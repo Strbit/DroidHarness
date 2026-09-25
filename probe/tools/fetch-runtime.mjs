@@ -1,0 +1,760 @@
+#!/usr/bin/env node
+/**
+ * fetch-runtime.mjs — 在 PC 上把 Termux 的 bionic Node 运行时解出来, 填进模块的 usr/.
+ *
+ * 为什么要在 PC 上做: 手机端不需要装 Termux, 也不需要有 ar/xz/zstd 这些工具.
+ *   · .deb 是 ar 归档      -> 本脚本自己解析 (ar 格式很简单)
+ *   · data.tar.zst         -> Node 24 的 zlib.zstdDecompressSync
+ *   · data.tar.gz          -> zlib.gunzipSync
+ *   · data.tar.xz          -> Node 不支持, 会明确报错并给出绕法
+ *   · 内层 tar             -> 交给系统 tar (GNU tar 读 tar 没问题, 只是读不了 ar)
+ *
+ * 用法:
+ *   node tools/fetch-runtime.mjs                          # 默认装到 ../module/usr
+ *   node tools/fetch-runtime.mjs --with-koffi             # 顺便放 koffi 平台包, 让探针能测原生模块
+ *   node tools/fetch-runtime.mjs --list                   # 只显示会下载什么
+ *   node tools/fetch-runtime.mjs --debs <dir>             # 离线模式: 解一个目录里已有的 .deb
+ *   node tools/fetch-runtime.mjs --arch aarch64 --repo <base>
+ */
+
+import fs from 'node:fs';
+import path from 'node:path';
+import zlib from 'node:zlib';
+import os from 'node:os';
+import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.resolve(HERE, '..');
+
+// ─────────────────────────── 参数 ───────────────────────────
+const argv = process.argv.slice(2);
+function argValue(name, fallback) {
+	const i = argv.indexOf(name);
+	if (i === -1) return fallback;
+	const v = argv[i + 1];
+	if (v === undefined || v.startsWith('--')) return true;
+	return v;
+}
+// OUT 是 "prefix 的父目录": 剥掉 data/data/com.termux/files 之后文件按 usr/... 落进去,
+// 所以默认传模块根目录, 最终得到 module/usr/bin/node —— 正好是 customize.sh 期望的位置.
+const OUT = path.resolve(argValue('--out', path.join(ROOT, 'module')));
+const ARCH = argValue('--arch', 'aarch64');
+const REPO = argValue('--repo', null);
+const DEBS_DIR = argValue('--debs', null);
+const LIST_ONLY = argv.includes('--list');
+const WITH_KOFFI = argv.includes('--with-koffi');
+const ROOT_PKGS = String(argValue('--packages', 'nodejs')).split(',').map((s) => s.trim()).filter(Boolean);
+
+const REPO_CANDIDATES = [
+	'https://packages.termux.dev/apt/termux-main',
+	'https://packages-cf.termux.dev/apt/termux-main',
+];
+
+// ─────────────────────────── 小工具 ───────────────────────────
+const log = (...a) => console.log(...a);
+const warn = (...a) => console.warn(...a);
+function die(msg) {
+	console.error(`\n[致命] ${msg}\n`);
+	process.exit(1);
+}
+function human(bytes) {
+	if (bytes > 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
+	if (bytes > 1024) return `${(bytes / 1024).toFixed(0)} KiB`;
+	return `${bytes} B`;
+}
+
+async function fetchBuffer(url, { redirects = 5 } = {}) {
+	if (redirects < 0) throw new Error(`重定向过多: ${url}`);
+	const res = await fetch(url, { redirect: 'manual' });
+	if (res.status >= 300 && res.status < 400) {
+		const loc = res.headers.get('location');
+		if (!loc) throw new Error(`重定向但没有 location: ${url}`);
+		return fetchBuffer(new URL(loc, url).href, { redirects: redirects - 1 });
+	}
+	if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText} — ${url}`);
+	return Buffer.from(await res.arrayBuffer());
+}
+
+async function tryFetch(urls, what) {
+	const errors = [];
+	for (const u of urls) {
+		try {
+			const buf = await fetchBuffer(u);
+			log(`  ✓ ${what}: ${u} (${human(buf.length)})`);
+			return { buf, url: u };
+		} catch (err) {
+			errors.push(`  ✗ ${u} — ${err.message}`);
+		}
+	}
+	warn(`  ! 取不到 ${what}, 试过:`);
+	for (const e of errors) warn(e);
+	return null;
+}
+
+// ─────────────────────────── ar 解析 ───────────────────────────
+/**
+ * .deb 是 ar 归档. 格式: "!<arch>\n" + 每个成员 60 字节头 + 数据(偶数对齐).
+ * 头部字段: name[16] mtime[12] uid[6] gid[6] mode[8] size[10] magic[2]
+ */
+function parseAr(buf) {
+	if (buf.length < 8 || buf.toString('latin1', 0, 8) !== '!<arch>\n') {
+		throw new Error('不是 ar 归档 (magic 不匹配)');
+	}
+	const members = [];
+	let off = 8;
+	while (off + 60 <= buf.length) {
+		const hdr = buf.toString('latin1', off, off + 60);
+		if (hdr.slice(58, 60) !== '`\n') break; // 头结束标记
+		const rawName = hdr.slice(0, 16).trim();
+		const size = parseInt(hdr.slice(48, 58).trim(), 10);
+		if (!Number.isFinite(size) || size < 0) break;
+		const dataStart = off + 60;
+		const dataEnd = dataStart + size;
+		if (dataEnd > buf.length) break;
+		// GNU ar 用 "name/" 结尾; 长名字用 "//" 表, 这里用不到 (deb 成员名都很短)
+		const name = rawName.replace(/\/+$/, '');
+		if (name && name !== '//' && name !== '/') {
+			members.push({ name, data: buf.subarray(dataStart, dataEnd) });
+		}
+		off = dataEnd + (size % 2); // 成员按 2 字节对齐
+	}
+	return members;
+}
+
+// ─────────── xz 解压: Node 的 zlib 没有 xz, 借外部工具 ───────────
+// Termux 的 .deb 实测用的是 data.tar.xz (不是 zst), 所以这一条是必经之路.
+let _xzTool;
+function findXzTool() {
+	if (_xzTool !== undefined) return _xzTool;
+
+	// 1) 真的 xz 二进制
+	const xzCandidates = [];
+	if (process.env.XZ_BIN) xzCandidates.push(process.env.XZ_BIN);
+	xzCandidates.push('xz');
+	for (const exe of xzCandidates) {
+		const r = spawnSync(exe, ['--version'], { encoding: 'utf8' });
+		if (!r.error && r.status === 0) {
+			_xzTool = {
+				desc: `xz (${exe})`,
+				run(inPath) {
+					const r2 = spawnSync(exe, ['-dc', inPath], { maxBuffer: 1024 * 1024 * 1024 });
+					if (r2.error) throw r2.error;
+					if (r2.status !== 0) throw new Error(`xz 退出码 ${r2.status}`);
+					return Buffer.from(r2.stdout);
+				},
+			};
+			return _xzTool;
+		}
+	}
+
+	// 2) Python 的 stdlib lzma —— Windows 上最可能现成的东西, 零安装
+	const pyScript =
+		'import sys,lzma;open(sys.argv[2],"wb").write(lzma.decompress(open(sys.argv[1],"rb").read()))';
+	const pyCandidates = [
+		['python', []],
+		['python3', []],
+		['py', ['-3']],
+	];
+	for (const [exe, prefix] of pyCandidates) {
+		const probe = spawnSync(exe, [...prefix, '-c', 'import lzma'], { encoding: 'utf8' });
+		if (probe.error || probe.status !== 0) continue;
+		_xzTool = {
+			desc: `Python lzma (${exe})`,
+			run(inPath, outPath) {
+				const r2 = spawnSync(exe, [...prefix, '-c', pyScript, inPath, outPath], { encoding: 'utf8' });
+				if (r2.error) throw r2.error;
+				if (r2.status !== 0) {
+					const tail = (r2.stderr ?? '').trim().split('\n').pop();
+					throw new Error(`Python lzma 退出码 ${r2.status}: ${tail}`);
+				}
+				return fs.readFileSync(outPath);
+			},
+		};
+		return _xzTool;
+	}
+
+	_xzTool = null;
+	return _xzTool;
+}
+
+function decompressXz(name, data) {
+	const tool = findXzTool();
+	if (!tool) {
+		throw new Error(
+			`成员 ${name} 是 xz 压缩, 而 Node 的 zlib 不支持 xz.\n` +
+				`      需要以下任一: (a) PATH 里有 xz; (b) 设 XZ_BIN 指向 xz 可执行文件; ` +
+				`(c) 装个 Python 3 (用它标准库里的 lzma).\n` +
+				`      或者用 --debs 指向你自己解好的目录.`
+		);
+	}
+	const stamp = `${process.pid}-${Math.random().toString(36).slice(2)}`;
+	const inPath = path.join(os.tmpdir(), `dsh-xz-${stamp}.xz`);
+	const outPath = path.join(os.tmpdir(), `dsh-xz-${stamp}.tar`);
+	fs.writeFileSync(inPath, data);
+	try {
+		return tool.run(inPath, outPath);
+	} finally {
+		try {
+			fs.unlinkSync(inPath);
+		} catch {}
+		try {
+			fs.unlinkSync(outPath);
+		} catch {}
+	}
+}
+
+function decompressMember(name, data) {
+	if (name.endsWith('.zst')) return zlib.zstdDecompressSync(data);
+	if (name.endsWith('.gz')) return zlib.gunzipSync(data);
+	if (name.endsWith('.bz2')) return zlib.bunzip2Sync(data);
+	if (name.endsWith('.xz')) return decompressXz(name, data);
+	if (name.endsWith('.tar')) return data;
+	throw new Error(`不认识的压缩: ${name}`);
+}
+
+// ─────────── 纯 Node 的 tar 解包 ───────────
+// 为什么不用系统 tar: Windows 上它有三个坑 ——
+//   1. GNU tar 把 "C:\..." 的冒号当远程主机, 报 "Cannot connect to C: resolve failed"
+//   2. Git 自带的 MSYS tar 会把参数里的反斜杠再转义一遍 (C\:\\Users\\...)
+//   3. 非管理员/未开开发者模式时建不了符号链接
+// tar 格式本身很简单 (512 字节头 + 数据块, 八进制长度), 自己解就一次消掉这三个坑,
+// 而且符号链接可以明确地退化成"拷一份目标".
+
+function tarNumber(buf, off, len) {
+	// GNU base-256 扩展: 首字节最高位为 1
+	if (buf[off] & 0x80) {
+		let v = 0;
+		for (let i = off + 1; i < off + len; i++) v = v * 256 + buf[i];
+		return v;
+	}
+	const s = buf.toString('latin1', off, off + len).replace(/\0.*$/, '').trim();
+	return s === '' ? 0 : parseInt(s, 8);
+}
+
+function tarString(buf, off, len) {
+	return buf.toString('utf8', off, off + len).replace(/\0.*$/, '');
+}
+
+/** 拼路径并挡掉目录穿越. 返回 null 表示这个条目不该写. */
+function safeJoin(destDir, rel) {
+	const parts = rel.split('/').filter((p) => p !== '' && p !== '.');
+	if (parts.length === 0) return null;
+	if (parts.some((p) => p === '..')) return null;
+	const normDest = path.resolve(destDir);
+	const full = path.resolve(path.join(normDest, ...parts));
+	if (full !== normDest && !full.startsWith(normDest + path.sep)) return null;
+	return full;
+}
+
+const block = (n) => Math.ceil(n / 512) * 512;
+
+/**
+ * 解一个 tar buffer 到 destDir, 剥掉前 strip 层路径.
+ * 符号链接先记下来, 主流程走完再统一处理 —— 因为链接目标可能在归档里排在它后面.
+ */
+function extractTarBuffer(buf, destDir, strip) {
+	const stats = { files: 0, dirs: 0, links: 0, linkCopied: 0, linkFailed: 0, skipped: 0, bytes: 0, symlinks: [] };
+	const pendingLinks = [];
+	let off = 0;
+	let pendingName = null;
+
+	while (off + 512 <= buf.length) {
+		const header = buf.subarray(off, off + 512);
+		let allZero = true;
+		for (let i = 0; i < 512; i++) {
+			if (header[i] !== 0) {
+				allZero = false;
+				break;
+			}
+		}
+		if (allZero) break; // 归档结束标记
+
+		const name = tarString(header, 0, 100);
+		const size = tarNumber(header, 124, 12);
+		const typeflag = String.fromCharCode(header[156]) || '0';
+		const linkname = tarString(header, 157, 100);
+		const prefix = tarString(header, 345, 155);
+		const dataStart = off + 512;
+		const dataEnd = dataStart + size;
+		const next = dataStart + block(size);
+
+		let fullName = pendingName !== null ? pendingName : prefix ? `${prefix}/${name}` : name;
+		pendingName = null;
+
+		if (typeflag === 'L') {
+			// GNU longname: 数据块里是下一个条目的完整路径
+			pendingName = buf.toString('utf8', dataStart, dataEnd).replace(/\0.*$/, '');
+			off = next;
+			continue;
+		}
+		if (typeflag === 'x' || typeflag === 'g') {
+			// PAX 扩展头: 从 "NN path=..." 里取真实路径
+			const text = buf.toString('utf8', dataStart, dataEnd);
+			const m = /^\d+ path=(.*)$/m.exec(text);
+			if (m && typeflag === 'x') pendingName = m[1];
+			off = next;
+			continue;
+		}
+
+		let rel = fullName.replace(/^\.\//, '').replace(/\/+$/, '');
+		if (strip > 0) rel = rel.split('/').slice(strip).join('/');
+
+		if (!rel) {
+			off = next;
+			continue;
+		}
+
+		const target = safeJoin(destDir, rel);
+		if (!target) {
+			stats.skipped++;
+			off = next;
+			continue;
+		}
+
+		if (typeflag === '5') {
+			fs.mkdirSync(target, { recursive: true });
+			stats.dirs++;
+		} else if (typeflag === '2') {
+			// 符号链接不在这里建. 两个理由:
+			//   1. Windows 上非管理员建不了符号链接
+			//   2. Termux 的 libfoo.so -> libfoo.so.78.3 这种, 物化成副本会让
+			//      zip 里出现几十 MB 的重复内容 (实测 libicudata 一个就浪费 66 MB)
+			// 改成记进清单, 由 customize.sh 在手机上用 ln -s 重建.
+			stats.symlinks.push({ rel, target: linkname });
+		} else if (typeflag === '1') {
+			stats.links++;
+			pendingLinks.push({ target, linkname, rel, hard: true });
+		} else if (typeflag === '0' || typeflag === '\0' || typeflag === '7') {
+			fs.mkdirSync(path.dirname(target), { recursive: true });
+			const data = buf.subarray(dataStart, dataEnd);
+			fs.writeFileSync(target, data);
+			stats.files++;
+			stats.bytes += data.length;
+		} else {
+			stats.skipped++;
+		}
+
+		off = next;
+	}
+
+	// 第二遍: 只剩硬链接 (数量很少, 直接拷一份)
+	for (const link of pendingLinks) {
+		fs.mkdirSync(path.dirname(link.target), { recursive: true });
+		try {
+			const src = resolveLink(destDir, link);
+			if (src && fs.existsSync(src) && fs.statSync(src).isFile()) {
+				fs.copyFileSync(src, link.target);
+				stats.linkCopied++;
+			} else {
+				stats.linkFailed++;
+			}
+		} catch {
+			stats.linkFailed++;
+		}
+	}
+
+	return stats;
+}
+
+/** 把一个链接条目解析成 destDir 下的实际路径. */
+function resolveLink(destDir, link) {
+	const raw = link.hard ? link.linkname : path.posix.join(path.posix.dirname(link.rel), link.linkname);
+	if (raw.startsWith('/')) return null; // 指向系统绝对路径, 在 PC 上没有意义
+	return safeJoin(destDir, path.posix.normalize(raw));
+}
+
+// ─────────── 裁剪: 只留运行时真正需要的东西 ───────────
+// Termux 的包会带一堆开发用文件 (ICU 头文件、man 页、pkgconfig、cmake 配置),
+// 在手机上一点用都没有. 实测能砍掉约三分之一体积.
+
+const PRUNE_IN_PREFIX = [
+	'include', // 头文件, 编译期才需要
+	'share/man',
+	'share/doc',
+	'share/info',
+	'share/icu',
+	'share/aclocal',
+	'lib/pkgconfig',
+	'lib/cmake',
+	'lib/icu',
+];
+
+const PRUNE_IN_NPM = ['src', 'doc', 'vendor', 'test', 'tests', '__tests__'];
+
+function removeIfExists(p) {
+	if (!fs.existsSync(p)) return 0;
+	let bytes = 0;
+	try {
+		const walk = (d) => {
+			for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+				const full = path.join(d, e.name);
+				if (e.isDirectory()) walk(full);
+				else {
+					try {
+						bytes += fs.statSync(full).size;
+					} catch {}
+				}
+			}
+		};
+		walk(p);
+		fs.rmSync(p, { recursive: true, force: true });
+	} catch {}
+	return bytes;
+}
+
+/** 裁掉 Termux prefix 里的开发文件. 返回省下的字节数. */
+function pruneRuntime(out) {
+	const prefix = path.join(out, 'usr');
+	let saved = 0;
+	for (const rel of PRUNE_IN_PREFIX) {
+		saved += removeIfExists(path.join(prefix, ...rel.split('/')));
+	}
+	// 静态库与 libtool 描述文件
+	for (const dir of [path.join(prefix, 'lib'), path.join(prefix, 'lib64')]) {
+		if (!fs.existsSync(dir)) continue;
+		for (const f of fs.readdirSync(dir)) {
+			if (f.endsWith('.a') || f.endsWith('.la')) saved += removeIfExists(path.join(dir, f));
+		}
+	}
+	return saved;
+}
+
+/** 裁掉 npm 包里的开发文件 (src / doc / vendor / test). */
+function pruneNpmPackage(dest) {
+	let saved = 0;
+	for (const rel of PRUNE_IN_NPM) {
+		saved += removeIfExists(path.join(dest, rel));
+	}
+	saved += removeIfExists(path.join(dest, 'CHANGELOG.md'));
+	return saved;
+}
+
+// ─────────── 符号链接清单 ───────────
+// PC 上不建链接 (建不了, 而且物化会让 zip 里塞进几十 MB 重复内容),
+// 只记录 rel -> target, 由 customize.sh 在手机上用 ln -s 重建.
+const SYMLINK_MANIFEST = [];
+const MANIFEST_NAME = '.dsh-symlinks';
+
+function writeSymlinkManifest(out) {
+	const file = path.join(out, 'usr', MANIFEST_NAME);
+	const prefix = path.join(out, 'usr');
+
+	// 路径存成"相对 prefix"的形式 (去掉 usr/ 前缀):
+	// 清单文件本身就在 usr/ 里, customize.sh 的 relink 也以 prefix 为根,
+	// 带前缀会拼成 $PREFIX/usr/lib/... 多一层.
+	const seen = new Map();
+	for (const l of SYMLINK_MANIFEST) {
+		const rel = l.rel.startsWith('usr/') ? l.rel.slice(4) : l.rel;
+		seen.set(rel, l.target);
+	}
+
+	// 已被裁掉的目录里的链接要丢掉, 否则 relink 会把删掉的目录又建出来,
+	// 里面挂一堆悬空链接 (实测 usr/share/doc/*、usr/lib/icu/* 会命中).
+	const kept = [];
+	for (const [rel, target] of seen) {
+		const parent = path.dirname(path.join(prefix, ...rel.split('/')));
+		if (fs.existsSync(parent)) kept.push(`${rel}\t${target}`);
+	}
+
+	if (kept.length === 0) {
+		removeIfExists(file);
+		return 0;
+	}
+	fs.writeFileSync(file, kept.join('\n') + '\n');
+	return kept.length;
+}
+
+/** 扫一遍 tar 头, 找出 "usr" 在第几段 —— 用来决定剥几层.
+ *  Termux 的包路径是 data/data/com.termux/files/usr/..., 所以答案是 4. */
+function detectStripFromTar(buf) {
+	const tally = new Map();
+	let off = 0;
+	let pendingName = null;
+	while (off + 512 <= buf.length) {
+		const header = buf.subarray(off, off + 512);
+		let allZero = true;
+		for (let i = 0; i < 512; i++) {
+			if (header[i] !== 0) {
+				allZero = false;
+				break;
+			}
+		}
+		if (allZero) break;
+
+		const name = tarString(header, 0, 100);
+		const size = tarNumber(header, 124, 12);
+		const typeflag = String.fromCharCode(header[156]) || '0';
+		const prefix = tarString(header, 345, 155);
+		const dataStart = off + 512;
+		const next = dataStart + block(size);
+
+		const fullName = pendingName !== null ? pendingName : prefix ? `${prefix}/${name}` : name;
+		pendingName = null;
+
+		if (typeflag === 'L') {
+			pendingName = buf.toString('utf8', dataStart, dataStart + size).replace(/\0.*$/, '');
+			off = next;
+			continue;
+		}
+		if (typeflag === 'x' || typeflag === 'g') {
+			const m = /^\d+ path=(.*)$/m.exec(buf.toString('utf8', dataStart, dataStart + size));
+			if (m && typeflag === 'x') pendingName = m[1];
+			off = next;
+			continue;
+		}
+
+		const i = fullName.replace(/^\.\//, '').split('/').indexOf('usr');
+		if (i > 0) tally.set(i, (tally.get(i) ?? 0) + 1);
+		off = next;
+	}
+	if (tally.size === 0) return 0;
+	return [...tally.entries()].sort((a, b) => b[1] - a[1])[0][0];
+}
+
+/**
+ * 解一个 .deb 到 dest.
+ * dest 是 "prefix 的父目录" —— 剥掉 data/data/com.termux/files 之后, 文件按 usr/... 落进去,
+ * 所以 dest 应当传模块根目录 (module/), 这样最终得到 module/usr/bin/node.
+ */
+function extractDeb(debPath, dest, label) {
+	const buf = fs.readFileSync(debPath);
+	const members = parseAr(buf);
+	const dataMember = members.find((m) => m.name.startsWith('data.tar'));
+	if (!dataMember) {
+		throw new Error(`${label}: .deb 里没有 data.tar.* (成员: ${members.map((m) => m.name).join(', ')})`);
+	}
+
+	const tarBytes = decompressMember(dataMember.name, dataMember.data);
+	const strip = detectStripFromTar(tarBytes);
+	fs.mkdirSync(dest, { recursive: true });
+	const stats = extractTarBuffer(tarBytes, dest, strip);
+	for (const s of stats.symlinks) SYMLINK_MANIFEST.push(s);
+	return { strip, ...stats };
+}
+
+// ─────────────────────────── 索引解析 ───────────────────────────
+function parsePackagesIndex(text) {
+	const stanzas = text.split(/\n\s*\n/);
+	const byName = new Map();
+	for (const st of stanzas) {
+		const fields = {};
+		let lastKey = null;
+		for (const line of st.split('\n')) {
+			if (/^\s/.test(line) && lastKey) {
+				fields[lastKey] += ` ${line.trim()}`;
+				continue;
+			}
+			const m = /^([A-Za-z0-9-]+):\s*(.*)$/.exec(line);
+			if (!m) continue;
+			fields[m[1]] = m[2];
+			lastKey = m[1];
+		}
+		if (fields.Package) byName.set(fields.Package, fields);
+	}
+	return byName;
+}
+
+/** "libc++ (>= 1), foo | bar, baz:any" -> ["libc++", "foo", "baz"] */
+function parseDepends(s) {
+	if (!s) return [];
+	return s
+		.split(',')
+		.map((part) => part.split('|')[0].trim()) // 取第一个可选分支
+		.map((part) => part.replace(/\s*\(.*?\)\s*/g, '').trim()) // 去版本约束
+		.map((part) => part.replace(/:.*$/, '').trim()) // 去 arch 限定
+		.filter(Boolean);
+}
+
+function resolveClosure(index, roots) {
+	const seen = new Map(); // name -> fields
+	const queue = [...roots];
+	const missing = [];
+	while (queue.length) {
+		const name = queue.shift();
+		if (seen.has(name)) continue;
+		const f = index.get(name);
+		if (!f) {
+			missing.push(name);
+			continue;
+		}
+		seen.set(name, f);
+		for (const d of parseDepends(f.Depends)) {
+			if (!seen.has(d)) queue.push(d);
+		}
+	}
+	return { closure: seen, missing };
+}
+
+// ─────────────────────────── npm 包 (给探针测原生模块) ───────────────────────────
+async function fetchNpmPackage(name, version, dest) {
+	const base = name.startsWith('@') ? name.split('/')[1] : name;
+	const url = `https://registry.npmjs.org/${name}/-/${base}-${version}.tgz`;
+	log(`  · npm ${name}@${version}`);
+	const buf = await fetchBuffer(url);
+	const tarBytes = zlib.gunzipSync(buf);
+	fs.mkdirSync(dest, { recursive: true });
+	// npm tarball 顶层统一是 package/, 剥掉
+	const stats = extractTarBuffer(tarBytes, dest, 1);
+	pruneNpmPackage(dest);
+	if (!fs.existsSync(path.join(dest, 'package.json'))) {
+		throw new Error(`解包 ${name} 后没有 package.json (写出 ${stats.files} 个文件)`);
+	}
+}
+
+async function installKoffi() {
+	log('\n=== 顺便安装 koffi 平台包 (让探针能测原生模块) ===');
+	const dest = path.join(ROOT, 'module', 'node_modules');
+	const meta = await tryFetch(['https://registry.npmjs.org/koffi/latest'], 'koffi 元数据');
+	if (!meta) {
+		warn('  取不到 npm 元数据, 跳过. 探针里 koffi 一项会显示"未安装".');
+		return;
+	}
+	const json = JSON.parse(meta.buf.toString('utf8'));
+	const version = json.version;
+	const platformPkg = '@koromix/koffi-android-arm64';
+	const platformVersion = json.optionalDependencies?.[platformPkg];
+	if (!platformVersion) {
+		warn(`  koffi ${version} 的 optionalDependencies 里没有 ${platformPkg}, 跳过`);
+		return;
+	}
+	log(`  koffi ${version}, 平台包 ${platformPkg}@${platformVersion}`);
+	await fetchNpmPackage('koffi', version, path.join(dest, 'koffi'));
+	await fetchNpmPackage(platformPkg, platformVersion, path.join(dest, '@koromix', 'koffi-android-arm64'));
+	log(`  ✓ 已放到 ${dest}`);
+}
+
+// ─────────────────────────── 主流程 ───────────────────────────
+async function main() {
+	log('DSH Android Runtime Probe — 运行时获取');
+	log('==========================================================');
+	log(`输出目录: ${OUT}`);
+	log(`目标架构: ${ARCH}`);
+	log('');
+
+	// 不需要任何外部解压工具: ar 解析与 tar 解包都是本脚本自己做的.
+
+	if (DEBS_DIR) {
+		// 离线模式
+		const dir = path.resolve(DEBS_DIR);
+		if (!fs.existsSync(dir)) die(`--debs 目录不存在: ${dir}`);
+		const debs = fs.readdirSync(dir).filter((f) => f.endsWith('.deb'));
+		if (debs.length === 0) die(`${dir} 里没有 .deb`);
+		log(`离线模式: ${dir} 下找到 ${debs.length} 个 .deb`);
+		let totalFiles = 0;
+		let totalLinkFailed = 0;
+		for (const f of debs) {
+			const r = extractDeb(path.join(dir, f), OUT, f);
+			totalFiles += r.files;
+			totalLinkFailed += r.linkFailed;
+			log(`  ✓ ${f} — ${r.files} 文件 / ${r.dirs} 目录 / ${r.linkCopied} 链接, 剥 ${r.strip} 层`);
+		}
+		log(`\n共 ${totalFiles} 个文件.`);
+		if (totalLinkFailed > 0) warn(`有 ${totalLinkFailed} 个链接没能还原 (见下方说明).`);
+		const savedOffline = pruneRuntime(OUT);
+		log(`裁剪开发文件: 省下 ${human(savedOffline)}`);
+		const nLinksOffline = writeSymlinkManifest(OUT);
+		if (nLinksOffline > 0) log(`符号链接清单: ${nLinksOffline} 条 -> usr/${MANIFEST_NAME}`);
+		verify(OUT);
+		if (WITH_KOFFI) await installKoffi();
+		return;
+	}
+
+	// 在线模式
+	const repos = REPO ? [REPO] : REPO_CANDIDATES;
+	const indexUrls = [];
+	for (const r of repos) {
+		indexUrls.push(`${r}/dists/stable/main/binary-${ARCH}/Packages`);
+		indexUrls.push(`${r}/dists/stable/main/binary-${ARCH}/Packages.gz`);
+	}
+
+	log('=== 1/4 取包索引 ===');
+	const idx = await tryFetch(indexUrls, 'Packages 索引');
+	if (!idx) die('取不到 Termux 包索引. 检查网络, 或用 --repo 指定镜像, 或用 --debs 离线模式.');
+
+	let indexText;
+	if (idx.url.endsWith('.gz')) indexText = zlib.gunzipSync(idx.buf).toString('utf8');
+	else indexText = idx.buf.toString('utf8');
+
+	const index = parsePackagesIndex(indexText);
+	log(`  索引里有 ${index.size} 个包`);
+	const repoBase = idx.url.split('/dists/')[0];
+
+	log('\n=== 2/4 解析依赖 ===');
+	const { closure, missing } = resolveClosure(index, ROOT_PKGS);
+	if (missing.length) warn(`  ! 索引里找不到: ${missing.join(', ')} (可能是 provides 的虚拟包, 通常无害)`);
+	const pkgs = [...closure.values()].sort((a, b) => a.Package.localeCompare(b.Package));
+	let totalSize = 0;
+	for (const f of pkgs) totalSize += parseInt(f.Size ?? '0', 10);
+	log(`  需要 ${pkgs.length} 个包, 合计约 ${human(totalSize)}`);
+	for (const f of pkgs) log(`    ${f.Package.padEnd(24)} ${String(f.Version).padEnd(18)} ${human(parseInt(f.Size ?? '0', 10))}`);
+
+	if (LIST_ONLY) {
+		log('\n--list 指定, 到此为止.');
+		return;
+	}
+
+	log('\n=== 3/4 下载并解包 ===');
+	const cacheDir = path.join(ROOT, '.cache', 'debs');
+	fs.mkdirSync(cacheDir, { recursive: true });
+	let totalFiles = 0;
+	let totalLinkFailed = 0;
+	for (const f of pkgs) {
+		const url = `${repoBase}/${f.Filename}`;
+		const local = path.join(cacheDir, path.basename(f.Filename));
+		if (!fs.existsSync(local) || fs.statSync(local).length !== parseInt(f.Size ?? '0', 10)) {
+			const buf = await fetchBuffer(url);
+			fs.writeFileSync(local, buf);
+		}
+		const r = extractDeb(local, OUT, f.Package);
+		totalFiles += r.files;
+		totalLinkFailed += r.linkFailed;
+		log(
+			`  ✓ ${f.Package.padEnd(24)} ${r.files} 文件 / ${r.dirs} 目录 / ${r.linkCopied} 链接, 剥 ${r.strip} 层`
+		);
+	}
+
+	log('\n=== 4/4 裁剪与校验 ===');
+	log(`共 ${totalFiles} 个文件.`);
+	if (totalLinkFailed > 0) {
+		warn('');
+		warn(`! 有 ${totalLinkFailed} 个链接没能还原 (目标不在归档里, 或指向系统绝对路径).`);
+		warn('  这些通常是 Termux 内部自指的链接, 影响很小.');
+		warn('  但如果下面的 node 校验失败, 就是它. 绕法: 在 WSL/Linux 里跑这个脚本.');
+		warn('');
+	}
+	const saved = pruneRuntime(OUT);
+	log(`裁剪开发文件 (include / man / doc / pkgconfig / cmake): 省下 ${human(saved)}`);
+	const nLinks = writeSymlinkManifest(OUT);
+	if (nLinks > 0) log(`符号链接清单: ${nLinks} 条 -> usr/${MANIFEST_NAME} (手机上由 customize.sh 重建)`);
+	verify(OUT);
+
+	if (WITH_KOFFI) await installKoffi();
+
+	log('\n完成. 下一步: 用 tools/build-module.ps1 打包, 然后刷进 KernelSU.');
+}
+
+function verify(out) {
+	const prefix = path.join(out, 'usr');
+	const nodeBin = path.join(prefix, 'bin', 'node');
+	log('');
+	if (fs.existsSync(nodeBin)) {
+		const st = fs.statSync(nodeBin);
+		log(`✓ 找到 usr/bin/node — ${human(st.size)}`);
+	} else {
+		warn(`✗ 没有 ${nodeBin}`);
+		warn('  可能原因: (1) 索引里没有 nodejs 包; (2) 需要手工指定 --packages; (3) 符号链接目标缺失');
+	}
+	const libDir = path.join(prefix, 'lib');
+	if (fs.existsSync(libDir)) {
+		const n = fs.readdirSync(libDir).filter((f) => f.includes('.so')).length;
+		log(`✓ usr/lib/ 下有 ${n} 个共享库`);
+	} else {
+		warn('✗ 没有 usr/lib/ 目录');
+	}
+}
+
+main().catch((err) => {
+	console.error('\n[未捕获错误]', err);
+	process.exit(1);
+});

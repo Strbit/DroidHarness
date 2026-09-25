@@ -1,0 +1,21 @@
+# ── 探针的运行时与产物 ──────────────────────────────
+# 这些都能由 tools/fetch-runtime.mjs 重建, 不该进版本库:
+#   usr/          Termux 的 aarch64 Node 运行时, 99 MiB
+#   node_modules/ koffi + @koromix/koffi-android-arm64, 让探针能测原生模块加载
+probe/module/usr/
+probe/module/node_modules/
+
+# 打包中间产物
+probe/.stage/
+probe/.cache/
+probe/dist/
+.stage/
+dist/
+
+# ── 设备侧的临时文件(万一被 pull 回来) ─────────────
+*.log
+
+# ── OS ────────────────────────────────────────────
+Thumbs.db
+Desktop.ini
+.DS_Store

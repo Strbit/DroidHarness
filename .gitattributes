@@ -1,0 +1,28 @@
+# ─────────────────────────────────────────────────────────────
+# 换行符策略: 一律 LF
+#
+# 为什么这个项目必须这么做:
+#   probe/module/customize.sh 与 service.sh 是要在**安卓上跑**的 shell 脚本.
+#   安卓的 sh 会把 CRLF 当成命令内容的一部分 —— "#!/system/bin/sh\r" 不是合法
+#   shebang, "then\r" 会报语法错. 而模块 zip 是从工作区打包的, 所以工作区一旦
+#   被检出成 CRLF, 刷进手机的模块就是坏的.
+#
+# Git for Windows 安装时会在 system 层把 core.autocrlf 设成 true, 于是检出时
+# 把 LF 换成 CRLF. 下面这一行的 eol=lf 优先级高于 core.autocrlf, 可以盖掉它.
+# ─────────────────────────────────────────────────────────────
+* text=auto eol=lf
+
+# ── 二进制: 不做任何换行转换 ──────────────────────────────
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.webp  binary
+*.zip   binary
+*.jar   binary
+*.so    binary
+*.node  binary
+*.dex   binary
+*.apk   binary
+*.exe   binary
+*.dll   binary
