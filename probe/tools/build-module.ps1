@@ -6,7 +6,16 @@
     模块 zip 的结构要求是 module.prop 位于 zip 根部 (不能多一层目录).
     所以这里先把 module/ 的内容拷到 staging, 再把 staging 的内容压成 zip.
 
+    默认打本仓库里的 probe 模块. 打别的模块用 -ModuleDir.
+
     注意: 本脚本按 PowerShell 5.1 写 (Windows 自带的那版), 不用三元运算符等 7.x 语法.
+
+.PARAMETER ModuleDir
+    要打包的模块目录 (里面应当有 module.prop). 默认 <probe>/module.
+    相对路径按当前工作目录解析.
+
+.PARAMETER DistDir
+    zip 输出目录. 默认是模块目录上一级下的 dist/.
 
 .PARAMETER SkipRuntime
     不检查/不要求 usr/ 里有 Node 运行时. 用来快速验证打包结构.
@@ -15,20 +24,30 @@
     只做 staging, 不压缩. 用来肉眼检查目录结构.
 
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File tools\build-module.ps1
+    powershell -ExecutionPolicy Bypass -File probe\tools\build-module.ps1
+
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File probe\tools\build-module.ps1 -ModuleDir dsh\module
 #>
 [CmdletBinding()]
 param(
+    [string]$ModuleDir = '',
+    [string]$DistDir = '',
     [switch]$SkipRuntime,
     [switch]$NoZip
 )
 
 $ErrorActionPreference = 'Stop'
 
-$Root      = Split-Path -Parent $PSScriptRoot
-$ModuleDir = Join-Path $Root 'module'
-$DistDir   = Join-Path $Root 'dist'
-$StageDir  = Join-Path $Root '.stage'
+$Root = Split-Path -Parent $PSScriptRoot
+if ([string]::IsNullOrEmpty($ModuleDir)) { $ModuleDir = Join-Path $Root 'module' }
+if (-not (Test-Path $ModuleDir)) { throw "模块目录不存在: $ModuleDir" }
+$ModuleDir = (Resolve-Path $ModuleDir).Path
+
+# staging 与 dist 都放在模块目录的上一级, 免得两个模块互相踩
+$ModuleParent = Split-Path -Parent $ModuleDir
+if ([string]::IsNullOrEmpty($DistDir)) { $DistDir = Join-Path $ModuleParent 'dist' }
+$StageDir = Join-Path $ModuleParent '.stage'
 
 Write-Host 'DSH Android Runtime Probe - 打包' -ForegroundColor Cyan
 Write-Host '=========================================================='

@@ -1,0 +1,167 @@
+#!/system/bin/sh
+# DSH on Android — 安装时布署
+#
+# 这个脚本做三件事: 把运行时接上, 把符号链接建出来, 冒烟测试一次.
+# 它不启动 DSH —— 那是 service.sh 的活.
+
+SKIPUNZIP=0
+
+# DSH_HOME 放在模块目录之外, 这样重装模块不会丢掉配置与凭据
+DSH_HOME_DIR=/data/adb/dsh
+# 工作区放在共享存储, 文件管理器能翻到
+WS=/sdcard/DroidHarness
+PREFIX="$MODPATH/usr"
+APP="$MODPATH/app"
+TAB=$(printf '\t')
+
+ui_print " "
+ui_print "*********************************************"
+ui_print " DSH on Android  v0.1.0"
+ui_print "*********************************************"
+ui_print " "
+ui_print "- 模块目录: $MODPATH"
+ui_print "- 运行时:   $PREFIX"
+ui_print "- 应用:     $APP"
+ui_print "- DSH_HOME: $DSH_HOME_DIR"
+ui_print "- 工作区:   $WS"
+ui_print " "
+
+# ─────────────────────────────────────────────────────────────
+# 1. 运行时
+# ─────────────────────────────────────────────────────────────
+if [ ! -x "$PREFIX/bin/node" ]; then
+	ui_print "! 找不到 $PREFIX/bin/node"
+	ui_print "! 先跑: node probe/tools/fetch-runtime.mjs --out dsh/module"
+	abort "! 运行时缺失"
+fi
+ui_print "--- 运行时 ---"
+for b in node bash rg; do
+	if [ -x "$PREFIX/bin/$b" ]; then
+		ui_print "  [ OK ] usr/bin/$b"
+	else
+		ui_print "  [WARN] usr/bin/$b 缺失"
+	fi
+done
+
+# ─────────────────────────────────────────────────────────────
+# 2. 重建符号链接
+#
+# Termux 的 .so 是 libfoo.so -> libfoo.so.78.3 三连. 构建期在 PC 上不建链接
+# (建不了, 而且物化成副本会塞进几十 MB 重复内容), 只记了一份清单, 这里真正建出来.
+# ─────────────────────────────────────────────────────────────
+ui_print " "
+ui_print "--- 重建符号链接 ---"
+relink() {
+	_p="$1"
+	_m="$_p/.dsh-symlinks"
+	[ -f "$_m" ] || return 0
+	_ok=0
+	_bad=0
+	while IFS="$TAB" read -r _rel _target; do
+		[ -z "$_rel" ] && continue
+		case "$_rel" in \#*) continue ;; esac
+		_dst="$_p/$_rel"
+		mkdir -p "${_dst%/*}" 2>/dev/null
+		rm -f "$_dst" 2>/dev/null
+		if ln -sfn "$_target" "$_dst" 2>/dev/null; then
+			_ok=$((_ok + 1))
+		else
+			_bad=$((_bad + 1))
+		fi
+	done <"$_m"
+	ui_print "  建了 $_ok 条, 失败 $_bad 条"
+	return 0
+}
+relink "$PREFIX"
+
+# ─────────────────────────────────────────────────────────────
+# 3. 应用树与 shim
+# ─────────────────────────────────────────────────────────────
+DSH_BIN="$APP/node_modules/@deepseek-ai/dsh/lib/bin.js"
+SHIM="$APP/node_modules/node-addon-require-builtin/lib/index.js"
+
+ui_print " "
+ui_print "--- 应用树 ---"
+if [ ! -f "$DSH_BIN" ]; then
+	ui_print "! 找不到 $DSH_BIN"
+	ui_print "! 先跑: node dsh/tools/build-dsh-tree.mjs"
+	abort "! 应用树缺失"
+fi
+ui_print "  [ OK ] DSH 入口在位"
+
+if [ -f "$SHIM" ] && grep -q "JS shim" "$SHIM" 2>/dev/null; then
+	ui_print "  [ OK ] node-addon-require-builtin 已被 JS 替身顶替"
+else
+	ui_print "  [FAIL] shim 未生效 —— dsh-app-boot 会在启动时抛错"
+	ui_print "         检查 dsh/tools/build-dsh-tree.mjs 是否跑过"
+fi
+
+# ─────────────────────────────────────────────────────────────
+# 4. 目录
+# ─────────────────────────────────────────────────────────────
+ui_print " "
+ui_print "--- 目录 ---"
+mkdir -p "$DSH_HOME_DIR" 2>/dev/null && ui_print "  [ OK ] $DSH_HOME_DIR"
+mkdir -p "$WS" 2>/dev/null && ui_print "  [ OK ] $WS"
+mkdir -p "$DSH_HOME_DIR/logs" 2>/dev/null
+
+# ─────────────────────────────────────────────────────────────
+# 5. 冒烟测试
+#
+# 一次测三件事: Node 能跑, --expose-internals 生效, shim 能把 internal 模块取出来.
+# 这三件是 dsh-app-boot 启动路径的前提.
+# ─────────────────────────────────────────────────────────────
+ui_print " "
+ui_print "--- 冒烟测试 ---"
+
+export PREFIX
+export LD_LIBRARY_PATH="$PREFIX/lib"
+export PATH="$PREFIX/bin:/system/bin:/system/xbin"
+export HOME="$DSH_HOME_DIR"
+export TMPDIR=/data/local/tmp
+export SHELL="$PREFIX/bin/bash"
+export OPENSSL_CONF=/data/local/tmp/dsh-openssl.cnf
+: >"$OPENSSL_CONF" 2>/dev/null
+export SSL_CERT_DIR=/system/etc/security/cacerts
+
+NODE_VER=$("$PREFIX/bin/node" -v 2>&1)
+ui_print "  node -v          -> $NODE_VER"
+
+SMOKE=$(cd "$APP" && "$PREFIX/bin/node" --expose-internals -e '
+const a = require("node-addon-require-builtin");
+const m = a.requireBuiltin("internal/modules/esm/loader");
+console.log("shim-ok", typeof m, typeof m.getOrInitializeCascadedLoader);
+' 2>&1)
+ui_print "  shim 取 internal -> $SMOKE"
+
+case "$SMOKE" in
+	shim-ok*object*function*) ui_print "  [ OK ] 启动路径前提全部满足" ;;
+	*) ui_print "  [FAIL] 见上面输出" ;;
+esac
+
+# ─────────────────────────────────────────────────────────────
+# 6. 权限
+# ─────────────────────────────────────────────────────────────
+ui_print " "
+ui_print "--- 权限 ---"
+# 注意: 绝对不要对 $MODPATH 做 set_perm_recursive —— app/ 有两万五千多个文件,
+# 而 set_perm 是逐个 shell 调用, 会慢到不可接受.
+# usr/ 只有一百多个文件, 递归没问题.
+set_perm_recursive "$PREFIX" 0 0 0755 0755
+# app/ 用一条 chmod -R 解决: 大写 X 表示"目录、或本来就有执行位的文件"才加执行位,
+# 正好是这里要的语义, 而且只起一个进程.
+chmod -R a+rX "$MODPATH/app" 2>/dev/null
+ui_print "  usr/ 递归设置; app/ 用 chmod -R a+rX 一次搞定"
+set_perm "$MODPATH/bin/dshctl" 0 0 0755 2>/dev/null
+set_perm "$MODPATH/service.sh" 0 0 0755 2>/dev/null
+set_perm "$MODPATH/module.prop" 0 0 0644 2>/dev/null
+
+ui_print " "
+ui_print "*********************************************"
+ui_print " 安装完成. 重启后 service.sh 会拉起 DSH."
+ui_print " 日志: $DSH_HOME_DIR/logs/dsh.log"
+ui_print " 控制: dshctl start|stop|status|log"
+ui_print " 访问: PC 上 adb forward tcp:3080 tcp:3080"
+ui_print "       然后浏览器开 http://127.0.0.1:3080"
+ui_print "*********************************************"
+ui_print " "
