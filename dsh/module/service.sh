@@ -13,7 +13,25 @@
 MODDIR=${0%/*}
 
 DSH_HOME_DIR=/data/adb/dsh
-WS=/sdcard/DroidHarness
+# ── 工作区 ──────────────────────────────────────────────────
+#
+# **必须是 /data 下的路径, 不能是 /sdcard。**
+#
+# 原来这里是 /sdcard/DroidHarness (放在共享存储, 文件管理器能直接翻到), 看起来更好,
+# 但 Android 的 /sdcard 是 FUSE, **不实现 link(2)** —— 实测 `ln a b` 直接报
+# "Function not implemented"。而 DSH 的 writeFileAtomic 给「创建新文件」走的正是
+# link()(为了拿 no-replace 语义), 于是:
+#
+#     ENOSYS: function not implemented, link
+#       '.../.foo.md.<pid>.<uuid>.tmpdir/foo.md.tmp' -> '.../foo.md'
+#
+# 表现是 agent **无法新建任何文件**, 只能改已经存在的(覆盖走 rename(), 那个 FUSE 支持)。
+# 工作区是主路径, 所以这条会让 harness 基本不可用。
+#
+# (构建期还给 dsh-fs-local 打了补丁, 让它在 link() 失败时降级成
+#  copyFile+COPYFILE_EXCL —— 见 dsh/tools/build-dsh-tree.mjs 的 TEXT_PATCHES。
+#  但那只是兜底: 用户如果自己把工作区选到 /sdcard, 仍会走那条慢路径。)
+WS="$DSH_HOME_DIR/workspace"
 PREFIX="$MODDIR/usr"
 APP="$MODDIR/app"
 BIN="$APP/node_modules/@deepseek-ai/dsh/lib/bin.js"
@@ -59,21 +77,24 @@ export NO_COLOR=1
 # PNPM_HOME, 并说清楚为什么其它变量都没用。
 #
 # 1. **store 操作锁目录取自 $HOME/.cache, 且要求它是「当前用户拥有的真实目录」。**
-#    本脚本的 HOME 是 /sdcard/DroidHarness, 它属于 u0_a257:media_rw 而进程是 root,
-#    于是 pnpm 直接报:
+#    ⚠️ 这一条的**前提已经变了**: 工作区从 /sdcard/DroidHarness 挪到
+#    /data/adb/dsh/workspace 之后, HOME 是 root 属主、且在 ext4 上, 所以 pnpm 的
+#    锁目录检查自然通过。但这条曾经真实发生过, 而且**如果用户把工作区选回 /sdcard
+#    就会再次踩到** —— 当时的报错是:
 #        ERR_PNPM_STORE_DIR_OPEN_OPERATION_LOCK
 #          lock directory must be a real directory owned by the current user
 #    手机端 agent 实测: npm_config_cache_dir / npm_config_store_dir /
 #    npm_config_state_dir / XDG_CACHE_HOME / --cache-dir / --config.cacheDir /
 #    --store-dir **全都挪不动它** —— pnpm 根本不读那几个变量。
-#    **唯一有效的是给它一个单独的 HOME**, 所以 usr/bin/pnpm 是个启动器:
+#    **唯一有效的是给它一个单独的 HOME**, 所以 usr/bin/pnpm 仍然是个启动器:
 #        export HOME="$DSH_HOME_DIR"; exec .../pnpm-bin "$@"
 #    这样只改 pnpm 子进程的 HOME, DSH 自己的 HOME 不动 (GUI 的工作区选择器从它起步)。
+#    留着它当作**兜底**: 不管工作区被选到哪, pnpm 的 store 都稳在 /data。
 #
 # 2. **store 必须和 profile 目录 (/data/adb/dsh/profiles/*) 在同一个真实文件系统上。**
 #    它靠硬链接把 store 里的文件链进 node_modules, 跨文件系统会报
 #    "Cross-device link not permitted"。而 /sdcard 是 FUSE, **不支持硬链接**。
-#    上面把 HOME 指到 /data/adb/dsh 顺带解决了这条 (store 落在 $PNPM_HOME/store)。
+#    启动器把 HOME 指到 /data/adb/dsh, store 落在 $PNPM_HOME/store, 这条就解决了。
 #
 # 3. **只对 JS 版 pnpm 成立**: 它的 bin/pnpm.mjs shebang 是 `#!/usr/bin/env node`,
 #    而 Android 没有 /usr/bin/env, 必须包一层启动器显式用 node 拉起。
