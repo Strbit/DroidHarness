@@ -77,11 +77,35 @@ APK 路线要处理的一多半痛苦，在模块里根本不存在：
 
 ```
 Termux nodejs 26.4.0-1  →  usr/bin/node  49,715,528 bytes  ELF64 AArch64 ✓
-依赖闭包 10 个包 / 23.4 MiB
-裁剪 + 符号链接清单后  →  module/ 99.4 MiB  →  可刷 zip 34.8 MiB
+依赖闭包 27 个包 / 48.0 MiB
+  （含 npm 与 pnpm —— DSH 的插件管理器写死了调用 pnpm，没有它装不了插件）
 ```
 
 Termux 只被当作**包来源**用，不是运行时依赖。
+
+## 许可证
+
+| 文件 | 覆盖范围 |
+|---|---|
+| [`LICENSE`](LICENSE)（Apache-2.0） | **只覆盖本项目自己写的代码** —— `dsh/module/*.sh`、`dsh/tools/`、`probe/`、`docs/` |
+| [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | **随包分发的第三方组件** —— 27 个运行时二进制 + 495 个 npm 包 |
+
+**这两者不是一回事。** GitHub 只会按仓库根的 `LICENSE` 显示一个标签，那份标签**不代表整个仓库**。
+
+运行时二进制里 **5 个受 GPL / LGPL 约束**（`bash`、`readline`、`git`、`less`、`libiconv`），
+分发它们时提供对应源码是**义务**，清单里给了源码地址。
+
+清单由脚本生成，可重跑：
+
+```sh
+node dsh/tools/gen-third-party-notices.mjs
+```
+
+数据来源是各包自己的元数据（Termux 的 `TERMUX_PKG_LICENSE` 与 APT 索引、npm 的 `package.json`），
+不是手抄的猜测。
+
+> 许可证全文随包发在模块的 `usr/share/doc/<包名>/copyright`。这些文件**不被裁剪** ——
+> 早期版本的裁剪逻辑把它们删了，那是错的，已改回。
 
 ---
 

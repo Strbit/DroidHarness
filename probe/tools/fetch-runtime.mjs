@@ -44,9 +44,39 @@ const REPO = argValue('--repo', null);
 const DEBS_DIR = argValue('--debs', null);
 const LIST_ONLY = argv.includes('--list');
 const WITH_KOFFI = argv.includes('--with-koffi');
-// 默认装三个: nodejs 是运行时; bash 与 ripgrep 是 agent 要用的 ——
-// 安卓自带的是 mksh 而不是 bash, 且没有 rg, 而 harness 的 shell / grep 工具依赖它们.
-const ROOT_PKGS = String(argValue('--packages', 'nodejs,bash,ripgrep'))
+
+/**
+ * 把 deb 的文件名变成当前平台合法的缓存文件名。
+ *
+ * 为什么需要它
+ * -----------
+ * Debian 的 epoch 版本号形如 `1:3.6.3`, 会**原样**出现在索引的 `Filename` 里:
+ *
+ *   Filename: pool/main/o/openssl/openssl_1:3.6.3_aarch64.deb
+ *
+ * 而 Windows 不允许文件名里有 `:` —— 它被当成 NTFS **备用数据流 (ADS)** 分隔符。
+ * 于是 `fs.writeFileSync('openssl_1:3.6.3_aarch64.deb', buf)` 不会报错,
+ * 但数据写进了名为 `3.6.3_aarch64.deb` 的 ADS, **基础文件 `openssl_1` 保持 0 字节**。
+ *
+ * 这个失败是静默的, 而且 Node 自己按同一个路径读能读回来, 所以:
+ *   · 在线模式解包是对的, 但大小校验读到基础文件的 0 ≠ 期望值 → **每次运行都重下**
+ *   · 离线模式按 `*.deb` 列目录, 看到的是 `openssl_1` (无后缀) → **静默跳过**
+ *     (实测漏掉 openssl 与 ca-certificates, 后果是 TLS 彻底坏掉)
+ *
+ * 所以缓存名要转义掉 Windows 的非法字符。非 Windows 平台保持原名。
+ */
+function safeCacheName(filename) {
+	const base = path.basename(filename);
+	if (process.platform !== 'win32') return base;
+	return base.replace(/[:*?"<>|]/g, (c) => '%' + c.charCodeAt(0).toString(16).padStart(2, '0'));
+}
+// 默认装这些:
+//   nodejs      运行时
+//   bash        安卓自带的是 mksh 而不是 bash, 而 agent 写的脚本通常是 bash
+//   ripgrep     harness 的 grep / glob 工具要 rg
+//   npm, pnpm   DSH 的插件管理器**写死了调用 pnpm** (execa("pnpm", ...)),
+//               没有它 GUI 的"添加插件"和 `dsh plugin add` 都会失败
+const ROOT_PKGS = String(argValue('--packages', 'nodejs,bash,ripgrep,npm,pnpm'))
 	.split(',')
 	.map((s) => s.trim())
 	.filter(Boolean);
@@ -376,13 +406,16 @@ function resolveLink(destDir, link) {
 const PRUNE_IN_PREFIX = [
 	'include', // 头文件, 编译期才需要
 	'share/man',
-	'share/doc',
 	'share/info',
 	'share/icu',
 	'share/aclocal',
 	'lib/pkgconfig',
 	'lib/cmake',
 	'lib/icu',
+	// ⚠️ 故意**不裁** share/doc.
+	// Debian/Termux 的包把许可证文本放在 share/doc/<pkg>/copyright,
+	// 裁掉它 = 随包分发第三方二进制却不附许可证, 那是违规的.
+	// (曾经裁过, 是个真错误, 已改回.)
 ];
 
 // 裁剪候选. 注意这些是"候选"而不是"要删的" —— 删之前必须扫一遍包里的代码,
@@ -406,22 +439,43 @@ const PRUNE_CANDIDATES = [
 const PRUNE_FILES = ['CHANGELOG.md', 'HISTORY.md'];
 const SCAN_EXT = /\.(js|cjs|mjs|json)$/i;
 
+/**
+ * 删掉一个路径 (目录或**文件**), 返回释放的字节数.
+ *
+ * ⚠️ 历史 bug: 这个函数原来无条件先 `fs.readdirSync(p)` 再 `fs.rmSync`。
+ * 对**文件**调用时 readdirSync 抛 ENOTDIR, 被 catch 吞掉, 于是 rmSync 从没执行 ——
+ * 静默地什么都没删, 还返回 0。
+ *
+ * 后果: `pruneRuntime` 里删 `.a` / `.la` 静态库那段一直没生效,
+ * 而 `pruneShareDoc` 第一次写就踩了这个坑 (163 个文件一个没删, 省下 0 字节).
+ *
+ * 现在按 lstat 分派: 目录才递归统计, 文件直接取 size。
+ */
 function removeIfExists(p) {
-	if (!fs.existsSync(p)) return 0;
+	let st;
+	try {
+		st = fs.lstatSync(p);
+	} catch {
+		return 0;
+	}
 	let bytes = 0;
 	try {
-		const walk = (d) => {
-			for (const e of fs.readdirSync(d, { withFileTypes: true })) {
-				const full = path.join(d, e.name);
-				if (e.isDirectory()) walk(full);
-				else {
-					try {
-						bytes += fs.statSync(full).size;
-					} catch {}
+		if (st.isDirectory()) {
+			const walk = (d) => {
+				for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+					const full = path.join(d, e.name);
+					if (e.isDirectory()) walk(full);
+					else {
+						try {
+							bytes += fs.statSync(full).size;
+						} catch {}
+					}
 				}
-			}
-		};
-		walk(p);
+			};
+			walk(p);
+		} else {
+			bytes = st.size;
+		}
 		fs.rmSync(p, { recursive: true, force: true });
 	} catch {}
 	return bytes;
@@ -441,6 +495,57 @@ function pruneRuntime(out) {
 			if (f.endsWith('.a') || f.endsWith('.la')) saved += removeIfExists(path.join(dir, f));
 		}
 	}
+	// share/doc: **只留许可证文本**, 删掉手册 / changelog / HTML 文档.
+	//
+	// 为什么不是整个删: 分发 GPL/LGPL 二进制时附许可证是**义务**, 不是礼貌.
+	// 为什么不是整个留: 实测 share/doc 共 5.4 MiB, 其中只有 0.2 MiB 是许可证 ——
+	//   剩下 5.2 MiB 是 bash 的 HTML 手册、pcre2 的文档、各家的 CHANGES.
+	saved += pruneShareDoc(path.join(prefix, 'share', 'doc'));
+	return saved;
+}
+
+/** share/doc 下只保留许可证类文件, 其余删掉. 返回省下的字节数. */
+function pruneShareDoc(docDir) {
+	if (!fs.existsSync(docDir)) return 0;
+	let saved = 0;
+	const isLicense = (n) => /^(copyright|licen[cs]e|copying|notice|authors)/i.test(n);
+	const walk = (d) => {
+		let entries;
+		try {
+			entries = fs.readdirSync(d, { withFileTypes: true });
+		} catch {
+			return;
+		}
+		for (const e of entries) {
+			const full = path.join(d, e.name);
+			if (e.isDirectory()) walk(full);
+			else if (!isLicense(e.name)) saved += removeIfExists(full);
+		}
+	};
+	walk(docDir);
+	// 清掉因此变空的目录
+	const pruneEmpty = (d) => {
+		let entries;
+		try {
+			entries = fs.readdirSync(d, { withFileTypes: true });
+		} catch {
+			return true;
+		}
+		let empty = true;
+		for (const e of entries) {
+			const full = path.join(d, e.name);
+			if (e.isDirectory()) {
+				if (!pruneEmpty(full)) empty = false;
+			} else empty = false;
+		}
+		if (empty && d !== docDir) {
+			try {
+				fs.rmdirSync(d);
+			} catch {}
+		}
+		return empty;
+	};
+	pruneEmpty(docDir);
 	return saved;
 }
 
@@ -809,10 +914,17 @@ async function main() {
 	let totalLinkFailed = 0;
 	for (const f of pkgs) {
 		const url = `${repoBase}/${f.Filename}`;
-		const local = path.join(cacheDir, path.basename(f.Filename));
-		if (!fs.existsSync(local) || fs.statSync(local).length !== parseInt(f.Size ?? '0', 10)) {
+		const local = path.join(cacheDir, safeCacheName(f.Filename));
+		const expected = parseInt(f.Size ?? '0', 10);
+		if (!fs.existsSync(local) || fs.statSync(local).length !== expected) {
 			const buf = await fetchBuffer(url);
 			fs.writeFileSync(local, buf);
+			// 下完立刻核大小. 没有这道校验的话, "写进了 ADS 而基础文件是 0 字节"
+			// 这种静默失败会一路带到解包 (见 safeCacheName 的注释).
+			const got = fs.statSync(local).size;
+			if (expected > 0 && got !== expected) {
+				die(`下载后大小不符: ${path.basename(local)}\n  期望 ${expected} 字节, 实际 ${got} 字节\n  如果实际是 0, 多半是文件名里有平台非法字符 (Windows 的 ':')`);
+			}
 		}
 		const r = extractDeb(local, OUT, f.Package);
 		totalFiles += r.files;
