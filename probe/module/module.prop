@@ -2,5 +2,5 @@ id=dsh_android_probe
 name=DSH Android Runtime Probe
 version=0.1.0
 versionCode=1
-author=you
+author=Strbit
 description=最小验证模块: KSU 模块能否 exec 自带二进制 / bionic Node 能否起来 / platform 与 ABI / spawn / TLS / 原生模块加载

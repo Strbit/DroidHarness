@@ -2,24 +2,39 @@
 
 本文件只记录**设备事实、平台行为与设计约束**，不引用任何第三方实现。
 
-- **目标设备**：Redmi K90 Pro Max · HyperOS 3 / Android 16 · KernelSU + LSPosed
+- **适用范围**：已 root 的 **arm64-v8a** 安卓设备，KernelSU / Magisk / APatch 均可
+- **测试环境**：Redmi K90 Pro Max · HyperOS 3 / Android 16 · KernelSU + LSPosed（目前只在这一台上验过）
 - **文档性质**：平台事实 + 设计输入 + 风险登记册。所有"未验证"项均显式标注。
 - **配套**：[mobile-control-layer-design.md](mobile-control-layer-design.md)（控制层设计）
 
 ---
 
-## 1. 目标设备
+## 1. 适用范围与测试环境
 
-| 项 | 值 | 对方案的意义 |
+**适用范围** —— 这个模块要能跑在什么设备上：
+
+| 项 | 要求 | 说明 |
 |---|---|---|
-| 型号 | Redmi K90 Pro Max | 小米系 → 第 3 章全部适用 |
+| Root | KernelSU / Magisk / APatch **任一** | 模块格式与 Magisk 兼容，三种管理器都能装 |
+| ABI | **arm64-v8a** | 随包发的 Node 运行时是按这个 ABI 构建的；其他 ABI 需要另配运行时 |
+| Android 版本 | 未设硬性下限 | 运行时来自 Termux 的包，理论支持范围跟它一致；**实测只在 Android 16 上** |
+| 存储 | `/data` 可写、`/sdcard` 可访问 | 模块装在 `/data/adb/modules/`，工作区在 `/sdcard/` |
+| 其他 | 无 | 不依赖特定 SoC、屏幕、或 OEM 特性 |
+
+**测试环境** —— 目前只在这一台上验过，其他机型与 ROM 未验证：
+
+| 项 | 值 | 备注 |
+|---|---|---|
+| 型号 | Redmi K90 Pro Max | 小米系 → 第 3 章适用 |
 | SoC | Qualcomm SM8850-AC Snapdragon 8 Elite Gen 5 (3nm) | Hexagon NPU 是新一代；若日后做端侧 OCR，需较新的 QAIRT/QNN SDK 支持 |
-| 系统 | **Android 16 + HyperOS 3** | Android 版本满足要求；HyperOS 是需要适配的变量 |
+| 系统 | **Android 16 + HyperOS 3** | HyperOS 是需要留意的变量，见第 3 章 |
 | 屏幕 | 6.9" 1200×2608 @ ~416 ppi，120Hz LTPO AMOLED | 虚拟屏需自适应；打孔镜像需核对 |
 | 内存 | 12/16 GB | 充裕 |
 | Root | KernelSU | 特权通道的基础 |
 | Hook 框架 | LSPosed | 部分能力依赖 |
-| ABI | arm64-v8a | 决定原生模块的平台包选择 |
+| ABI | arm64-v8a | 与上面的适用范围一致 |
+
+> **这一台不是"目标设备"，只是手边唯一能测的机器。** 第 3 章那些坑是"**如果你的 ROM 也是这一系**就会遇到"，不是"方案假定了这一系"。
 
 ---
 
@@ -42,7 +57,9 @@
 
 ---
 
-## 3. HyperOS 平台事实
+## 3. HyperOS / MIUI 平台事实（视你的 ROM 而定）
+
+> 这一章只对**小米系 ROM**（HyperOS / MIUI）成立。如果你的设备是别的 ROM，整章可以跳过 —— **模块本身不依赖这一系的任何东西**，这里记的只是"如果你恰好也在这一系上跑，会遇到什么"。
 
 ### 3.1 后台保活（最可能踩的坑）
 
@@ -82,7 +99,7 @@ root 的 `pm` 绕过 adb 那套授权交互。
 - 有 **HyperOS 2.x 上 LSPosed 崩溃**的报告
 - 有 **Android 16 新安全补丁上 LSPosed 崩溃**的报告
 
-**你的设备同时命中两个维度**（HyperOS + 新补丁）。**未验证**：这些报告是否已在最新版修复。
+**小米系 + 新补丁的设备会同时命中两个维度**。**未验证**：这些报告是否已在最新版修复。
 
 **应对顺序**
 1. 确认用的是活跃维护的分支而非已停维护的原版

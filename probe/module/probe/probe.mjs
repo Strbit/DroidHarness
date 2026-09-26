@@ -68,7 +68,7 @@ if (process.platform === 'android') {
 	);
 }
 
-if (process.arch === 'arm64') ok('arch 报 arm64', '与 K90 Pro Max 一致');
+if (process.arch === 'arm64') ok('arch 报 arm64', '与随包发的运行时的构建目标一致');
 else warn('arch 不是 arm64', `报的是 "${process.arch}"`);
 
 // ─────────────────────────────────────────────────────────────

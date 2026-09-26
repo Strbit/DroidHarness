@@ -1,8 +1,9 @@
-# DSH on Android — KernelSU 模块
+# DSH on Android — KernelSU / Magisk 模块
 
-把 DeepSeek Harness 跑在**已 root 的安卓手机**上，以 KernelSU 模块形态分发。
+把 DeepSeek Harness 跑在**已 root 的 arm64 安卓设备**上，以 KernelSU / Magisk 模块形态分发。
 
-- **目标设备**：Redmi K90 Pro Max · HyperOS 3 / Android 16 · KernelSU
+- **适用范围**：已 root 的 **arm64-v8a** 安卓设备。KernelSU / Magisk / APatch 均可（模块格式与 Magisk 兼容）
+- **测试环境**：只在 **Redmi K90 Pro Max · HyperOS 3 / Android 16 · KernelSU** 上验过；其他机型与 ROM 未验证
 - **不需要 Termux**：运行时在 PC 上从 Termux 的 `.deb` 解出来，打进模块
 - **只绑 `127.0.0.1`**：这不是保守，是设计约束（见下）
 
@@ -132,14 +133,36 @@ DSH 本身就是一个能跑 shell 的 agent，所以这里把第一条钉死：
 
 ---
 
+## 兼容性
+
+| 项 | 状态 |
+|---|---|
+| Root 管理器 | **KernelSU 已实测**。Magisk / APatch 应该也能装（模块格式兼容），但**未验证** |
+| ABI | **只做了 arm64-v8a**。其他 ABI 需要另配运行时（`fetch-runtime.mjs --arch`） |
+| Android 版本 | 只在 **Android 16** 上验过。运行时来自 Termux 的包，理论支持范围跟它一致 |
+| ROM | 只在 **HyperOS 3** 上验过。**模块不依赖任何 OEM 特性**；HyperOS / MIUI 特有的注意事项见[平台笔记](../docs/android-agent-harness-plan.md) 第 3 章（如果你的 ROM 不是这一系，那章可以整章跳过） |
+| 屏幕 | 不依赖具体分辨率 / DPI（运行时探测） |
+| SoC | 不依赖。唯一沾边的是端侧 OCR 的 NPU 支持，而那个功能现在没做 |
+
 ## 已知限制
 
-- **首次安装较慢**：25,871 个文件要解压。安装脚本**故意不对 `app/` 做 `set_perm_recursive`**（那是逐个 shell 调用，会慢到不可接受），改用一条 `chmod -R a+rX`。
-- **没有裁剪**：`app/` 里含约 44 MiB 的 source map、41 MiB 的 `.ts`、8 MiB 的 Markdown 与测试目录，合计约 100 MiB 是运行时不用的。为了先拿到可用产物没有裁。裁的话要按"引用扫描"来，不能按目录名猜（见 `probe/README.md` 里 koffi `src/` 那次教训）。
-- **`node-pty` 没有原生模块**：安装脚本被跳过，所以持久终端不可用。DSH 设计上容忍。
+- **首次安装较慢**：25,871 个文件要解压。安装脚本**故意不对 `app/` 做 `set_perm_recursive`**（那是逐个 shell 调用，会慢到不可接受），改用一条 `chmod -R 0755`。
+- **没有裁剪**：`app/` 里约 **113 MiB** 是运行时不用的 —— source map 44 MiB、`.d.ts` 类型声明 33 MiB、Windows 调试符号 20 MiB、Markdown 与测试目录 16 MiB。为了先拿到可用产物没有裁。裁的话必须按**引用扫描**来，不能按目录名猜：koffi 的 `src/` 和 `yaml/dist/doc/` 都是"名字像文档、其实是运行时代码"的例子。
+- **`node-pty` 没有原生模块**：安装脚本被跳过（它在 HOST 上跑，而包是给 TARGET 的），所以持久终端不可用。DSH 设计上容忍。
 - **`sharp` 没有 android 变体**：图片处理可能不可用。
-- **`DroidHarness/dsh/module/app/` 与 `usr/` 不进 git**：它们是构建产物，由上面两条命令重建。
-- **未在真机验证**：这份模块还没有刷过。
+- **构建产物不进 git**：`dsh/module/{app,usr}/` 由上面两条命令重建。
+
+## 已实测
+
+在测试机（Redmi K90 Pro Max · HyperOS 3 / Android 16 · KernelSU）上：
+
+```
+模块目录 exec: OK   (u:r:ksu:s0 + SELinux enforcing)
+Node 26.4.0 / ABI 147 / platform=android / arch=arm64
+spawn / TLS / 系统 CA 库  全过
+shim 实测通过: shim-ok object function
+dsh web 已拉起, 监听 127.0.0.1:3080, Web GUI 可正常访问
+```
 
 ## 与 `probe/` 的关系
 
@@ -153,4 +176,4 @@ spawn / TLS / CA 全过
 
 结论通过后才有这个正式模块。`probe/` 保留着，以后排查平台问题还能用。
 
-平台事实、HyperOS 行为、安全设计输入的完整记录见 [`../docs/android-agent-harness-plan.md`](../docs/android-agent-harness-plan.md)。
+平台事实、平台行为与坑清单、安全设计输入、风险登记册的完整记录见 [`../docs/android-agent-harness-plan.md`](../docs/android-agent-harness-plan.md)。
