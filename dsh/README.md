@@ -106,7 +106,7 @@ adb shell su -c 'dshctl forward'   # 打印 PC 侧该敲的命令
 
 ---
 
-## 三个关键决定（都踩过）
+## 四个关键决定（都踩过）
 
 ### 1. `--ignore-scripts` 是必须的
 
@@ -195,11 +195,52 @@ if (platform !== 'linux' && platform !== 'darwin') throw ...
 
 那时可能出现会话日志撕裂。**真需要跨进程锁的话，正确做法是用 Android NDK 把本包自带的 `src/flock.c` 编成 android-arm64 的 `.node`**（源码是随包发的），而不是继续用替身。
 
+### 4. 脚本的 shebang 写死了 Termux 路径，必须重写
+
+**这条我一开始漏了，而且漏得很隐蔽：我只验证了 ELF 二进制"能跑"，没验证脚本。**
+
+Termux 的包里，**脚本**文件的 shebang 写死了：
+
+```
+#!/data/data/com.termux/files/usr/bin/sh
+```
+
+ELF 二进制不读 shebang，所以它们没事；但脚本的表现是「**文件明明在，却报 No such file or directory**」—— `execve` 找不到解释器。
+
+最阴的一例：`git-submodule` / `git-mergetool` 是 git 自带的 shell 脚本，在 `usr/libexec/git-core/` 下。git 找得到它们、但 execve 失败，于是**谎报**成：
+
+```
+git: 'submodule' is not a git command. See 'git --help'.
+```
+
+**这个错误信息会把排查方向带偏到「git 装得不全」。** 实际影响：`git clone --recurse-submodules`、`git submodule update`、`git mergetool`、`git filter-branch` 全部不可用。而且我加进运行时的 `npm` / `npx` / `wcurl` / `curl-config` **也是加了但不能用** —— 它们的入口 `npm-cli.js` 的 shebang 是 `#!/data/data/com.termux/files/usr/bin/env node`，而 **Android 上没有 `/usr/bin/env`**。
+
+实测共 **70 个**文件，`fetch-runtime.mjs` 的 `rewriteShebangs()` 在构建期重写其中 48 个：
+
+| 原 shebang | 个数 | 重写成 |
+|---|---|---|
+| `#!…/bin/sh` | 32 | `#!/system/bin/sh` |
+| `#!…/bin/env node` | 12 | `#!/data/adb/modules/dsh_android/usr/bin/node` |
+| `#!…/bin/env sh` | 2 | `#!/system/bin/sh` |
+| `#!…/bin/bash` | 2 | `#!/data/adb/modules/dsh_android/usr/bin/bash` |
+| `#!…/bin/env python3` | 14 | **不动** —— 模块里没有 python |
+| `#!…/bin/perl` | 7 | **不动** —— 没有 perl |
+| `#!…/bin/python` | 1 | **不动** |
+
+两个关键细节：
+
+1. **必须写运行时路径 `/data/adb/modules/<id>/usr/...`，不是 `modules_update/...`** —— 安装期间在 `modules_update`，重启后就不在了。`id` 从 `module.prop` 读，不写死。
+2. **只改文本脚本**：先判前两字节是不是 `#!`（ELF 首字节是 `\x7f`，天然排除），而且只换第一行、其余字节原样保留。
+
+**那 22 个没解释器的**（python3 / perl / python）在 README 里标注为不支持：`node-gyp` 编译原生模块、`git cvsserver` / `git send-email` / `gitweb` / `git p4` 用不了。
+
+> 这条是**手机端 agent 实测出来的**，它给出的清单（70 个、按 shebang 分类）和我事后复核的结果完全一致。
+
 ---
 
 ## 插件安装（pnpm）
 
-DSH 的插件管理器**把参数原样转发给 `pnpm` 执行**，所以运行时里必须有 pnpm。本模块带的是 **Termux 编的 pnpm 12.7.0**（ELF 二进制，46.8 MiB）。
+DSH 的插件管理器**把参数原样转发给 `pnpm` 执行**，所以运行时里必须有 pnpm。本模块带的是 **NDK 编的 Android ELF**（pnpm 12.7.0，46.8 MiB；`ELF 64-bit LSB arm64, dynamic (/system/bin/linker64)` —— 不是 Termux 那个写死路径的构建）。
 
 它在 Android 上有两个坑，`service.sh` 已经处理了第一个：
 
@@ -226,7 +267,7 @@ export npm_config_state_dir="$DSH_HOME_DIR/.pnpm-state"
 
 npm 上发布的 pnpm 的 `bin/pnpm.mjs` shebang 是 `#!/usr/bin/env node`，而 **Android 上没有 `/usr/bin/env`**，直接 exec 会失败 —— 必须包一层启动器显式用 node 拉起。
 
-**本模块用的是 Termux 编的 ELF 二进制，不读 shebang，所以不受这条影响。** 但如果你把 `usr/bin/pnpm` 换成 npm 上的 pnpm JS 包，就要注意。
+**本模块用的是 NDK 编的 Android ELF（不读 shebang），所以不受这条影响。** 但如果你把 `usr/bin/pnpm` 换成 npm 上的 pnpm JS 包，就要注意。
 
 ### 装插件
 
