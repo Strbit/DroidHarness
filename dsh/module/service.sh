@@ -67,6 +67,36 @@ export SHELL="$PREFIX/bin/bash"
 export OPENSSL_CONF="$DSH_HOME_DIR/tmp/openssl.cnf"
 : >"$OPENSSL_CONF" 2>/dev/null
 export SSL_CERT_DIR=/system/etc/security/cacerts
+
+# ── git ─────────────────────────────────────────────────────
+#
+# git 的 ELF 里**编译进了** Termux 前缀的 exec-path, 于是所有**脚本型子命令**
+# 全都找不到, 而且报的是**误导性**的错误:
+#
+#     $ git submodule
+#     git: 'submodule' is not a git command. See 'git --help'.
+#
+# 这会把人带偏到「git 装得不全」—— 而 `git-submodule` 明明就在模块里、
+# shebang 也已经修成 `#!/system/bin/sh`。真正的原因是: **git 压根不去模块目录找,
+# 它只查 exec-path**, 而 exec-path 是编译进二进制的:
+#
+#     $ git --exec-path
+#     /data/data/com.termux/files/usr/libexec/git-core      ← 这个目录不存在
+#
+# 这个 bug 和「脚本 shebang 写死 Termux 路径」是**两个独立问题**, 但症状叠在
+# `git submodule` 这一个命令上 —— 修掉 shebang 不会让症状消失, 极易误判成没修好。
+# (这条是手机端 agent 实测发现的。)
+#
+# 受影响: git submodule / mergetool / subtree / filter-branch / request-pull /
+#         instaweb / quiltimport / merge-octopus ... 以及它们间接调用的 git-sh-setup。
+# 不受影响: builtin 子命令 (add / commit / status ...), 那些编译在二进制里。
+#
+# 用环境变量覆盖 (git 官方支持的方式)。**不要改二进制**: 里面那条 Termux 路径
+# 48 字节, 而模块路径 49 字节, 原地打补丁会溢出。
+#
+# 模板目录同理, 也是 Termux 路径; 不设的话 `git init` 装不出 hook 样本(实测装 0 个)。
+export GIT_EXEC_PATH="$PREFIX/libexec/git-core"
+export GIT_TEMPLATE_DIR="$PREFIX/share/git-core/templates"
 export NO_COLOR=1
 
 # ── 包管理器 (pnpm) ─────────────────────────────────────────
