@@ -4,7 +4,8 @@
 
 它**不启动 DSH**，只测 DSH 依赖的那些底层能力。目的是把"能不能跑"这件事和"写控制层"解耦——先用最小代价把地基验证掉，再动手写工具。
 
-- 目标机：Redmi K90 Pro Max · HyperOS 3 / Android 16 · KernelSU
+- 适用范围：已 root 的 **arm64-v8a** 安卓设备（KernelSU / Magisk / APatch）
+- 测试环境：Redmi K90 Pro Max · HyperOS 3 / Android 16 · KernelSU（目前只在这一台上验过）
 - 形态：**KernelSU 模块**（不是 APK，也不是 Termux）
 - 手机端**不需要装 Termux**：Node 运行时在 PC 上从 Termux 的 `.deb` 解出来，打进模块里
 

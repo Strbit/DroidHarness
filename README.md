@@ -4,9 +4,10 @@
 
 手机侧控制层自研，**不复用任何第三方控制实现**；形态是 **KernelSU 模块**（不是 APK，也不是 Termux）；控制层与 harness 解耦，未来可以把 DSH 换成自己的 harness 而控制层一行不动。
 
-- **目标设备**：Redmi K90 Pro Max · HyperOS 3 / Android 16 · KernelSU + LSPosed
+- **适用范围**：已 root 的 **arm64-v8a** 安卓设备。KernelSU / Magisk / APatch 均可（模块格式与 Magisk 兼容）
+- **测试环境**：目前只在 **Redmi K90 Pro Max · HyperOS 3 / Android 16 · KernelSU + LSPosed** 上验过；其他机型与 ROM 未验证
 - **长期目标**：DSH 跑在手机本地 → 逐步换成自己的 harness
-- **当前状态**：地基探针就绪，待真机验证；控制层未开始
+- **当前状态**：DSH 模块已能在测试机上跑起来（Web GUI 可访问）；自研控制层未开始
 
 ---
 

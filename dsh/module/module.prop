@@ -3,4 +3,4 @@ name=DSH on Android
 version=0.1.0
 versionCode=1
 author=Strbit
-description=在已 root 的安卓机上以 KernelSU 模块形态运行 DeepSeek Harness。自带 aarch64 Node 运行时 (含 bash 与 ripgrep)，本地服务只绑 127.0.0.1
+description=在已 root 的 arm64 安卓机上以 KernelSU / Magisk 模块形态运行 DeepSeek Harness。自带 aarch64 Node 运行时 (含 bash 与 ripgrep)，本地服务只绑 127.0.0.1

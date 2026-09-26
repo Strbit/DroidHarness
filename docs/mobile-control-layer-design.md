@@ -2,7 +2,8 @@
 
 **目标**：DSH 跑在手机里；手机侧的控制层自研，不复用任何第三方实现。
 **长期目标**：未来换成自己的 harness——所以控制层**不能绑在 DSH 上**。
-**设备**：Redmi K90 Pro Max · HyperOS 3 / Android 16 · KernelSU + LSPosed
+**适用范围**：已 root 的 **arm64-v8a** 安卓设备（KernelSU / Magisk / APatch）
+**测试环境**：Redmi K90 Pro Max · HyperOS 3 / Android 16 · KernelSU + LSPosed（目前只在这一台上验过）
 
 > 配套阅读：[android-agent-harness-plan.md](android-agent-harness-plan.md)（设备事实、平台行为、安全设计输入、风险登记册）。
 
