@@ -166,9 +166,18 @@ if [ -f "$PROBE" ]; then
 	if [ $PROBE_RC -ne 0 ]; then
 		ui_print "[WARN] 探针退出码 $PROBE_RC (注意: 不带 --expose-internals 会退出, 见下)"
 		ui_print "  用不带该旗标的方式重试一次..."
-		"$PROBE_NODE" "$PROBE" >"$WORK/probe.log" 2>&1
-		PROBE_RC=$?
-		ui_print "  重试退出码 $PROBE_RC"
+		# 注意: 这里必须用 >> 追加而不是 > 覆盖.
+		# 第一遍 (带 --expose-internals) 的输出正是诊断失败原因的关键,
+		# 用 > 会把它整体冲掉, 最终日志里只剩重试结果, 原始报错永久丢失.
+		{
+			echo ""
+			echo "=========================================="
+			echo "重试: 不带 --expose-internals (第一遍退出码 $PROBE_RC)"
+			echo "=========================================="
+		} >>"$WORK/probe.log"
+		"$PROBE_NODE" "$PROBE" >>"$WORK/probe.log" 2>&1
+		PROBE_RC2=$?
+		ui_print "  重试退出码 $PROBE_RC2"
 	fi
 	while IFS= read -r line; do
 		ui_print "$line"
