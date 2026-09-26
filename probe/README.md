@@ -34,7 +34,7 @@ node tools\fetch-runtime.mjs --list          # 先看会下载什么
 node tools\fetch-runtime.mjs --with-koffi    # 真下载 + 解包到 module\usr\
 ```
 
-它做的事：取 Termux 的 `Packages` 索引 → 递归解析 `nodejs` 的依赖闭包 → 下载 `.deb` → 解析 `ar` → 解 `data.tar.xz` → 自己解内层 tar。
+它做的事：取 Termux 的 `Packages` 索引 → 递归解析 `nodejs` / `bash` / `ripgrep` 的依赖闭包 → 下载 `.deb` → 解析 `ar` → 解 `data.tar.xz` → 自己解内层 tar。
 
 **不需要 `ar` / `tar` / `zstd`** —— `ar` 解析和 tar 解包都是脚本自己实现的（原因见下）。
 **但 xz 需要外部帮忙**：Termux 的 `.deb` 实测用的是 `data.tar.xz`，而 Node 的 `zlib` 没有 xz。脚本按顺序找：
@@ -58,14 +58,42 @@ tar 格式本身很简单（512 字节头 + 数据块，八进制长度），所
 ### 实测结果（PC 侧已验证）
 
 ```
-Termux nodejs 26.4.0-1  →  usr/bin/node  49,715,528 bytes  ELF64 AArch64 ✓
-依赖闭包 10 个包 / 23.4 MiB  →  693 个文件  →  usr/lib 下 32 个共享库
-裁剪开发文件 (include / man / doc / pkgconfig / cmake)   省下 9.6 MiB
+Termux nodejs  26.4.0-1  →  usr/bin/node   49,715,528 bytes  ELF64 AArch64 ✓
+Termux bash     5.3.20   →  usr/bin/bash      880,416 bytes  ELF64 AArch64 ✓
+Termux ripgrep 15.2.0    →  usr/bin/rg      4,868,920 bytes  ELF64 AArch64 ✓
+依赖闭包 17 个包 / 27.8 MiB  →  usr/lib 下 24 个共享库
+裁剪开发文件 (include / man / doc / pkgconfig / cmake)   省下 17.0 MiB
 符号链接改为清单 (18 条)                                  省下约 88 MiB 重复内容
-module/ 最终 99.4 MiB / 24 文件   →   打包后 zip 34.8 MiB
+module/ 最终约 106 MiB   →   打包后 zip 38.9 MiB (219 条目)
 ```
 
 注意 Termux 的 Node 是 **26.4.0**，远高于 DSH 要求的 `>=22.19.0`。
+
+**为什么还要装 bash 和 ripgrep**：安卓自带的是 mksh 而不是 bash，且没有 `rg`，而 harness 的 shell 工具需要 bash、grep / glob 工具需要 `rg`。真机探针显示只装 `nodejs` 时 `SHELL` 会退回 `/system/bin/sh`。
+
+### 要排除 Termux app 专用的包装器
+
+加 bash 后依赖闭包会从 10 个包涨到 **55 个**，因为 `termux-tools` 拉进了 coreutils / curl / findutils / gawk / grep / sed / tar / util-linux。
+
+**但其中 `termux-am` 会往 `$PREFIX/bin/am` 放一个只跟 Termux app 通信的包装器**，而 `$PREFIX/bin` 在 PATH 里靠前 —— 我们的 `am` 调用会打到它而不是 `/system/bin/am`。`termux-exec` 还会改 exec 行为（LD_PRELOAD）。
+
+所以脚本排除了 `termux-am` / `termux-am-socket` / `termux-exec` / `termux-tools`，闭包降到 **17 个包**，且没有 shadow 风险。
+
+### 裁剪 npm 包：按引用扫描，不按目录名猜
+
+曾把 `koffi` 的 `src/` 当成开发目录删掉 —— 而 `koffi/index.cjs` 就是
+`module.exports = require("./src/koffi/index.cjs")`，`src/` 是**运行时必需**的。
+结果设备上 `require("koffi")` 直接报 `MODULE_NOT_FOUND`。
+
+根因不是"列表里漏了 `src`"，而是**按目录名猜哪些是开发文件**这个做法本身不成立。现在改成**引用扫描**：删之前先扫包里所有 JS，有 `require` / `import` 引用就保留，并在输出里说明原因：
+
+```
+裁剪 koffi: 省 531 KiB
+  保留 src <- index.cjs  (有代码引用, 删了会坏)
+✓ koffi 加载器入口在位 (src/koffi/index.cjs)
+```
+
+另外对 koffi 加了显式的加载器入口校验 —— 布局坏了在 PC 上就报出来，不用等真机才发现。
 
 ### 符号链接为什么要走清单
 
