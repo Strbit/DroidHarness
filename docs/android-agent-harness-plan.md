@@ -263,6 +263,26 @@ HyperOS 的「应用双开」= **另一个 Android user**（`user 999`，名字 
   - 随机小 I/O 慢，大量小文件（比如 `node_modules`）会很痛
 - **Android 11+ `/sdcard/Android/data/<pkg>/`** 别的 app 与 adb 都访问不到 → 工作区要用顶层目录（如 `/sdcard/<name>/`）。
 
+### 5.6 第三方组件与许可证
+
+从 Termux 的 `.deb` 抽二进制打进自己的包，法律上没问题，但**有义务**。
+
+- **Termux 不是"一个许可证"，它是发行版。** 依据 [termux-packages/LICENSE.md](https://github.com/termux/termux-packages/blob/master/LICENSE.md)：
+  *"the scripts and patches to build each package is licensed under the same license as the actual package"*。
+  **每个包带自己上游的许可证。**
+- 我们那 27 个运行时包里，**5 个受 GPL / LGPL 约束**：`bash`(GPL-3.0)、`readline`(GPL-3.0)、`git`(GPL-2.0)、`less`(GPL-3.0 + custom)、`libiconv`(LGPL-2.1 + GPL-3.0)。
+- **这是"聚合"，不是"链接"** —— 自己的 MIT/Apache 代码**不会**因此变成 GPL。义务只落在**那些二进制**上：附许可证、提供对应源码、不给接收者加额外限制。
+- **不要裁掉 `share/doc/<pkg>/copyright`。** Debian/Termux 把许可证文本放那儿，删掉它 = 随包发第三方二进制却不附许可证。（曾经裁过，是错的。正确做法是**只留许可证、删掉手册文档** —— 实测 `share/doc` 5.4 MiB 里只有 0.2 MiB 是许可证。）
+- **GitHub 的协议标签会误导人。** 它只按仓库根的 `LICENSE` 显示一个标签，而那个标签**不代表整个仓库**。必须有 `THIRD_PARTY_NOTICES.md` 写清楚。
+
+清单用脚本生成，别手写（包会变，手写的必然过期）：
+
+```sh
+node dsh/tools/gen-third-party-notices.mjs
+```
+
+数据来源是各包自己的元数据 —— Termux 的 `TERMUX_PKG_LICENSE` 与 APT 索引、npm 的 `package.json`。**不是猜的。**
+
 ---
 
 ## 6. 风险登记册

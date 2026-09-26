@@ -15,15 +15,28 @@ module/
 ├── customize.sh              安装时: 建符号链接 + 冒烟测试
 ├── service.sh                开机: 拉起 dsh web (带监督与熔断)
 ├── bin/dshctl                控制脚本 start/stop/status/log/forward
-├── usr/                      运行时 (aarch64 Node 26.4.0 + bash + ripgrep + 依赖库)
-└── app/                      DSH 应用树 (513 个包)
+├── usr/                      运行时 (aarch64 Node 26.4.0 + bash + ripgrep + npm + pnpm + 依赖库)
+│   └── share/doc/<包名>/copyright        各第三方组件的许可证全文
+└── app/                      DSH 应用树 (495 个 npm 包)
     └── node_modules/
         ├── @deepseek-ai/dsh/lib/bin.js     入口
         ├── @koromix/koffi-android-arm64/   原生模块的平台预编译包
         └── node-addon-require-builtin/     ← 已被 JS 替身顶替, 见下
 ```
 
-体积：`usr/` 约 104 MiB，`app/` 约 225 MiB（25,715 个文件）。**打包后 zip 约 101 MiB**（构建耗时约 5 分钟，主要是压那两万多个文件）。
+**为什么运行时里有 npm 和 pnpm**：DSH 的插件管理器**写死了调用 `pnpm`**（`execa("pnpm", ...)`），
+没有它，GUI 的"添加插件"和 `dsh plugin add` 都会失败。
+
+## 许可证
+
+| 文件 | 覆盖 |
+|---|---|
+| [`../LICENSE`](../LICENSE)（Apache-2.0） | **只覆盖本项目自己写的代码** |
+| [`../THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) | **随包分发的第三方组件** —— 27 个运行时二进制 + 495 个 npm 包 |
+
+运行时里有 **5 个受 GPL / LGPL 约束**（`bash`、`readline`、`git`、`less`、`libiconv`），
+分发它们时提供对应源码是**义务**，清单里给了地址。许可证全文随包发在 `usr/share/doc/<包名>/copyright`
+（这些文件**不被裁剪** —— 早期版本的裁剪逻辑删了它们，那是错的）。
 
 ---
 
@@ -32,17 +45,34 @@ module/
 ```powershell
 cd D:\projects\DroidHarness
 
-# 1. 取运行时 (aarch64 Node + bash + ripgrep)
+# 1. 取运行时 (aarch64 Node + bash + ripgrep + npm + pnpm)
 node probe\tools\fetch-runtime.mjs --out dsh\module
 
-# 2. 装 DSH 应用树并打补丁
+# 2. 装 DSH 应用树并打补丁 (两个 shim 都会实测校验)
 node dsh\tools\build-dsh-tree.mjs
 
 # 3. 打包
-powershell -ExecutionPolicy Bypass -File probe\tools\build-module.ps1 -ModuleDir dsh\module
+node probe\tools\pack-module.mjs --module dsh\module
 ```
 
-产物在 `dsh\dist\`。第 2 步会跑一次**实测校验**，确认 shim 真的能用。
+产物在 `dsh\dist\`。
+
+### 为什么打包脚本是 Node 而不是 PowerShell
+
+原来的 `build-module.ps1` 功能是对的，但慢得离谱：**28,074 个条目要 300–360 秒**。时间几乎全花在 PowerShell 的逐文件开销上（对象创建、流开关、.NET 互操作），而不是压缩 —— Deflate 本身能跑 20–50 MB/s，那版只有约 1 MB/s。它还多了一步完全不必要的 staging（用 `Copy-Item` 把 350 MiB 再拷一遍）。
+
+`pack-module.mjs` 不做 staging 拷贝，用 Node 的 zlib（C 实现），异步 `deflateRaw` 走 libuv 线程池拿到并行。实测 **106 MiB / 219 条目 7.1 秒**。
+
+**代价是体积大 5%**：.NET 的 Deflate 用的是 zlib-ng，压缩率确实比标准 zlib 好。实测同一个 `usr/bin/node`：
+
+```
+.NET (PowerShell)   15.244 MiB
+Node zlib level 9   16.151 MiB
+```
+
+我试过 `memLevel:9` / `windowBits:15` / `Z_FILTERED`，**全都更差**（35.34 / 35.13 / 36.45 MiB vs L9 的 35.13）。所以这不是参数没调对，是实现的差别。
+
+**5% 的体积换 15× 的速度是划算的**，而且真正的体积收益在裁剪 app 树（见"已知限制"）。`build-module.ps1` 保留着 —— 需要那 5% 时可以用它。
 
 ---
 
@@ -76,7 +106,7 @@ adb shell su -c 'dshctl forward'   # 打印 PC 侧该敲的命令
 
 ---
 
-## 两个关键决定（都踩过）
+## 三个关键决定（都踩过）
 
 ### 1. `--ignore-scripts` 是必须的
 
@@ -121,6 +151,50 @@ function requireBuiltin(moduleId) { return require(moduleId); }
 
 `requireBuiltin("internal/modules/esm/loader")` 返回的对象确实带 `getOrInitializeCascadedLoader` 函数——正是 `dsh-app-boot` 需要的。
 
+### 3. `node-addon-system/flock` 也要替身 —— 但这个是**语义降级**
+
+这个是后来在真机上撞出来的，症状很直接：
+
+```
+本轮运行失败: flock is not supported on android-arm64
+```
+
+`dsh-session-persistence-jsonl` 的会话写入路径要给 `session.lock` 上一个非阻塞 `flock(2)`，用的是 `@deepseek-ai/node-addon-system` 的原生模块。而它的 `optionalDependencies` 里：
+
+```
+darwin-arm64  darwin-x64  linux-x64  linux-arm64
+                              ← 没有 android
+```
+
+加载器第一句就按平台拒绝：
+
+```js
+if (platform !== 'linux' && platform !== 'darwin') throw ...
+```
+
+**注意：把 `platform` 骗成 `linux` 也没用** —— 它还会按 `report.header.glibcVersionRuntime` 在 glibc / musl 之间选，而 Android 用的是 bionic，两者都不是。
+
+**这个锁是干什么的**：跨**进程**的会话写所有权互斥。两个 DSH 进程同时写同一个会话日志会撕裂它。锁在持有者的 fd 关闭时由内核释放（进程崩溃也一样），所以不会留死锁。读者不碰它。
+
+**为什么可以降级**：**上游自己对单进程部署就是这么做的**。该文件自己的注释原文：
+
+> The browser worker stubs the native flock entry to immediate success: it is single-process, so the in-process write claim already excludes every writer.
+
+我们的部署同样是单进程 —— `service.sh` 是唯一拉起入口，带 pidfile 检查，拒绝启动第二个实例；进程内的写互斥由 `SessionWriteLease` 自己的状态保证，与 flock 无关。所以丢掉的**只有**"两个 DSH 进程之间的互斥"。
+
+替身源码在 [`shim/node-addon-system-flock.js`](shim/node-addon-system-flock.js)，实测：
+
+```
+✓ flock shim 实测通过: flock-shim-ok js-shim-single-process
+```
+
+**这个假设什么时候会破**（同样写在 shim 文件顶部）：
+
+- 你手动再跑一个 `dsh web`，而监督进程也在跑，且两者指向同一个 `DSH_HOME`
+- 你把 `service.sh` 的 pidfile 检查去掉
+
+那时可能出现会话日志撕裂。**真需要跨进程锁的话，正确做法是用 Android NDK 把本包自带的 `src/flock.c` 编成 android-arm64 的 `.node`**（源码是随包发的），而不是继续用替身。
+
 ---
 
 ## 为什么只绑 `127.0.0.1`
@@ -146,15 +220,39 @@ DSH 本身就是一个能跑 shell 的 agent，所以这里把第一条钉死：
 
 ## 已知限制
 
-- **首次安装较慢**：25,871 个文件要解压。安装脚本**故意不对 `app/` 做 `set_perm_recursive`**（那是逐个 shell 调用，会慢到不可接受），改用一条 `chmod -R 0755`。
-- **没有裁剪**：`app/` 里约 **113 MiB** 是运行时不用的 —— source map 44 MiB、`.d.ts` 类型声明 33 MiB、Windows 调试符号 20 MiB、Markdown 与测试目录 16 MiB。为了先拿到可用产物没有裁。裁的话必须按**引用扫描**来，不能按目录名猜：koffi 的 `src/` 和 `yaml/dist/doc/` 都是"名字像文档、其实是运行时代码"的例子。
+- **首次安装较慢**：14,228 个文件要解压。安装脚本**故意不对 `app/` 做 `set_perm_recursive`**（那是逐个 shell 调用，会慢到不可接受），改用一条 `chmod -R 0755`。
 - **`node-pty` 没有原生模块**：安装脚本被跳过（它在 HOST 上跑，而包是给 TARGET 的），所以持久终端不可用。DSH 设计上容忍。
 - **`sharp` 没有 android 变体**：图片处理可能不可用。
 - **构建产物不进 git**：`dsh/module/{app,usr}/` 由上面两条命令重建。
 
+## 裁剪
+
+`app/` 已经裁过一轮：**224.6 MiB / 25,715 文件 → 111.8 MiB / 12,008 文件**。
+
+裁掉的是运行期用不到的东西：source map 44 MiB、`.d.ts` 类型声明 33 MiB、Windows 调试符号 20 MiB、Markdown 与测试目录 16 MiB。
+
+```sh
+node dsh/tools/build-dsh-tree.mjs --skip-install --prune --dry-run   # 先看会删什么
+node dsh/tools/build-dsh-tree.mjs --skip-install --prune             # 真删
+```
+
+按**引用扫描**判断，不是按目录名猜。这次它拦住了一个真会坏事的删除：`yaml/dist/doc/` 名字像文档，实际是 `Document.js` 这些**运行时代码**。同类教训还有 koffi 的 `src/`。
+
+## 体积
+
+```
+usr/   183.9 MiB /  2,216 文件     运行时 (node 47.4 + pnpm 46.8 + libicudata 33.1 + ...)
+app/   111.8 MiB / 12,008 文件     DSH 应用树 (已裁剪)
+                               ─────────────
+       295.7 MiB / 14,228 文件
+zip    113.3 MiB                   (Node 打包器, 18.7 秒)
+```
+
+**`pnpm` 一个文件就 46.8 MiB** —— 它是静态链接的 Rust 二进制，而且**已经 strip 过**（`.debug_*` 与 `.symtab` 都是 0，`.text` 占 36 MiB），没得压。想再瘦身只有两条路，都要先在真机上验证插件能装上：换成 npm 上的 pnpm JS 包（省约 33 MiB，未验证能否在 bionic 上跑）、或不要 `git`（省约 17 MiB，代价是 `dsh plugin add github:...` 不可用）。
+
 ## 已实测
 
-在测试机（Redmi K90 Pro Max · HyperOS 3 / Android 16 · KernelSU）上：
+在测试机（REDMI K90 Pro Max · HyperOS 3 / Android 16 · KernelSU）上：
 
 ```
 模块目录 exec: OK   (u:r:ksu:s0 + SELinux enforcing)
@@ -163,6 +261,42 @@ spawn / TLS / 系统 CA 库  全过
 shim 实测通过: shim-ok object function
 dsh web 已拉起, 监听 127.0.0.1:3080, Web GUI 可正常访问
 ```
+
+**两个 shim 都在真机上验过**（用手机自己的 Node 跑真实 import，不是在 PC 上推断）：
+
+```
+$ node --input-type=module -e 'import {tryLockExclusive,FLOCK_IMPLEMENTATION} from "@deepseek-ai/node-addon-system/flock"; ...'
+flock-ok js-shim-single-process
+```
+
+**配置 API 后对话能正常跑完** —— 2026-09-26 真机确认，修掉了之前那句
+`本轮运行失败: flock is not supported on android-arm64`。
+
+### 验证时踩的坑一：`adb shell su` 不一定存在
+
+这台设备上 `su` 不在 `adb shell` 的 PATH 里（KernelSU 默认不往 PATH 放 `su`）：
+
+```
+$ adb shell 'su -c id'
+/system/bin/sh: su: inaccessible or not found
+```
+
+**要在 KernelSU 管理器里给 `com.android.shell`（uid 2000）授权 root，`adb shell su` 才能用。** 在那之前所有 `adb shell "su -c '...'"` 形式的命令都会失败 —— 而失败信息是 "not found"，很容易被误读成"没 root"。
+
+### 验证时踩的坑二：别拿端口号猜服务
+
+PC 的 `127.0.0.1:3080` 是**电脑端自己的 DSH**。手机端要另开一个转发端口（本项目用 `13080`）：
+
+```powershell
+adb forward tcp=13080 tcp=3080
+adb forward --list          # ← 先看映射表, 别拿返回值猜是谁
+```
+
+不带 token 访问会得到 **401**（DSH 的 token 鉴权）—— 那是**转发通了**的证据，不是错误。token 每次重启 DSH 都会变，取 `dshctl log` 里最新那条。
+
+### 验证时踩的坑三：Windows 上带冒号的 deb 文件名
+
+见 `probe/tools/fetch-runtime.mjs` 里 `safeCacheName()` 的注释。Debian 的 epoch 版本号形如 `1:3.6.3`，会原样出现在索引的 `Filename` 里，而 Windows 把 `:` 当 NTFS 备用数据流分隔符 —— 于是 `openssl` 与 `ca-certificates` 被静默跳过，**TLS 彻底坏掉且没有任何报错**。
 
 ## 与 `probe/` 的关系
 

@@ -122,36 +122,66 @@ if (!fs.existsSync(path.join(APP, 'node_modules'))) {
 }
 
 // ─────────────────────────── 2. 打补丁 ───────────────────────────
+//
+// 每个 shim 一条. 全部是同一个根因: **原包带的原生模块没有 android 变体**.
+// 各 shim 文件顶部写清了"为什么可以降级", 以及降级丢掉了什么.
 log('=== 打补丁 ===');
 
-const pkgDir = path.join(APP, 'node_modules', 'node-addon-require-builtin');
-const shimTarget = path.join(pkgDir, 'lib', 'index.js');
+const SHIMS = [
+	{
+		label: 'node-addon-require-builtin',
+		src: SHIM_SRC,
+		pkg: 'node-addon-require-builtin',
+		target: ['lib', 'index.js'],
+		expectMain: 'lib/index.js',
+		why: '平台专用原生加载器没有 android 变体',
+	},
+	{
+		label: 'node-addon-system/flock',
+		src: path.join(ROOT, 'dsh', 'shim', 'node-addon-system-flock.js'),
+		pkg: path.join('@deepseek-ai', 'node-addon-system'),
+		target: ['lib', 'flock.js'],
+		// 这个包走 exports 映射, 没有 main 字段 —— 只校验落点, 不校验 main
+		expectMain: null,
+		why: 'flock 原生模块没有 android 变体; 单进程部署下上游自己也这么做',
+	},
+];
 
-if (!fs.existsSync(pkgDir)) {
-	die(`找不到 ${pkgDir} —— 这棵树不完整`);
+const shimTargets = [];
+for (const s of SHIMS) {
+	const pkgDir = path.join(APP, 'node_modules', s.pkg);
+	if (!fs.existsSync(pkgDir)) die(`找不到 ${pkgDir} —— 这棵树不完整`);
+	if (!fs.existsSync(s.src)) die(`找不到 shim 源文件: ${s.src}`);
+
+	const target = path.join(pkgDir, ...s.target);
+	// 先确认落点没变, 免得版本升级后换了路径而我们静默没打上.
+	if (!fs.existsSync(target)) {
+		warn(`! 落点不存在: ${path.relative(APP, target)}`);
+		die(`shim 落点不匹配 (${s.label}), 拒绝继续`);
+	}
+	if (s.expectMain !== null) {
+		const pj = JSON.parse(fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf8'));
+		const mainField = pj.main ?? 'index.js';
+		if (mainField !== s.expectMain) {
+			warn(`! 原包 main 变成了 "${mainField}", 与 shim 假设的 ${s.expectMain} 不一致`);
+			die(`shim 落点不匹配 (${s.label}), 拒绝继续`);
+		}
+	}
+
+	fs.copyFileSync(s.src, target);
+	log(`  ✓ ${s.label}: 已用 JS 替身覆盖 ${path.relative(APP, target)}`);
+
+	// 顺手清掉装不上的平台 optionalDependencies —— 留着只会让 npm ls 报 unmet.
+	const pjPath = path.join(pkgDir, 'package.json');
+	const pj = JSON.parse(fs.readFileSync(pjPath, 'utf8'));
+	if (pj.optionalDependencies && Object.keys(pj.optionalDependencies).length > 0) {
+		pj.optionalDependencies = {};
+		pj.description = `JS shim (Android): ${s.why}`;
+		fs.writeFileSync(pjPath, JSON.stringify(pj, null, 2) + '\n');
+		log(`  ✓ ${s.label}: 已清掉 optionalDependencies`);
+	}
+	shimTargets.push(target);
 }
-if (!fs.existsSync(SHIM_SRC)) {
-	die(`找不到 shim 源文件: ${SHIM_SRC}`);
-}
-
-// 原包的 main 是 lib/index.js. 先确认, 免得版本升级后换路径而我们静默没打上.
-const pkgJson = JSON.parse(fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf8'));
-const mainField = pkgJson.main ?? 'index.js';
-if (mainField !== 'lib/index.js') {
-	warn(`! 原包 main 变成了 "${mainField}", 与 shim 假设的 lib/index.js 不一致`);
-	warn('  请更新本脚本的 shimTarget');
-	die('shim 落点不匹配, 拒绝继续');
-}
-
-fs.copyFileSync(SHIM_SRC, shimTarget);
-log(`  ✓ 已用 JS 替身覆盖 ${path.relative(APP, shimTarget)}`);
-
-// 顺手把原包的 optionalDependencies 清掉 —— 它们指向一堆装不上的平台包,
-// 留着只会让 npm ls 之类的工具报 unmet.
-pkgJson.optionalDependencies = {};
-pkgJson.description = 'JS shim (Android): 原包的平台专用原生加载器没有 android 变体';
-fs.writeFileSync(path.join(pkgDir, 'package.json'), JSON.stringify(pkgJson, null, 2) + '\n');
-log('  ✓ 已清掉该包的 optionalDependencies');
 
 // ─────────────────────────── 3. 校验 ───────────────────────────
 log('\n=== 校验 ===');
@@ -161,7 +191,7 @@ const checks = [
 	['koffi 平台预编译包', path.join(APP, 'node_modules', '@koromix', 'koffi-android-arm64', 'android_arm64', 'koffi.node')],
 	['koffi 加载器入口', path.join(APP, 'node_modules', 'koffi', 'src', 'koffi', 'index.cjs')],
 	['DSH 入口', path.join(APP, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')],
-	['shim 落点', shimTarget],
+	...shimTargets.map((t) => [`shim 落点 (${path.relative(APP, t)})`, t]),
 ];
 let bad = 0;
 for (const [label, p] of checks) {
@@ -199,6 +229,35 @@ const negative = spawnSync(
 	{ cwd: APP, encoding: 'utf8' }
 );
 log(`  · 不带旗标时: ${((negative.stdout ?? '') + (negative.stderr ?? '')).trim()}`);
+
+// flock shim 实测: 真开一个文件拿 fd, 走一遍 tryLockExclusive.
+// 这是唯一能证明"会话写入路径不会在 Android 上抛 unsupported platform"的方法.
+// (该 shim 是 ESM, 所以用 --input-type=module.)
+const flockSmoke = spawnSync(
+	nodeBin,
+	[
+		'--input-type=module',
+		'-e',
+		[
+			"import { open, rm } from 'node:fs/promises';",
+			"import { tryLockExclusive, FLOCK_IMPLEMENTATION } from '@deepseek-ai/node-addon-system/flock';",
+			"const p = '.__flock_smoke.lock';",
+			"const h = await open(p, 'w');",
+			'await tryLockExclusive(h.fd);',
+			'await h.close();',
+			'await rm(p, { force: true });',
+			"console.log('flock-shim-ok', FLOCK_IMPLEMENTATION);",
+		].join(' '),
+	],
+	{ cwd: APP, encoding: 'utf8' }
+);
+const flockOut = ((flockSmoke.stdout ?? '') + (flockSmoke.stderr ?? '')).trim();
+if (/flock-shim-ok js-shim-single-process/.test(flockOut)) {
+	log(`  ✓ flock shim 实测通过: ${flockOut}`);
+} else {
+	warn(`  ✗ flock shim 实测失败: ${flockOut}`);
+	bad++;
+}
 
 // ─────────────────────────── 4. 裁剪 ───────────────────────────
 // 设计原则: 只删"能证明没人引用"的东西.
