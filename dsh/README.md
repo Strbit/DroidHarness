@@ -252,7 +252,7 @@ zip    113.3 MiB                   (Node 打包器, 18.7 秒)
 
 ## 已实测
 
-在测试机（Redmi K90 Pro Max · HyperOS 3 / Android 16 · KernelSU）上：
+在测试机（REDMI K90 Pro Max · HyperOS 3 / Android 16 · KernelSU）上：
 
 ```
 模块目录 exec: OK   (u:r:ksu:s0 + SELinux enforcing)
@@ -261,6 +261,42 @@ spawn / TLS / 系统 CA 库  全过
 shim 实测通过: shim-ok object function
 dsh web 已拉起, 监听 127.0.0.1:3080, Web GUI 可正常访问
 ```
+
+**两个 shim 都在真机上验过**（用手机自己的 Node 跑真实 import，不是在 PC 上推断）：
+
+```
+$ node --input-type=module -e 'import {tryLockExclusive,FLOCK_IMPLEMENTATION} from "@deepseek-ai/node-addon-system/flock"; ...'
+flock-ok js-shim-single-process
+```
+
+**配置 API 后对话能正常跑完** —— 2026-09-26 真机确认，修掉了之前那句
+`本轮运行失败: flock is not supported on android-arm64`。
+
+### 验证时踩的坑一：`adb shell su` 不一定存在
+
+这台设备上 `su` 不在 `adb shell` 的 PATH 里（KernelSU 默认不往 PATH 放 `su`）：
+
+```
+$ adb shell 'su -c id'
+/system/bin/sh: su: inaccessible or not found
+```
+
+**要在 KernelSU 管理器里给 `com.android.shell`（uid 2000）授权 root，`adb shell su` 才能用。** 在那之前所有 `adb shell "su -c '...'"` 形式的命令都会失败 —— 而失败信息是 "not found"，很容易被误读成"没 root"。
+
+### 验证时踩的坑二：别拿端口号猜服务
+
+PC 的 `127.0.0.1:3080` 是**电脑端自己的 DSH**。手机端要另开一个转发端口（本项目用 `13080`）：
+
+```powershell
+adb forward tcp=13080 tcp=3080
+adb forward --list          # ← 先看映射表, 别拿返回值猜是谁
+```
+
+不带 token 访问会得到 **401**（DSH 的 token 鉴权）—— 那是**转发通了**的证据，不是错误。token 每次重启 DSH 都会变，取 `dshctl log` 里最新那条。
+
+### 验证时踩的坑三：Windows 上带冒号的 deb 文件名
+
+见 `probe/tools/fetch-runtime.mjs` 里 `safeCacheName()` 的注释。Debian 的 epoch 版本号形如 `1:3.6.3`，会原样出现在索引的 `Filename` 里，而 Windows 把 `:` 当 NTFS 备用数据流分隔符 —— 于是 `openssl` 与 `ca-certificates` 被静默跳过，**TLS 彻底坏掉且没有任何报错**。
 
 ## 与 `probe/` 的关系
 
