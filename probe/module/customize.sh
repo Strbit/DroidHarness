@@ -64,8 +64,15 @@ ui_print " "
 # ─────────────────────────────────────────────────────────────
 # 环境变量: Termux 编出来的二进制有一批写死的 Termux 路径,
 # OPENSSL_CONF / SHELL / TMPDIR 三个少一个都起不来 (实测).
+#
+# ⚠️ 但 TMPDIR 绝不能指向 /data/local/tmp:
+#   本脚本是被 installer.sh **source** 的 (. $MODPATH/customize.sh), 不是子进程,
+#   所以这里 export 的变量会留在**安装器自己的 shell** 里. 而安装器在结尾
+#   (以及 abort 时) 会执行 `rm -rf $TMPDIR` —— 指向 /data/local/tmp 就等于
+#   让安装器把整个目录连根删掉. (dsh 模块真踩了这个坑.)
+#   这里指向模块目录内的私有子目录: 就算被删, 删的也是我们自己那个.
 # ─────────────────────────────────────────────────────────────
-mkdir -p "$WORK/tmp" 2>/dev/null
+mkdir -p "$MODPATH/.tmp" 2>/dev/null
 
 setup_env() {
 	_probe_prefix="$1"
@@ -73,7 +80,7 @@ setup_env() {
 	export LD_LIBRARY_PATH="$_probe_prefix/lib"
 	export PATH="$_probe_prefix/bin:/system/bin:/system/xbin"
 	export HOME="$WORK"
-	export TMPDIR="$WORK/tmp"
+	export TMPDIR="$MODPATH/.tmp"
 	if [ -x "$_probe_prefix/bin/bash" ]; then
 		export SHELL="$_probe_prefix/bin/bash"
 	else
@@ -81,7 +88,7 @@ setup_env() {
 	fi
 	# 必须指向一个"存在的普通文件", 空文件即可. 不设或指向不存在的路径,
 	# Termux 版 Node 会在 bootstrap 阶段静默 exit 13 且什么都不打印.
-	export OPENSSL_CONF="$WORK/openssl.cnf"
+	export OPENSSL_CONF="$MODPATH/.tmp/openssl.cnf"
 	: >"$OPENSSL_CONF"
 	# 让 OpenSSL 用安卓系统证书库, 而不是写死的 Termux 路径.
 	export SSL_CERT_DIR=/system/etc/security/cacerts
@@ -94,6 +101,27 @@ ui_print "  LD_LIBRARY_PATH = $LD_LIBRARY_PATH"
 ui_print "  OPENSSL_CONF    = $OPENSSL_CONF"
 ui_print "  TMPDIR          = $TMPDIR"
 ui_print "  SHELL           = $SHELL"
+ui_print " "
+
+# ─────────────────────────────────────────────────────────────
+# 权限 —— 必须早于任何执行尝试
+#
+# KernelSU/Magisk 解压模块时不保留 zip 里的 Unix 权限位, 所以此刻
+# usr/bin/node 还没有执行位. 不先设权限, 下面两个 exec 测试会全部假失败;
+# 而脚本末尾原本还会再设一次, 于是重启后一切正常 —— 你只会看到一份误导的
+# 安装日志, 以为"SELinux 不让 exec", 其实是权限位还没设.
+# ─────────────────────────────────────────────────────────────
+ui_print "--- 权限 (测试前) ---"
+set_perm_recursive "$MODPATH" 0 0 0755 0644
+# usr/ 里既有可执行文件也有库, 统一 0755 最省事 —— 库多一个执行位无害,
+# 而漏掉某个 bin/libexec 里的可执行文件会很难查.
+set_perm_recursive "$MODPATH/usr" 0 0 0755 0755
+if [ -x "$PREFIX/bin/node" ]; then
+	ui_print "  [ OK ] usr/bin/node 可执行"
+else
+	ui_print "  [FAIL] usr/bin/node 仍不可执行"
+	abort "! 权限设置失败, 后面的测试没有意义"
+fi
 ui_print " "
 
 # ─────────────────────────────────────────────────────────────
@@ -189,15 +217,15 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────
-# 权限与收尾
+# 收尾
 # ─────────────────────────────────────────────────────────────
 ui_print " "
 ui_print "=== 收尾 ==="
-set_perm_recursive "$MODPATH" 0 0 0755 0644
-# usr/ 里既有可执行文件也有库, 统一 0755 最省事 —— 库多一个执行位无害,
-# 而漏掉某个 bin/libexec 里的可执行文件会很难查.
-set_perm_recursive "$MODPATH/usr" 0 0 0755 0755
-ui_print "- 权限已设置"
+# 权限已经在测试之前设过了 (见上面「权限」那一节).
+# 那里设是必须的: KernelSU/Magisk 解压时不保留 zip 的权限位, 不先设的话
+# 测试 A / B 会全部假失败 —— 而末尾再设一次又让重启后一切正常,
+# 于是你只会看到一份误导的安装日志. 这个坑踩过一次.
+ui_print "- 权限已在测试前设置"
 
 # 留一个标记, 供 service.sh 判断是否已做过拷贝
 date >"$WORK/installed-at.txt" 2>/dev/null

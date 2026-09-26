@@ -19,3 +19,12 @@ dist/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# 构建中间产物 (DSH 的 android 树等)
+.build/
+
+
+# DSH 模块的构建产物 (由 dsh/tools 生成)
+dsh/module/app/
+dsh/module/usr/
+

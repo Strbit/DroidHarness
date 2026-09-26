@@ -1,0 +1,124 @@
+#!/system/bin/sh
+# dshctl — 控制 DSH 的启停
+#
+# 用法:
+#   dshctl start      拉起 (后台)
+#   dshctl stop       停掉 (含监督进程)
+#   dshctl restart
+#   dshctl status     是否在跑, 监听哪里
+#   dshctl log [n]    看日志 (默认 40 行)
+#   dshctl forward    打印在 PC 上该敲的 adb forward 命令
+#
+# 在手机上 (adb shell su -c 'dshctl status') 或经 Termux 都能用.
+
+MODDIR=$(cd "${0%/*}/.." && pwd)
+DSH_HOME_DIR=/data/adb/dsh
+LOG="$DSH_HOME_DIR/logs/dsh.log"
+PIDFILE="$DSH_HOME_DIR/supervisor.pid"
+MATCH='@deepseek-ai/dsh/lib/bin.js'
+PORT=3080
+
+running() {
+	pgrep -f "$MATCH" >/dev/null 2>&1
+}
+
+case "$1" in
+start)
+	if running; then
+		echo "已在运行 (pid $(pgrep -f "$MATCH" | tr '\n' ' '))"
+		exit 0
+	fi
+	echo "拉起中..."
+	sh "$MODDIR/service.sh" >/dev/null 2>&1 &
+	sleep 6
+	if running; then
+		echo "已启动. 日志: $LOG"
+		echo "PC 侧: adb forward tcp:$PORT tcp:$PORT  然后开 http://127.0.0.1:$PORT"
+	else
+		echo "启动后没看到进程, 看日志:"
+		tail -n 20 "$LOG" 2>/dev/null
+		exit 1
+	fi
+	;;
+
+stop)
+	echo "停止中..."
+	# 先杀监督进程, 否则它会把 node 又拉起来
+	if [ -f "$PIDFILE" ]; then
+		kill "$(cat "$PIDFILE")" 2>/dev/null
+		rm -f "$PIDFILE"
+	fi
+	pkill -f "$MATCH" 2>/dev/null
+	sleep 2
+	if running; then
+		echo "还有残留, 强制杀..."
+		pkill -9 -f "$MATCH" 2>/dev/null
+		sleep 1
+	fi
+	if running; then
+		echo "仍有进程存活, 请手动检查: pgrep -f '$MATCH'"
+		exit 1
+	fi
+	echo "已停止"
+	;;
+
+restart)
+	"$0" stop
+	sleep 1
+	"$0" start
+	;;
+
+status)
+	if running; then
+		echo "状态: 运行中"
+		for p in $(pgrep -f "$MATCH"); do
+			echo "  pid $p"
+		done
+		if [ -f "$PIDFILE" ]; then
+			echo "  监督进程 pid $(cat "$PIDFILE")"
+		fi
+		echo "监听: 127.0.0.1:$PORT (仅本机)"
+		# 顺手确认端口真的在听
+		if netstat -tln 2>/dev/null | grep -q ":$PORT "; then
+			echo "端口: $PORT 已在监听"
+		else
+			echo "端口: 没看到 $PORT 在监听 (可能刚起还没就绪)"
+		fi
+	else
+		echo "状态: 未运行"
+		echo "用 dshctl start 拉起, 或重启手机让 service.sh 自动拉起"
+	fi
+	;;
+
+log)
+	n=${2:-40}
+	if [ -f "$LOG" ]; then
+		tail -n "$n" "$LOG"
+	else
+		echo "还没有日志: $LOG"
+	fi
+	;;
+
+forward)
+	echo "在 PC 上执行:"
+	echo "  adb forward tcp:$PORT tcp:$PORT"
+	echo "然后浏览器打开:"
+	echo "  http://127.0.0.1:$PORT"
+	echo ""
+	echo "用完可以撤掉转发:"
+	echo "  adb forward --remove tcp:$PORT"
+	;;
+
+*)
+	echo "dshctl — 控制 DSH 的启停"
+	echo ""
+	echo "用法: dshctl <命令>"
+	echo ""
+	echo "  start      拉起 (后台)"
+	echo "  stop       停掉 (含监督进程)"
+	echo "  restart    重启"
+	echo "  status     是否在跑, 监听哪里"
+	echo "  log [n]    看日志 (默认 40 行)"
+	echo "  forward    打印 PC 侧该敲的 adb forward 命令"
+	;;
+esac
