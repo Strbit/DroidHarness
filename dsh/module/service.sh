@@ -51,6 +51,27 @@ export OPENSSL_CONF="$DSH_HOME_DIR/tmp/openssl.cnf"
 export SSL_CERT_DIR=/system/etc/security/cacerts
 export NO_COLOR=1
 
+# ── 包管理器 (pnpm / npm) ───────────────────────────────────
+#
+# DSH 的插件管理器把参数原样转发给 pnpm 执行。而 pnpm 在 Android 上有两个坑:
+#
+# 1. **store 必须和 profile 目录 (/data/adb/dsh/profiles/*) 在同一个真实文件系统上。**
+#    它靠硬链接把 store 里的文件链进 node_modules, 跨文件系统会直接报
+#    "Cross-device link not permitted"。而 /sdcard 是 FUSE/sdcardfs, **不支持硬链接**。
+#    pnpm 的 store 默认在 $HOME 下, 而本脚本的 HOME 是 /sdcard/DroidHarness ——
+#    所以必须显式把 store / cache / state 全部指到 /data/adb/dsh。
+#    (这个坑是手机端 agent 实测出来的, 不是我推的。)
+#
+# 2. **只对 JS 版 pnpm 成立**: 它的 bin/pnpm.mjs shebang 是 `#!/usr/bin/env node`,
+#    而 Android 没有 /usr/bin/env, 必须包一层启动器显式用 node 拉起。
+#    本模块用的是 Termux 编的 ELF 二进制 (pnpm 12.7.0), **不受这条影响**;
+#    但如果你把 usr/bin/pnpm 换成 npm 上的 pnpm JS 包, 就要注意。
+export PNPM_HOME="$DSH_HOME_DIR/pnpm-home"
+export npm_config_store_dir="$DSH_HOME_DIR/.pnpm-store"
+export npm_config_cache_dir="$DSH_HOME_DIR/.pnpm-cache"
+export npm_config_state_dir="$DSH_HOME_DIR/.pnpm-state"
+mkdir -p "$PNPM_HOME" "$npm_config_store_dir" "$npm_config_cache_dir" "$npm_config_state_dir" 2>/dev/null
+
 {
 	echo ""
 	echo "=========================================="
