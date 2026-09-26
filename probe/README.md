@@ -227,6 +227,7 @@ dsh-android-probe/
 - **剥层数是自动探测的**（扫 tar 头找 `usr` 在第几段，Termux 的答案是 4），不写死。
 - **符号链接在 PC 上不建**，只记进 `usr/.dsh-symlinks`（见上）。清单里可能有指向 `/system/bin/sh` 这类系统绝对路径的条目——那些在手机上才是对的，PC 上无法验证。
 - **打包脚本必须保持 UTF-8 BOM**。PowerShell 5.1 会把无 BOM 的 UTF-8 当 ANSI 读，中文字符串会被拆坏导致语法错误。别用会剥掉 BOM 的编辑器改它。
+- **别用 PowerShell 的 `Get-Content` / `Set-Content` 改带中文的文件。** 它们默认按 **ANSI** 读、按 UTF-8 写，而 PS 5.1 的 `-Encoding UTF8` 还会**加 BOM** —— 一个来回就把中文变成乱码。实测代价：`dsh/README.md` 整个文件被写坏（`# DSH on Android — KernelSU / Magisk 模块` → `# DSH on Android 鈥?KernelSU / Magisk 妯″潡`），是靠 `253 insertions / 266 deletions` 这个明显对不上的 diff 才发现的。要改文本就用编辑工具，或 `[System.IO.File]::ReadAllText/WriteAllText` + `New-Object System.Text.UTF8Encoding($false)`。
 - **`module.prop` 里的 `author`** 是占位符 `you`，自己改。
 - **探针退出码恒为 0**——它是探针，失败本身就是要观测的结果。
 
