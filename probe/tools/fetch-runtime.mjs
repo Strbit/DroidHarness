@@ -44,7 +44,12 @@ const REPO = argValue('--repo', null);
 const DEBS_DIR = argValue('--debs', null);
 const LIST_ONLY = argv.includes('--list');
 const WITH_KOFFI = argv.includes('--with-koffi');
-const ROOT_PKGS = String(argValue('--packages', 'nodejs')).split(',').map((s) => s.trim()).filter(Boolean);
+// 默认装三个: nodejs 是运行时; bash 与 ripgrep 是 agent 要用的 ——
+// 安卓自带的是 mksh 而不是 bash, 且没有 rg, 而 harness 的 shell / grep 工具依赖它们.
+const ROOT_PKGS = String(argValue('--packages', 'nodejs,bash,ripgrep'))
+	.split(',')
+	.map((s) => s.trim())
+	.filter(Boolean);
 
 const REPO_CANDIDATES = [
 	'https://packages.termux.dev/apt/termux-main',
@@ -380,7 +385,26 @@ const PRUNE_IN_PREFIX = [
 	'lib/icu',
 ];
 
-const PRUNE_IN_NPM = ['src', 'doc', 'vendor', 'test', 'tests', '__tests__'];
+// 裁剪候选. 注意这些是"候选"而不是"要删的" —— 删之前必须扫一遍包里的代码,
+// 确认没有任何 require/import 引用它.
+//
+// 教训: 曾把 koffi 的 src/ 当开发目录删掉, 结果 require('koffi') 直接 MODULE_NOT_FOUND.
+// 它的 index.cjs 就是 `module.exports = require("./src/koffi/index.cjs")` —— src/ 是运行时必需的.
+const PRUNE_CANDIDATES = [
+	'doc',
+	'docs',
+	'test',
+	'tests',
+	'__tests__',
+	'example',
+	'examples',
+	'benchmark',
+	'benchmarks',
+	'src',
+	'vendor',
+];
+const PRUNE_FILES = ['CHANGELOG.md', 'HISTORY.md'];
+const SCAN_EXT = /\.(js|cjs|mjs|json)$/i;
 
 function removeIfExists(p) {
 	if (!fs.existsSync(p)) return 0;
@@ -420,14 +444,62 @@ function pruneRuntime(out) {
 	return saved;
 }
 
-/** 裁掉 npm 包里的开发文件 (src / doc / vendor / test). */
+/** 收集包里的 JS/JSON 文件 (跳过嵌套 node_modules). */
+function collectScanFiles(dir, out = []) {
+	let entries;
+	try {
+		entries = fs.readdirSync(dir, { withFileTypes: true });
+	} catch {
+		return out;
+	}
+	for (const e of entries) {
+		const full = path.join(dir, e.name);
+		if (e.isDirectory()) {
+			if (e.name === 'node_modules') continue;
+			collectScanFiles(full, out);
+		} else if (SCAN_EXT.test(e.name)) {
+			out.push(full);
+		}
+	}
+	return out;
+}
+
+/** 包里有代码引用这个名字吗. 返回引用它的文件 (相对包根), 没有则 null. */
+function findReference(dest, name) {
+	const esc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+	// 匹配 require("name…") / require('./name…') / from "name…" / import("name…")
+	const re = new RegExp(`(?:require\\(|from\\s+|import\\()\\s*["'\`][./]*${esc}[/"'\`]`);
+	for (const f of collectScanFiles(dest)) {
+		let text;
+		try {
+			text = fs.readFileSync(f, 'utf8');
+		} catch {
+			continue;
+		}
+		if (re.test(text)) return path.relative(dest, f);
+	}
+	return null;
+}
+
+/**
+ * 裁掉 npm 包里的开发文件.
+ * 只删"没有任何代码引用"的目录 —— 按目录名猜会删掉运行时必需的东西 (见 PRUNE_CANDIDATES 的注释).
+ */
 function pruneNpmPackage(dest) {
 	let saved = 0;
-	for (const rel of PRUNE_IN_NPM) {
-		saved += removeIfExists(path.join(dest, rel));
+	const kept = [];
+	for (const rel of PRUNE_CANDIDATES) {
+		const target = path.join(dest, rel);
+		if (!fs.existsSync(target)) continue;
+		const ref = findReference(dest, rel);
+		if (ref) {
+			kept.push(`${rel} <- ${ref}`);
+			continue;
+		}
+		saved += removeIfExists(target);
 	}
-	saved += removeIfExists(path.join(dest, 'CHANGELOG.md'));
-	return saved;
+	for (const rel of PRUNE_FILES) saved += removeIfExists(path.join(dest, rel));
+	return { saved, kept };
 }
 
 // ─────────── 符号链接清单 ───────────
@@ -566,13 +638,24 @@ function parseDepends(s) {
 		.filter(Boolean);
 }
 
-function resolveClosure(index, roots) {
+// 这些包是 Termux app 专用的包装器. 在模块环境里不但没用, 还会 shadow 系统命令 ——
+// termux-am 会往 $PREFIX/bin/am 放一个只跟 Termux app 通信的包装器, 而 $PREFIX/bin
+// 在 PATH 里靠前, 于是我们的 am 调用会打到它而不是 /system/bin/am.
+// termux-exec 还会改 exec 行为 (LD_PRELOAD).
+const EXCLUDE_PKGS = new Set(['termux-am', 'termux-am-socket', 'termux-exec', 'termux-tools']);
+
+function resolveClosure(index, roots, exclude = EXCLUDE_PKGS) {
 	const seen = new Map(); // name -> fields
 	const queue = [...roots];
 	const missing = [];
+	const skipped = [];
 	while (queue.length) {
 		const name = queue.shift();
 		if (seen.has(name)) continue;
+		if (exclude.has(name)) {
+			skipped.push(name);
+			continue;
+		}
 		const f = index.get(name);
 		if (!f) {
 			missing.push(name);
@@ -583,7 +666,7 @@ function resolveClosure(index, roots) {
 			if (!seen.has(d)) queue.push(d);
 		}
 	}
-	return { closure: seen, missing };
+	return { closure: seen, missing, skipped };
 }
 
 // ─────────────────────────── npm 包 (给探针测原生模块) ───────────────────────────
@@ -596,9 +679,25 @@ async function fetchNpmPackage(name, version, dest) {
 	fs.mkdirSync(dest, { recursive: true });
 	// npm tarball 顶层统一是 package/, 剥掉
 	const stats = extractTarBuffer(tarBytes, dest, 1);
-	pruneNpmPackage(dest);
+	const prune = pruneNpmPackage(dest);
 	if (!fs.existsSync(path.join(dest, 'package.json'))) {
 		throw new Error(`解包 ${name} 后没有 package.json (写出 ${stats.files} 个文件)`);
+	}
+	return prune;
+}
+
+/**
+ * koffi 的 index.cjs 就是 `module.exports = require("./src/koffi/index.cjs")`.
+ * 所以 src/ 是运行时必需的 —— 布局坏了在 PC 上看不出来, 到设备上才炸.
+ * 这里显式校验一次.
+ */
+function verifyKoffiLayout(koffiDir) {
+	const entry = path.join(koffiDir, 'src', 'koffi', 'index.cjs');
+	if (fs.existsSync(entry)) {
+		log(`    ✓ koffi 加载器入口在位 (src/koffi/index.cjs)`);
+	} else {
+		warn(`    ✗ koffi 加载器入口缺失: src/koffi/index.cjs`);
+		warn('      设备上 require("koffi") 会报 MODULE_NOT_FOUND');
 	}
 }
 
@@ -619,8 +718,16 @@ async function installKoffi() {
 		return;
 	}
 	log(`  koffi ${version}, 平台包 ${platformPkg}@${platformVersion}`);
-	await fetchNpmPackage('koffi', version, path.join(dest, 'koffi'));
-	await fetchNpmPackage(platformPkg, platformVersion, path.join(dest, '@koromix', 'koffi-android-arm64'));
+	const a = await fetchNpmPackage('koffi', version, path.join(dest, 'koffi'));
+	const b = await fetchNpmPackage(platformPkg, platformVersion, path.join(dest, '@koromix', 'koffi-android-arm64'));
+	for (const [label, prune] of [
+		['koffi', a],
+		['koffi-android-arm64', b],
+	]) {
+		log(`    裁剪 ${label}: 省 ${human(prune.saved)}`);
+		for (const k of prune.kept) log(`      保留 ${k}  (有代码引用, 删了会坏)`);
+	}
+	verifyKoffiLayout(path.join(dest, 'koffi'));
 	log(`  ✓ 已放到 ${dest}`);
 }
 
@@ -681,8 +788,9 @@ async function main() {
 	const repoBase = idx.url.split('/dists/')[0];
 
 	log('\n=== 2/4 解析依赖 ===');
-	const { closure, missing } = resolveClosure(index, ROOT_PKGS);
+	const { closure, missing, skipped } = resolveClosure(index, ROOT_PKGS);
 	if (missing.length) warn(`  ! 索引里找不到: ${missing.join(', ')} (可能是 provides 的虚拟包, 通常无害)`);
+	if (skipped.length) log(`  已排除 Termux app 专用包装器: ${skipped.join(', ')}`);
 	const pkgs = [...closure.values()].sort((a, b) => a.Package.localeCompare(b.Package));
 	let totalSize = 0;
 	for (const f of pkgs) totalSize += parseInt(f.Size ?? '0', 10);
