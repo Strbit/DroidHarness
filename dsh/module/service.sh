@@ -33,13 +33,20 @@ mkdir -p "$DSH_HOME_DIR/logs" "$WS" 2>/dev/null
 
 # ── 环境 ────────────────────────────────────────────────────
 # Termux 编出来的二进制有一批写死的 Termux 路径, 这三个少一个都起不来.
+#
+# 注意 TMPDIR 指向私有目录而不是 /data/local/tmp:
+#   · /data/local/tmp 是共享目录 (shell 拥有, 很多工具在用), 会话临时文件不该丢里面
+#   · 更重要的是: customize.sh 是被 installer.sh source 的, 那里 export TMPDIR
+#     会让安装器结尾的 `rm -rf $TMPDIR` 删掉错误的东西 (这个坑真踩了).
+#     本脚本是当子进程跑的, export 不会外泄, 但仍然用私有目录保持一致.
 export DSH_HOME="$DSH_HOME_DIR"
 export LD_LIBRARY_PATH="$PREFIX/lib"
 export PATH="$PREFIX/bin:/system/bin:/system/xbin"
 export HOME="$WS"
-export TMPDIR=/data/local/tmp
+mkdir -p "$DSH_HOME_DIR/tmp" 2>/dev/null
+export TMPDIR="$DSH_HOME_DIR/tmp"
 export SHELL="$PREFIX/bin/bash"
-export OPENSSL_CONF=/data/local/tmp/dsh-openssl.cnf
+export OPENSSL_CONF="$DSH_HOME_DIR/tmp/openssl.cnf"
 : >"$OPENSSL_CONF" 2>/dev/null
 export SSL_CERT_DIR=/system/etc/security/cacerts
 export NO_COLOR=1

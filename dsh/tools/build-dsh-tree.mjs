@@ -19,6 +19,11 @@
  *   node dsh/tools/build-dsh-tree.mjs                  # 装 + 打补丁 + 校验
  *   node dsh/tools/build-dsh-tree.mjs --skip-install   # 只打补丁 + 校验 (树已存在)
  *   node dsh/tools/build-dsh-tree.mjs --version 0.1.7-rc.2
+ *
+ *   node dsh/tools/build-dsh-tree.mjs --skip-install --prune --dry-run
+ *       只分析能裁掉什么, 打印清单, 不删任何东西
+ *   node dsh/tools/build-dsh-tree.mjs --skip-install --prune
+ *       真删
  */
 
 import fs from 'node:fs';
@@ -33,6 +38,8 @@ const SHIM_SRC = path.join(ROOT, 'dsh', 'shim', 'node-addon-require-builtin.js')
 
 const argv = process.argv.slice(2);
 const SKIP_INSTALL = argv.includes('--skip-install');
+const DO_PRUNE = argv.includes('--prune');
+const DRY_RUN = argv.includes('--dry-run');
 function argValue(name, fallback) {
 	const i = argv.indexOf(name);
 	if (i === -1) return fallback;
@@ -193,7 +200,248 @@ const negative = spawnSync(
 );
 log(`  · 不带旗标时: ${((negative.stdout ?? '') + (negative.stderr ?? '')).trim()}`);
 
-// ─────────────────────────── 4. 报告 ───────────────────────────
+// ─────────────────────────── 4. 裁剪 ───────────────────────────
+// 设计原则: 只删"能证明没人引用"的东西.
+//
+// 教训: 曾经按目录名把 koffi 的 src/ 当开发目录删掉, 结果 require('koffi') 直接
+// MODULE_NOT_FOUND —— 它的 index.cjs 就是 require("./src/koffi/index.cjs").
+// 所以这里分三档, 而且都要过一遍引用扫描:
+//
+//   扩展名档  这些后缀在运行期从不被代码加载 (.map / .pdb), 或只被 package.json
+//             的 types 字段引用而 Node 不读 (.d.ts)
+//   目录档    test / docs 之类
+//   平台档    明确属于别的操作系统的产物
+//
+// **不碰 src/**: DSH 的包在 exports 里声明了 "./src/*", 那是可达路径.
+
+const PRUNE_BY_EXT = [
+	['.map', 'source map, 只被 //# sourceMappingURL 注释引用'],
+	['.pdb', 'Windows 调试符号, 只有 Windows 链接器用'],
+	['.d.ts', '类型声明, Node 运行期从不加载'],
+	['.md', '文档'],
+];
+const PRUNE_BY_DIR = ['test', 'tests', '__tests__', 'spec', 'docs', 'doc', 'example', 'examples', 'benchmark', 'benchmarks'];
+const PRUNE_BY_PLATFORM = [
+	'node-pty/prebuilds/win32-x64',
+	'node-pty/prebuilds/win32-arm64',
+	'node-pty/prebuilds/darwin-x64',
+	'node-pty/prebuilds/darwin-arm64',
+	'node-pty/third_party/conpty',
+	'node-pty/src/win',
+];
+
+/** 扫一遍全树的 JS, 收集所有 require/import 的目标, 用来判断"有没有人引用". */
+function buildSpecifiers(root) {
+	const out = [];
+	const re = /(?:require\(|from\s+|import\()\s*["'`]([^"'`]+)["'`]/g;
+	const walk = (d) => {
+		let entries;
+		try {
+			entries = fs.readdirSync(d, { withFileTypes: true });
+		} catch {
+			return;
+		}
+		for (const e of entries) {
+			const full = path.join(d, e.name);
+			if (e.isDirectory()) {
+				walk(full);
+				continue;
+			}
+			if (!/\.(js|cjs|mjs)$/i.test(e.name)) continue;
+			let text;
+			try {
+				text = fs.readFileSync(full, 'utf8');
+			} catch {
+				continue;
+			}
+			// 先去掉块注释. 有些包 (例如 undici) 用 JSDoc 做类型标注:
+			//   /** @typedef {import('../../types/x.d.ts').default.Foo} Foo */
+			// 那是注释, 运行期从不加载, 但正则会把里面的 import(...) 当成真引用 ——
+			// 结果整个 .d.ts 档 (33 MiB) 被误判成"被引用".
+			text = text.replace(/\/\*[\s\S]*?\*\//g, ' ');
+			let m;
+			while ((m = re.exec(text)) !== null) out.push(m[1]);
+		}
+	};
+	walk(root);
+	return new Set(out);
+}
+
+function analyzePrune(root) {
+	log('  扫描全树的 require/import 目标 (要读约 9000 个 JS)...');
+	const specs = buildSpecifiers(root);
+	log(`  收集到 ${specs.size} 个不同的引用目标`);
+
+	const buckets = new Map();
+	const bucket = (key, label, note) => {
+		if (!buckets.has(key)) buckets.set(key, { key, label, note, files: [], bytes: 0 });
+		return buckets.get(key);
+	};
+	const collect = (b, dir) => {
+		const walk = (d) => {
+			let entries;
+			try {
+				entries = fs.readdirSync(d, { withFileTypes: true });
+			} catch {
+				return;
+			}
+			for (const e of entries) {
+				const full = path.join(d, e.name);
+				if (e.isDirectory()) walk(full);
+				else {
+					try {
+						b.bytes += fs.statSync(full).size;
+					} catch {}
+					b.files.push(path.relative(root, full).replace(/\\/g, '/'));
+				}
+			}
+		};
+		walk(dir);
+	};
+
+	const walk = (d) => {
+		let entries;
+		try {
+			entries = fs.readdirSync(d, { withFileTypes: true });
+		} catch {
+			return;
+		}
+		for (const e of entries) {
+			const full = path.join(d, e.name);
+			const rel = path.relative(root, full).replace(/\\/g, '/');
+			if (e.isDirectory()) {
+				const plat = PRUNE_BY_PLATFORM.find((p) => rel === p || rel.startsWith(p + '/'));
+				if (plat) {
+					collect(bucket('plat:' + plat, `平台  ${plat}`, '别的操作系统的产物'), full);
+					continue;
+				}
+				if (PRUNE_BY_DIR.includes(e.name.toLowerCase())) {
+					collect(bucket('dir:' + e.name.toLowerCase(), `目录  ${e.name}/`, '测试 / 文档 / 示例'), full);
+					continue;
+				}
+				walk(full);
+			} else {
+				// 注意: 不能用 path.extname —— 它对 foo.d.ts 返回 ".ts", 会让整个
+				// .d.ts 档 (33 MiB) 静默漏掉. 用后缀匹配.
+				const lower = e.name.toLowerCase();
+				const hit = PRUNE_BY_EXT.find(([x]) => lower.endsWith(x));
+				if (hit) {
+					const b = bucket('ext:' + hit[0], `扩展  *${hit[0]}`, hit[1]);
+					try {
+						b.bytes += fs.statSync(full).size;
+					} catch {}
+					b.files.push(rel);
+				}
+			}
+		}
+	};
+	walk(root);
+
+	// 引用检查
+	for (const b of buckets.values()) {
+		const key = b.key.slice(b.key.indexOf(':') + 1);
+		if (b.key.startsWith('ext:')) {
+			b.ref = [...specs].find((s) => s.toLowerCase().endsWith(key));
+		} else {
+			// 必须按**路径段**判断, 不能用裸子串. 否则:
+			//   "vitest"                          被当成引用了 test/
+			//   "@shikijs/langs/asciidoc"         被当成引用了 doc/
+			//   "registry.example.com/my-org/..." 被当成引用了 example/
+			//   "benchmark"                       被当成引用了 benchmark/
+			const seg = key.includes('/') ? key : `/${key}`;
+			b.ref = [...specs].find((s) => {
+				const low = s.toLowerCase();
+				return low.includes(seg + '/') || low.endsWith(seg);
+			});
+		}
+	}
+
+	const list = [...buckets.values()].sort((a, b) => b.bytes - a.bytes);
+	const totalBytes = list.reduce((n, b) => n + b.bytes, 0);
+	const totalFiles = list.reduce((n, b) => n + b.files.length, 0);
+
+	log('');
+	log('=== 裁剪分析 ===');
+	log('');
+	log('  类别                              文件数        大小   引用检查');
+	log('  ─────────────────────────────────────────────────────────────────');
+	for (const b of list) {
+		const verdict = b.ref ? `被引用! ${b.ref}` : '无引用';
+		log(
+			`  ${b.label.padEnd(32)} ${String(b.files.length).padStart(6)}  ${human(b.bytes).padStart(10)}   ${verdict}`
+		);
+	}
+	log('  ─────────────────────────────────────────────────────────────────');
+	log(`  ${'合计'.padEnd(32)} ${String(totalFiles).padStart(6)}  ${human(totalBytes).padStart(10)}`);
+	log('');
+	const blocked = list.filter((b) => b.ref);
+	if (blocked.length > 0) {
+		warn(`  ! 有 ${blocked.length} 个类别被代码引用, 不会删:`);
+		for (const b of blocked) warn(`      ${b.label}  <- ${b.ref}`);
+	}
+
+	const before = dirSize(root);
+	log(`  应用树: ${human(before.bytes)} / ${before.files} 文件`);
+	log(`  删除后: ${human(before.bytes - totalBytes + list.filter((b) => b.ref).reduce((n, b) => n + b.bytes, 0))} 左右`);
+
+	return { buckets: list, totalBytes, totalFiles, blocked };
+}
+
+function applyPrune(analysis) {
+	let removed = 0;
+	for (const b of analysis.buckets) {
+		if (b.ref) continue;
+		for (const rel of b.files) {
+			const full = path.join(APP, rel);
+			try {
+				fs.rmSync(full, { force: true });
+				removed++;
+			} catch {}
+		}
+	}
+	// 清掉空目录
+	const pruneEmpty = (d) => {
+		let entries;
+		try {
+			entries = fs.readdirSync(d, { withFileTypes: true });
+		} catch {
+			return true;
+		}
+		let empty = true;
+		for (const e of entries) {
+			const full = path.join(d, e.name);
+			if (e.isDirectory()) {
+				if (!pruneEmpty(full)) empty = false;
+			} else empty = false;
+		}
+		if (empty && d !== APP) {
+			try {
+				fs.rmdirSync(d);
+			} catch {}
+		}
+		return empty;
+	};
+	pruneEmpty(APP);
+	return removed;
+}
+
+if (DO_PRUNE) {
+	const analysis = analyzePrune(APP);
+	if (DRY_RUN) {
+		log('');
+		log('  --dry-run: 上面只是分析, 没有删任何东西.');
+		log('  确认无误后去掉 --dry-run 重跑即可真正删除.');
+	} else {
+		const n = applyPrune(analysis);
+		const after = dirSize(APP);
+		log('');
+		log(`  已删除 ${n} 个文件`);
+		log(`  应用树: ${human(after.bytes)} / ${after.files} 文件`);
+	}
+	log('');
+}
+
+// ─────────────────────────── 5. 报告 ───────────────────────────
 const size = dirSize(APP);
 log('\n=== 结果 ===');
 log(`  应用树: ${human(size.bytes)} / ${size.files} 文件`);
@@ -203,4 +451,4 @@ if (bad > 0) {
 	process.exit(1);
 }
 log('\n下一步: node probe/tools/fetch-runtime.mjs --out dsh/module   (取运行时)');
-log('        powershell -File tools/build-module.ps1              (打包)');
+log('        powershell -File probe/tools/build-module.ps1 -ModuleDir dsh/module   (打包)');

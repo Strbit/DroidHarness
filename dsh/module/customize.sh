@@ -142,26 +142,47 @@ fi
 # ─────────────────────────────────────────────────────────────
 # 6. 冒烟测试
 #
-# 一次测三件事: Node 能跑, --expose-internals 生效, shim 能把 internal 模块取出来.
-# 这三件是 dsh-app-boot 启动路径的前提.
+# ⚠️⚠️ 这个脚本是被 installer.sh **source** 进去的, 不是当子进程跑的:
+#
+#     [ -f $MODPATH/customize.sh ] && . $MODPATH/customize.sh
+#
+#   所以这里 export 的变量会留在**安装器自己的 shell** 里. 而安装器在结尾
+#   (以及 abort 时) 会做:
+#
+#     rm -rf $TMPDIR
+#
+#   一旦这里 export TMPDIR=/data/local/tmp, 那一句就变成 rm -rf /data/local/tmp
+#   —— 把整个目录连根删掉. **这个坑真的踩了**, 代价是用户 /data/local/tmp 里的东西全没.
+#
+#   所以下面一律用 `env VAR=... 命令` 的形式: 只对那一条命令生效, 不污染安装器的 shell.
+#   同理**不要 export PATH / LD_LIBRARY_PATH** —— 安装器后面还要用 unzip / find / set_perm.
 # ─────────────────────────────────────────────────────────────
 ui_print " "
 ui_print "--- 冒烟测试 ---"
 
-export PREFIX
-export LD_LIBRARY_PATH="$PREFIX/lib"
-export PATH="$PREFIX/bin:/system/bin:/system/xbin"
-export HOME="$DSH_HOME_DIR"
-export TMPDIR=/data/local/tmp
-export SHELL="$PREFIX/bin/bash"
-export OPENSSL_CONF=/data/local/tmp/dsh-openssl.cnf
-: >"$OPENSSL_CONF" 2>/dev/null
-export SSL_CERT_DIR=/system/etc/security/cacerts
+# 自己的临时目录, 完全不碰 /data/local/tmp
+DSH_TMP="$DSH_HOME_DIR/tmp"
+mkdir -p "$DSH_TMP" 2>/dev/null
+OPENSSL_CONF_FILE="$DSH_TMP/openssl.cnf"
+: >"$OPENSSL_CONF_FILE" 2>/dev/null
 
-NODE_VER=$("$PREFIX/bin/node" -v 2>&1)
+# 只对单条命令生效的环境. 不用 export.
+run_node() {
+	env \
+		PATH="$PREFIX/bin:/system/bin:/system/xbin" \
+		LD_LIBRARY_PATH="$PREFIX/lib" \
+		HOME="$DSH_HOME_DIR" \
+		TMPDIR="$DSH_TMP" \
+		SHELL="$PREFIX/bin/bash" \
+		OPENSSL_CONF="$OPENSSL_CONF_FILE" \
+		SSL_CERT_DIR=/system/etc/security/cacerts \
+		"$PREFIX/bin/node" "$@"
+}
+
+NODE_VER=$(run_node -v 2>&1)
 ui_print "  node -v          -> $NODE_VER"
 
-SMOKE=$(cd "$APP" && "$PREFIX/bin/node" --expose-internals -e '
+SMOKE=$(cd "$APP" && run_node --expose-internals -e '
 const a = require("node-addon-require-builtin");
 const m = a.requireBuiltin("internal/modules/esm/loader");
 console.log("shim-ok", typeof m, typeof m.getOrInitializeCascadedLoader);
@@ -172,6 +193,9 @@ case "$SMOKE" in
 	shim-ok*object*function*) ui_print "  [ OK ] 启动路径前提全部满足" ;;
 	*) ui_print "  [FAIL] 见上面输出" ;;
 esac
+
+# 收尾: 确认没有污染安装器的 TMPDIR (那会害安装器删错目录)
+ui_print "  (安装器 TMPDIR = ${TMPDIR:-未设} —— 不应是 /data/local/tmp)"
 
 ui_print " "
 ui_print "*********************************************"

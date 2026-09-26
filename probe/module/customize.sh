@@ -64,8 +64,15 @@ ui_print " "
 # ─────────────────────────────────────────────────────────────
 # 环境变量: Termux 编出来的二进制有一批写死的 Termux 路径,
 # OPENSSL_CONF / SHELL / TMPDIR 三个少一个都起不来 (实测).
+#
+# ⚠️ 但 TMPDIR 绝不能指向 /data/local/tmp:
+#   本脚本是被 installer.sh **source** 的 (. $MODPATH/customize.sh), 不是子进程,
+#   所以这里 export 的变量会留在**安装器自己的 shell** 里. 而安装器在结尾
+#   (以及 abort 时) 会执行 `rm -rf $TMPDIR` —— 指向 /data/local/tmp 就等于
+#   让安装器把整个目录连根删掉. (dsh 模块真踩了这个坑.)
+#   这里指向模块目录内的私有子目录: 就算被删, 删的也是我们自己那个.
 # ─────────────────────────────────────────────────────────────
-mkdir -p "$WORK/tmp" 2>/dev/null
+mkdir -p "$MODPATH/.tmp" 2>/dev/null
 
 setup_env() {
 	_probe_prefix="$1"
@@ -73,7 +80,7 @@ setup_env() {
 	export LD_LIBRARY_PATH="$_probe_prefix/lib"
 	export PATH="$_probe_prefix/bin:/system/bin:/system/xbin"
 	export HOME="$WORK"
-	export TMPDIR="$WORK/tmp"
+	export TMPDIR="$MODPATH/.tmp"
 	if [ -x "$_probe_prefix/bin/bash" ]; then
 		export SHELL="$_probe_prefix/bin/bash"
 	else
@@ -81,7 +88,7 @@ setup_env() {
 	fi
 	# 必须指向一个"存在的普通文件", 空文件即可. 不设或指向不存在的路径,
 	# Termux 版 Node 会在 bootstrap 阶段静默 exit 13 且什么都不打印.
-	export OPENSSL_CONF="$WORK/openssl.cnf"
+	export OPENSSL_CONF="$MODPATH/.tmp/openssl.cnf"
 	: >"$OPENSSL_CONF"
 	# 让 OpenSSL 用安卓系统证书库, 而不是写死的 Termux 路径.
 	export SSL_CERT_DIR=/system/etc/security/cacerts
