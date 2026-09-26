@@ -197,6 +197,43 @@ if (platform !== 'linux' && platform !== 'darwin') throw ...
 
 ---
 
+## 插件安装（pnpm）
+
+DSH 的插件管理器**把参数原样转发给 `pnpm` 执行**，所以运行时里必须有 pnpm。本模块带的是 **Termux 编的 pnpm 12.7.0**（ELF 二进制，46.8 MiB）。
+
+它在 Android 上有两个坑，`service.sh` 已经处理了第一个：
+
+### 1. store 不能落在 `/sdcard`
+
+pnpm 靠**硬链接**把 store 里的文件链进 `node_modules`。而 `/sdcard` 是 FUSE/sdcardfs，**不支持硬链接** —— 跨文件系统会直接报：
+
+```
+Cross-device link not permitted
+```
+
+pnpm 的 store 默认在 `$HOME` 下，而本模块的 `HOME` 是 `/sdcard/DroidHarness`（这是有意的：GUI 的工作区选择器从 `HOME` 开始列）。所以 `service.sh` 必须显式把它们指到 `/data/adb/dsh`：
+
+```sh
+export PNPM_HOME="$DSH_HOME_DIR/pnpm-home"
+export npm_config_store_dir="$DSH_HOME_DIR/.pnpm-store"
+export npm_config_cache_dir="$DSH_HOME_DIR/.pnpm-cache"
+export npm_config_state_dir="$DSH_HOME_DIR/.pnpm-state"
+```
+
+> 这个坑是**手机端 agent 实测出来的**，不是我推的。它当时的判断依据是"store 必须和 profile 目录（`/data/adb/dsh/profiles/*`）在同一个真实文件系统上"，方向完全正确。
+
+### 2. JS 版 pnpm 的 shebang（本模块不受影响）
+
+npm 上发布的 pnpm 的 `bin/pnpm.mjs` shebang 是 `#!/usr/bin/env node`，而 **Android 上没有 `/usr/bin/env`**，直接 exec 会失败 —— 必须包一层启动器显式用 node 拉起。
+
+**本模块用的是 Termux 编的 ELF 二进制，不读 shebang，所以不受这条影响。** 但如果你把 `usr/bin/pnpm` 换成 npm 上的 pnpm JS 包，就要注意。
+
+### 装插件
+
+Web GUI → **设置 → 插件 → 添加插件**，填 npm 包名（如 `dsh-web-mobile`）。装完刷新页面即可（客户端插件走 HMR，不用重启 DSH）。
+
+---
+
 ## 为什么只绑 `127.0.0.1`
 
 有一类设计错误的后果特别严重，构成是三个决定叠加：**绑 `0.0.0.0` + 无鉴权 + 提供任意命令执行**。三者叠加等于把设备 root 权限挂在网络上。
