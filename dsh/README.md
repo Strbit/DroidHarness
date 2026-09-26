@@ -1,293 +1,301 @@
-﻿# DSH on Android 鈥?KernelSU / Magisk 妯″潡
+# DSH on Android — KernelSU / Magisk 模块
 
-鎶?DeepSeek Harness 璺戝湪**宸?root 鐨?arm64 瀹夊崜璁惧**涓婏紝浠?KernelSU / Magisk 妯″潡褰㈡€佸垎鍙戙€?
-- **閫傜敤鑼冨洿**锛氬凡 root 鐨?**arm64-v8a** 瀹夊崜璁惧銆侹ernelSU / Magisk / APatch 鍧囧彲锛堟ā鍧楁牸寮忎笌 Magisk 鍏煎锛?- **娴嬭瘯鐜**锛氬彧鍦?**Redmi K90 Pro Max 路 HyperOS 3 / Android 16 路 KernelSU** 涓婇獙杩囷紱鍏朵粬鏈哄瀷涓?ROM 鏈獙璇?- **涓嶉渶瑕?Termux**锛氳繍琛屾椂鍦?PC 涓婁粠 Termux 鐨?`.deb` 瑙ｅ嚭鏉ワ紝鎵撹繘妯″潡
-- **鍙粦 `127.0.0.1`**锛氳繖涓嶆槸淇濆畧锛屾槸璁捐绾︽潫锛堣涓嬶級
+把 DeepSeek Harness 跑在**已 root 的 arm64 安卓设备**上，以 KernelSU / Magisk 模块形态分发。
 
-## 妯″潡閲屾湁浠€涔?
+- **适用范围**：已 root 的 **arm64-v8a** 安卓设备。KernelSU / Magisk / APatch 均可（模块格式与 Magisk 兼容）
+- **测试环境**：只在 **Redmi K90 Pro Max · HyperOS 3 / Android 16 · KernelSU** 上验过；其他机型与 ROM 未验证
+- **不需要 Termux**：运行时在 PC 上从 Termux 的 `.deb` 解出来，打进模块
+- **只绑 `127.0.0.1`**：这不是保守，是设计约束（见下）
+
+## 模块里有什么
+
 ```
 module/
-鈹溾攢鈹€ module.prop
-鈹溾攢鈹€ customize.sh              瀹夎鏃? 寤虹鍙烽摼鎺?+ 鍐掔儫娴嬭瘯
-鈹溾攢鈹€ service.sh                寮€鏈? 鎷夎捣 dsh web (甯︾洃鐫ｄ笌鐔旀柇)
-鈹溾攢鈹€ bin/dshctl                鎺у埗鑴氭湰 start/stop/status/log/forward
-鈹溾攢鈹€ usr/                      杩愯鏃?(aarch64 Node 26.4.0 + bash + ripgrep + npm + pnpm + 渚濊禆搴?
-鈹?  鈹斺攢鈹€ share/doc/<鍖呭悕>/copyright        鍚勭涓夋柟缁勪欢鐨勮鍙瘉鍏ㄦ枃
-鈹斺攢鈹€ app/                      DSH 搴旂敤鏍?(495 涓?npm 鍖?
-    鈹斺攢鈹€ node_modules/
-        鈹溾攢鈹€ @deepseek-ai/dsh/lib/bin.js     鍏ュ彛
-        鈹溾攢鈹€ @koromix/koffi-android-arm64/   鍘熺敓妯″潡鐨勫钩鍙伴缂栬瘧鍖?        鈹斺攢鈹€ node-addon-require-builtin/     鈫?宸茶 JS 鏇胯韩椤舵浛, 瑙佷笅
+├── module.prop
+├── customize.sh              安装时: 建符号链接 + 冒烟测试
+├── service.sh                开机: 拉起 dsh web (带监督与熔断)
+├── bin/dshctl                控制脚本 start/stop/status/log/forward
+├── usr/                      运行时 (aarch64 Node 26.4.0 + bash + ripgrep + npm + pnpm + 依赖库)
+│   └── share/doc/<包名>/copyright        各第三方组件的许可证全文
+└── app/                      DSH 应用树 (495 个 npm 包)
+    └── node_modules/
+        ├── @deepseek-ai/dsh/lib/bin.js     入口
+        ├── @koromix/koffi-android-arm64/   原生模块的平台预编译包
+        └── node-addon-require-builtin/     ← 已被 JS 替身顶替, 见下
 ```
 
-**涓轰粈涔堣繍琛屾椂閲屾湁 npm 鍜?pnpm**锛欴SH 鐨勬彃浠剁鐞嗗櫒**鍐欐浜嗚皟鐢?`pnpm`**锛坄execa("pnpm", ...)`锛夛紝
-娌℃湁瀹冿紝GUI 鐨?娣诲姞鎻掍欢"鍜?`dsh plugin add` 閮戒細澶辫触銆?
-## 璁稿彲璇?
-| 鏂囦欢 | 瑕嗙洊 |
-|---|---|
-| [`../LICENSE`](../LICENSE)锛圓pache-2.0锛?| **鍙鐩栨湰椤圭洰鑷繁鍐欑殑浠ｇ爜** |
-| [`../THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) | **闅忓寘鍒嗗彂鐨勭涓夋柟缁勪欢** 鈥斺€?27 涓繍琛屾椂浜岃繘鍒?+ 495 涓?npm 鍖?|
+**为什么运行时里有 npm 和 pnpm**：DSH 的插件管理器**写死了调用 `pnpm`**（`execa("pnpm", ...)`），
+没有它，GUI 的"添加插件"和 `dsh plugin add` 都会失败。
 
-杩愯鏃堕噷鏈?**5 涓彈 GPL / LGPL 绾︽潫**锛坄bash`銆乣readline`銆乣git`銆乣less`銆乣libiconv`锛夛紝
-鍒嗗彂瀹冧滑鏃舵彁渚涘搴旀簮鐮佹槸**涔夊姟**锛屾竻鍗曢噷缁欎簡鍦板潃銆傝鍙瘉鍏ㄦ枃闅忓寘鍙戝湪 `usr/share/doc/<鍖呭悕>/copyright`
-锛堣繖浜涙枃浠?*涓嶈瑁佸壀** 鈥斺€?鏃╂湡鐗堟湰鐨勮鍓€昏緫鍒犱簡瀹冧滑锛岄偅鏄敊鐨勶級銆?
+## 许可证
+
+| 文件 | 覆盖 |
+|---|---|
+| [`../LICENSE`](../LICENSE)（Apache-2.0） | **只覆盖本项目自己写的代码** |
+| [`../THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) | **随包分发的第三方组件** —— 27 个运行时二进制 + 495 个 npm 包 |
+
+运行时里有 **5 个受 GPL / LGPL 约束**（`bash`、`readline`、`git`、`less`、`libiconv`），
+分发它们时提供对应源码是**义务**，清单里给了地址。许可证全文随包发在 `usr/share/doc/<包名>/copyright`
+（这些文件**不被裁剪** —— 早期版本的裁剪逻辑删了它们，那是错的）。
+
 ---
 
-## 鏋勫缓
+## 构建
 
 ```powershell
 cd D:\projects\DroidHarness
 
-# 1. 鍙栬繍琛屾椂 (aarch64 Node + bash + ripgrep + npm + pnpm)
+# 1. 取运行时 (aarch64 Node + bash + ripgrep + npm + pnpm)
 node probe\tools\fetch-runtime.mjs --out dsh\module
 
-# 2. 瑁?DSH 搴旂敤鏍戝苟鎵撹ˉ涓?(涓や釜 shim 閮戒細瀹炴祴鏍￠獙)
+# 2. 装 DSH 应用树并打补丁 (两个 shim 都会实测校验)
 node dsh\tools\build-dsh-tree.mjs
 
-# 3. 鎵撳寘
+# 3. 打包
 node probe\tools\pack-module.mjs --module dsh\module
 ```
 
-浜х墿鍦?`dsh\dist\`銆?
-### 涓轰粈涔堟墦鍖呰剼鏈槸 Node 鑰屼笉鏄?PowerShell
+产物在 `dsh\dist\`。
 
-鍘熸潵鐨?`build-module.ps1` 鍔熻兘鏄鐨勶紝浣嗘參寰楃璋憋細**28,074 涓潯鐩 300鈥?60 绉?*銆傛椂闂村嚑涔庡叏鑺卞湪 PowerShell 鐨勯€愭枃浠跺紑閿€涓婏紙瀵硅薄鍒涘缓銆佹祦寮€鍏炽€?NET 浜掓搷浣滐級锛岃€屼笉鏄帇缂?鈥斺€?Deflate 鏈韩鑳借窇 20鈥?0 MB/s锛岄偅鐗堝彧鏈夌害 1 MB/s銆傚畠杩樺浜嗕竴姝ュ畬鍏ㄤ笉蹇呰鐨?staging锛堢敤 `Copy-Item` 鎶?350 MiB 鍐嶆嫹涓€閬嶏級銆?
-`pack-module.mjs` 涓嶅仛 staging 鎷疯礉锛岀敤 Node 鐨?zlib锛圕 瀹炵幇锛夛紝寮傛 `deflateRaw` 璧?libuv 绾跨▼姹犳嬁鍒板苟琛屻€傚疄娴?**106 MiB / 219 鏉＄洰 7.1 绉?*銆?
-**浠ｄ环鏄綋绉ぇ 5%**锛?NET 鐨?Deflate 鐢ㄧ殑鏄?zlib-ng锛屽帇缂╃巼纭疄姣旀爣鍑?zlib 濂姐€傚疄娴嬪悓涓€涓?`usr/bin/node`锛?
+### 为什么打包脚本是 Node 而不是 PowerShell
+
+原来的 `build-module.ps1` 功能是对的，但慢得离谱：**28,074 个条目要 300–360 秒**。时间几乎全花在 PowerShell 的逐文件开销上（对象创建、流开关、.NET 互操作），而不是压缩 —— Deflate 本身能跑 20–50 MB/s，那版只有约 1 MB/s。它还多了一步完全不必要的 staging（用 `Copy-Item` 把 350 MiB 再拷一遍）。
+
+`pack-module.mjs` 不做 staging 拷贝，用 Node 的 zlib（C 实现），异步 `deflateRaw` 走 libuv 线程池拿到并行。实测 **106 MiB / 219 条目 7.1 秒**。
+
+**代价是体积大 5%**：.NET 的 Deflate 用的是 zlib-ng，压缩率确实比标准 zlib 好。实测同一个 `usr/bin/node`：
+
 ```
 .NET (PowerShell)   15.244 MiB
 Node zlib level 9   16.151 MiB
 ```
 
-鎴戣瘯杩?`memLevel:9` / `windowBits:15` / `Z_FILTERED`锛?*鍏ㄩ兘鏇村樊**锛?5.34 / 35.13 / 36.45 MiB vs L9 鐨?35.13锛夈€傛墍浠ヨ繖涓嶆槸鍙傛暟娌¤皟瀵癸紝鏄疄鐜扮殑宸埆銆?
-**5% 鐨勪綋绉崲 15脳 鐨勯€熷害鏄垝绠楃殑**锛岃€屼笖鐪熸鐨勪綋绉敹鐩婂湪瑁佸壀 app 鏍戯紙瑙?宸茬煡闄愬埗"锛夈€俙build-module.ps1` 淇濈暀鐫€ 鈥斺€?闇€瑕侀偅 5% 鏃跺彲浠ョ敤瀹冦€?
+我试过 `memLevel:9` / `windowBits:15` / `Z_FILTERED`，**全都更差**（35.34 / 35.13 / 36.45 MiB vs L9 的 35.13）。所以这不是参数没调对，是实现的差别。
+
+**5% 的体积换 15× 的速度是划算的**，而且真正的体积收益在裁剪 app 树（见"已知限制"）。`build-module.ps1` 保留着 —— 需要那 5% 时可以用它。
+
 ---
 
-## 瀹夎涓庝娇鐢?
-**瑁?*锛欿ernelSU 绠＄悊鍣?鈫?妯″潡 鈫?浠庢湰鍦板畨瑁?鈫?閫?zip銆傚畨瑁呮棩蹇楅噷浼氱湅鍒板啋鐑熸祴璇曠粨鏋溿€?
-**閲嶅惎鍚?* `service.sh` 鑷姩鎷夎捣銆傛棩蹇楋細
+## 安装与使用
+
+**装**：KernelSU 管理器 → 模块 → 从本地安装 → 选 zip。安装日志里会看到冒烟测试结果。
+
+**重启后** `service.sh` 自动拉起。日志：
 
 ```sh
 adb shell su -c 'cat /data/adb/dsh/logs/dsh.log'
 ```
 
-**璁块棶**锛堝湪 PC 涓婏級锛?
+**访问**（在 PC 上）：
+
 ```powershell
 adb forward tcp:3080 tcp:3080
 ```
 
-鐒跺悗娴忚鍣ㄦ墦寮€ `http://127.0.0.1:3080`銆?
-**鎺у埗**锛?
+然后浏览器打开 `http://127.0.0.1:3080`。
+
+**控制**：
+
 ```sh
-adb shell su -c 'dshctl status'    # 鍦ㄨ窇鍚? 鐩戝惉鍝噷
-adb shell su -c 'dshctl log 60'    # 鐪嬫棩蹇?adb shell su -c 'dshctl restart'
+adb shell su -c 'dshctl status'    # 在跑吗, 监听哪里
+adb shell su -c 'dshctl log 60'    # 看日志
+adb shell su -c 'dshctl restart'
 adb shell su -c 'dshctl stop'
-adb shell su -c 'dshctl forward'   # 鎵撳嵃 PC 渚ц鏁茬殑鍛戒护
+adb shell su -c 'dshctl forward'   # 打印 PC 侧该敲的命令
 ```
 
 ---
 
-## 鍥涗釜鍏抽敭鍐冲畾锛堥兘韪╄繃锛?
-### 1. `--ignore-scripts` 鏄繀椤荤殑
+## 五个关键决定（都踩过）
 
-`npm install` 鐨勫畨瑁呰剼鏈湪 **HOST**锛圵indows锛変笂璺戯紝浣嗗寘鏄粰 **TARGET**锛坅ndroid锛夎鐨勩€俴offi 鐨?`install` 鑴氭湰浼氬姞杞藉钩鍙?`.node`鈥斺€斿畠鎷垮埌鐨勬槸 android 鐨勶紝鍦?Windows 涓婂姞杞戒笉浜嗏€斺€斾簬鏄洖閫€鍒?*浠庢簮鐮佺紪璇?*锛岀劧鍚庡洜涓烘病鏈?CMake 鑰屽け璐ャ€?
-璺宠繃鑴氭湰鍗冲彲锛氬钩鍙伴缂栬瘧鍖呭凡缁忕敱 `--os=android --cpu=arm64` 瑁呭ソ浜嗐€?
-> 鍙︿竴涓弽渚嬶細**缁濅笉鑳界敤 `--omit=optional`**銆俴offi 鐨勫钩鍙伴缂栬瘧鍖呮鏄?`optionalDependencies`锛岀渷鎺夊畠绛変簬鎶?koffi 搴熸帀銆?
-### 2. `node-addon-require-builtin` 蹇呴』鐢?JS 鏇胯韩椤舵浛
+### 1. `--ignore-scripts` 是必须的
 
-鍘熷寘鐨?`optionalDependencies` 閲屽彧鏈夎繖浜涘钩鍙帮細
+`npm install` 的安装脚本在 **HOST**（Windows）上跑，但包是给 **TARGET**（android）装的。koffi 的 `install` 脚本会加载平台 `.node`——它拿到的是 android 的，在 Windows 上加载不了——于是回退到**从源码编译**，然后因为没有 CMake 而失败。
+
+跳过脚本即可：平台预编译包已经由 `--os=android --cpu=arm64` 装好了。
+
+> 另一个反例：**绝不能用 `--omit=optional`**。koffi 的平台预编译包正是 `optionalDependencies`，省掉它等于把 koffi 废掉。
+
+### 2. `node-addon-require-builtin` 必须用 JS 替身顶替
+
+原包的 `optionalDependencies` 里只有这些平台：
 
 ```
 darwin-arm64  darwin-x64  linux-arm64-gnu  linux-x64-gnu
 win32-arm64-msvc  win32-x64-msvc  win32-ia32-msvc
 ```
 
-**娌℃湁 android**锛坄linux-arm64-gnu` 涔熸晳涓嶄簡鈥斺€擜ndroid 鐢?bionic锛屼笉鏄?glibc锛夈€傛墍浠?npm 鍦?Android 涓婁竴涓钩鍙板寘閮借涓嶄笂锛宍require` 蹇呯劧鎶涖€?
-鑰?DSH 閲屾湁涓ゅ闇€瑕佸畠锛?
-| 浣嶇疆 | 琛屼负 |
-|---|---|
-| `cordis-plugin-loader` | 鏈?`--expose-internals` 鍒嗘敮涓旀暣浣?try/catch锛?*鏈潵灏变笉浼氭寕** |
-| `dsh-app-boot` | **鏃犱繚鎶?*鐨?`createRequire(...)("node-addon-require-builtin")` 鈫?灏辨槸瀹冨繀椤婚《鏇跨殑鍘熷洜 |
+**没有 android**（`linux-arm64-gnu` 也救不了——Android 用 bionic，不是 glibc）。所以 npm 在 Android 上一个平台包都装不上，`require` 必然抛。
 
-**鏇胯韩鐨勫師鐞?*锛氳繖涓寘鍞竴鐨勮兘鍔涙槸"鎶?Node 鐨?internal 妯″潡 require 鍑烘潵"锛岃€?Node 鑷繁灏辨湁杩欐潯璺€斺€斿惎鍔ㄦ椂鍔?`--expose-internals`锛宍require("internal/...")` 鐩存帴鍙敤銆傛墍浠ワ細
+而 DSH 里有两处需要它：
+
+| 位置 | 行为 |
+|---|---|
+| `cordis-plugin-loader` | 有 `--expose-internals` 分支且整体 try/catch，**本来就不会挂** |
+| `dsh-app-boot` | **无保护**的 `createRequire(...)("node-addon-require-builtin")` ← 就是它必须顶替的原因 |
+
+**替身的原理**：这个包唯一的能力是"把 Node 的 internal 模块 require 出来"，而 Node 自己就有这条路——启动时加 `--expose-internals`，`require("internal/...")` 直接可用。所以：
 
 ```js
 function requireBuiltin(moduleId) { return require(moduleId); }
 ```
 
-涓嶉渶瑕佷换浣曞師鐢熶唬鐮併€傛浛韬簮鐮佸湪 [`shim/node-addon-require-builtin.js`](shim/node-addon-require-builtin.js)锛岀敱 `build-dsh-tree.mjs` 鍦ㄦ瀯寤烘湡瑕嗙洊鍒?`app/node_modules/node-addon-require-builtin/lib/index.js`銆?
-**杩欎竴姝ユ槸瀹炴祴杩囩殑**锛屼笉鏄帹鏂細
+不需要任何原生代码。替身源码在 [`shim/node-addon-require-builtin.js`](shim/node-addon-require-builtin.js)，由 `build-dsh-tree.mjs` 在构建期覆盖到 `app/node_modules/node-addon-require-builtin/lib/index.js`。
+
+**这一步是实测过的**，不是推断：
 
 ```
-鉁?shim 瀹炴祴閫氳繃: shim-ok object function
-路 涓嶅甫鏃楁爣鏃? 闇€瑕?Node 浠?--expose-internals 鍚姩鎵嶈兘瑙ｆ瀽 "internal/..."   鈫?鍙鐨勯敊璇?```
-
-`requireBuiltin("internal/modules/esm/loader")` 杩斿洖鐨勫璞＄‘瀹炲甫 `getOrInitializeCascadedLoader` 鍑芥暟鈥斺€旀鏄?`dsh-app-boot` 闇€瑕佺殑銆?
-### 3. `node-addon-system/flock` 涔熻鏇胯韩 鈥斺€?浣嗚繖涓槸**璇箟闄嶇骇**
-
-杩欎釜鏄悗鏉ュ湪鐪熸満涓婃挒鍑烘潵鐨勶紝鐥囩姸寰堢洿鎺ワ細
-
-```
-鏈疆杩愯澶辫触: flock is not supported on android-arm64
+✓ shim 实测通过: shim-ok object function
+· 不带旗标时: 需要 Node 以 --expose-internals 启动才能解析 "internal/..."   ← 可读的错误
 ```
 
-`dsh-session-persistence-jsonl` 鐨勪細璇濆啓鍏ヨ矾寰勮缁?`session.lock` 涓婁竴涓潪闃诲 `flock(2)`锛岀敤鐨勬槸 `@deepseek-ai/node-addon-system` 鐨勫師鐢熸ā鍧椼€傝€屽畠鐨?`optionalDependencies` 閲岋細
+`requireBuiltin("internal/modules/esm/loader")` 返回的对象确实带 `getOrInitializeCascadedLoader` 函数——正是 `dsh-app-boot` 需要的。
+
+### 3. `node-addon-system/flock` 也要替身 —— 但这个是**语义降级**
+
+这个是后来在真机上撞出来的，症状很直接：
+
+```
+本轮运行失败: flock is not supported on android-arm64
+```
+
+`dsh-session-persistence-jsonl` 的会话写入路径要给 `session.lock` 上一个非阻塞 `flock(2)`，用的是 `@deepseek-ai/node-addon-system` 的原生模块。而它的 `optionalDependencies` 里：
 
 ```
 darwin-arm64  darwin-x64  linux-x64  linux-arm64
-                              鈫?娌℃湁 android
+                              ← 没有 android
 ```
 
-鍔犺浇鍣ㄧ涓€鍙ュ氨鎸夊钩鍙版嫆缁濓細
+加载器第一句就按平台拒绝：
 
 ```js
 if (platform !== 'linux' && platform !== 'darwin') throw ...
 ```
 
-**娉ㄦ剰锛氭妸 `platform` 楠楁垚 `linux` 涔熸病鐢?* 鈥斺€?瀹冭繕浼氭寜 `report.header.glibcVersionRuntime` 鍦?glibc / musl 涔嬮棿閫夛紝鑰?Android 鐢ㄧ殑鏄?bionic锛屼袱鑰呴兘涓嶆槸銆?
-**杩欎釜閿佹槸骞蹭粈涔堢殑**锛氳法**杩涚▼**鐨勪細璇濆啓鎵€鏈夋潈浜掓枼銆備袱涓?DSH 杩涚▼鍚屾椂鍐欏悓涓€涓細璇濇棩蹇椾細鎾曡瀹冦€傞攣鍦ㄦ寔鏈夎€呯殑 fd 鍏抽棴鏃剁敱鍐呮牳閲婃斁锛堣繘绋嬪穿婧冧篃涓€鏍凤級锛屾墍浠ヤ笉浼氱暀姝婚攣銆傝鑰呬笉纰板畠銆?
-**涓轰粈涔堝彲浠ラ檷绾?*锛?*涓婃父鑷繁瀵瑰崟杩涚▼閮ㄧ讲灏辨槸杩欎箞鍋氱殑**銆傝鏂囦欢鑷繁鐨勬敞閲婂師鏂囷細
+**注意：把 `platform` 骗成 `linux` 也没用** —— 它还会按 `report.header.glibcVersionRuntime` 在 glibc / musl 之间选，而 Android 用的是 bionic，两者都不是。
+
+**这个锁是干什么的**：跨**进程**的会话写所有权互斥。两个 DSH 进程同时写同一个会话日志会撕裂它。锁在持有者的 fd 关闭时由内核释放（进程崩溃也一样），所以不会留死锁。读者不碰它。
+
+**为什么可以降级**：**上游自己对单进程部署就是这么做的**。该文件自己的注释原文：
 
 > The browser worker stubs the native flock entry to immediate success: it is single-process, so the in-process write claim already excludes every writer.
 
-鎴戜滑鐨勯儴缃插悓鏍锋槸鍗曡繘绋?鈥斺€?`service.sh` 鏄敮涓€鎷夎捣鍏ュ彛锛屽甫 pidfile 妫€鏌ワ紝鎷掔粷鍚姩绗簩涓疄渚嬶紱杩涚▼鍐呯殑鍐欎簰鏂ョ敱 `SessionWriteLease` 鑷繁鐨勭姸鎬佷繚璇侊紝涓?flock 鏃犲叧銆傛墍浠ヤ涪鎺夌殑**鍙湁**"涓や釜 DSH 杩涚▼涔嬮棿鐨勪簰鏂?銆?
-鏇胯韩婧愮爜鍦?[`shim/node-addon-system-flock.js`](shim/node-addon-system-flock.js)锛屽疄娴嬶細
+我们的部署同样是单进程 —— `service.sh` 是唯一拉起入口，带 pidfile 检查，拒绝启动第二个实例；进程内的写互斥由 `SessionWriteLease` 自己的状态保证，与 flock 无关。所以丢掉的**只有**"两个 DSH 进程之间的互斥"。
+
+替身源码在 [`shim/node-addon-system-flock.js`](shim/node-addon-system-flock.js)，实测：
 
 ```
-鉁?flock shim 瀹炴祴閫氳繃: flock-shim-ok js-shim-single-process
+✓ flock shim 实测通过: flock-shim-ok js-shim-single-process
 ```
 
-**杩欎釜鍋囪浠€涔堟椂鍊欎細鐮?*锛堝悓鏍峰啓鍦?shim 鏂囦欢椤堕儴锛夛細
+**这个假设什么时候会破**（同样写在 shim 文件顶部）：
 
-- 浣犳墜鍔ㄥ啀璺戜竴涓?`dsh web`锛岃€岀洃鐫ｈ繘绋嬩篃鍦ㄨ窇锛屼笖涓よ€呮寚鍚戝悓涓€涓?`DSH_HOME`
-- 浣犳妸 `service.sh` 鐨?pidfile 妫€鏌ュ幓鎺?
-閭ｆ椂鍙兘鍑虹幇浼氳瘽鏃ュ織鎾曡銆?*鐪熼渶瑕佽法杩涚▼閿佺殑璇濓紝姝ｇ‘鍋氭硶鏄敤 Android NDK 鎶婃湰鍖呰嚜甯︾殑 `src/flock.c` 缂栨垚 android-arm64 鐨?`.node`**锛堟簮鐮佹槸闅忓寘鍙戠殑锛夛紝鑰屼笉鏄户缁敤鏇胯韩銆?
-### 4. 鑴氭湰鐨?shebang 鍐欐浜?Termux 璺緞锛屽繀椤婚噸鍐?
-**杩欐潯鎴戜竴寮€濮嬫紡浜嗭紝鑰屼笖婕忓緱寰堥殣钄斤細鎴戝彧楠岃瘉浜?ELF 浜岃繘鍒?鑳借窇"锛屾病楠岃瘉鑴氭湰銆?*
+- 你手动再跑一个 `dsh web`，而监督进程也在跑，且两者指向同一个 `DSH_HOME`
+- 你把 `service.sh` 的 pidfile 检查去掉
 
-Termux 鐨勫寘閲岋紝**鑴氭湰**鏂囦欢鐨?shebang 鍐欐浜嗭細
+那时可能出现会话日志撕裂。**真需要跨进程锁的话，正确做法是用 Android NDK 把本包自带的 `src/flock.c` 编成 android-arm64 的 `.node`**（源码是随包发的），而不是继续用替身。
+
+### 4. 脚本的 shebang 写死了 Termux 路径，必须重写
+
+**这条我一开始漏了，而且漏得很隐蔽：我只验证了 ELF 二进制"能跑"，没验证脚本。**
+
+Termux 的包里，**脚本**文件的 shebang 写死了：
 
 ```
 #!/data/data/com.termux/files/usr/bin/sh
 ```
 
-ELF 浜岃繘鍒朵笉璇?shebang锛屾墍浠ュ畠浠病浜嬶紱浣嗚剼鏈殑琛ㄧ幇鏄€?*鏂囦欢鏄庢槑鍦紝鍗存姤 No such file or directory**銆嶁€斺€?`execve` 鎵句笉鍒拌В閲婂櫒銆?
-鏈€闃寸殑涓€渚嬶細`git-submodule` / `git-mergetool` 鏄?git 鑷甫鐨?shell 鑴氭湰锛屽湪 `usr/libexec/git-core/` 涓嬨€俫it 鎵惧緱鍒板畠浠€佷絾 execve 澶辫触锛屼簬鏄?*璋庢姤**鎴愶細
+ELF 二进制不读 shebang，所以它们没事；但脚本的表现是「**文件明明在，却报 No such file or directory**」—— `execve` 找不到解释器。
+
+最阴的一例：`git-submodule` / `git-mergetool` 是 git 自带的 shell 脚本，在 `usr/libexec/git-core/` 下。git 找得到它们、但 execve 失败，于是**谎报**成：
 
 ```
 git: 'submodule' is not a git command. See 'git --help'.
 ```
 
-**杩欎釜閿欒淇℃伅浼氭妸鎺掓煡鏂瑰悜甯﹀亸鍒般€実it 瑁呭緱涓嶅叏銆嶃€?* 瀹為檯褰卞搷锛歚git clone --recurse-submodules`銆乣git submodule update`銆乣git mergetool`銆乣git filter-branch` 鍏ㄩ儴涓嶅彲鐢ㄣ€傝€屼笖鎴戝姞杩涜繍琛屾椂鐨?`npm` / `npx` / `wcurl` / `curl-config` **涔熸槸鍔犱簡浣嗕笉鑳界敤** 鈥斺€?瀹冧滑鐨勫叆鍙?`npm-cli.js` 鐨?shebang 鏄?`#!/data/data/com.termux/files/usr/bin/env node`锛岃€?**Android 涓婃病鏈?`/usr/bin/env`**銆?
-瀹炴祴鍏?**70 涓?*鏂囦欢锛宍fetch-runtime.mjs` 鐨?`rewriteShebangs()` 鍦ㄦ瀯寤烘湡閲嶅啓鍏朵腑 48 涓細
+**这个错误信息会把排查方向带偏到「git 装得不全」。** 实际影响：`git clone --recurse-submodules`、`git submodule update`、`git mergetool`、`git filter-branch` 全部不可用。而且我加进运行时的 `npm` / `npx` / `wcurl` / `curl-config` **也是加了但不能用** —— 它们的入口 `npm-cli.js` 的 shebang 是 `#!/data/data/com.termux/files/usr/bin/env node`，而 **Android 上没有 `/usr/bin/env`**。
 
-| 鍘?shebang | 涓暟 | 閲嶅啓鎴?|
+实测共 **70 个**文件，`fetch-runtime.mjs` 的 `rewriteShebangs()` 在构建期重写其中 48 个：
+
+| 原 shebang | 个数 | 重写成 |
 |---|---|---|
-| `#!鈥?bin/sh` | 32 | `#!/system/bin/sh` |
-| `#!鈥?bin/env node` | 12 | `#!/data/adb/modules/dsh_android/usr/bin/node` |
-| `#!鈥?bin/env sh` | 2 | `#!/system/bin/sh` |
-| `#!鈥?bin/bash` | 2 | `#!/data/adb/modules/dsh_android/usr/bin/bash` |
-| `#!鈥?bin/env python3` | 14 | **涓嶅姩** 鈥斺€?妯″潡閲屾病鏈?python |
-| `#!鈥?bin/perl` | 7 | **涓嶅姩** 鈥斺€?娌℃湁 perl |
-| `#!鈥?bin/python` | 1 | **涓嶅姩** |
+| `#!…/bin/sh` | 32 | `#!/system/bin/sh` |
+| `#!…/bin/env node` | 12 | `#!/data/adb/modules/dsh_android/usr/bin/node` |
+| `#!…/bin/env sh` | 2 | `#!/system/bin/sh` |
+| `#!…/bin/bash` | 2 | `#!/data/adb/modules/dsh_android/usr/bin/bash` |
+| `#!…/bin/env python3` | 14 | **不动** —— 模块里没有 python |
+| `#!…/bin/perl` | 7 | **不动** —— 没有 perl |
+| `#!…/bin/python` | 1 | **不动** |
 
-涓や釜鍏抽敭缁嗚妭锛?
-1. **蹇呴』鍐欒繍琛屾椂璺緞 `/data/adb/modules/<id>/usr/...`锛屼笉鏄?`modules_update/...`** 鈥斺€?瀹夎鏈熼棿鍦?`modules_update`锛岄噸鍚悗灏变笉鍦ㄤ簡銆俙id` 浠?`module.prop` 璇伙紝涓嶅啓姝汇€?2. **鍙敼鏂囨湰鑴氭湰**锛氬厛鍒ゅ墠涓ゅ瓧鑺傛槸涓嶆槸 `#!`锛圗LF 棣栧瓧鑺傛槸 `\x7f`锛屽ぉ鐒舵帓闄わ級锛岃€屼笖鍙崲绗竴琛屻€佸叾浣欏瓧鑺傚師鏍蜂繚鐣欍€?
-**閭?22 涓病瑙ｉ噴鍣ㄧ殑**锛坧ython3 / perl / python锛夊湪 README 閲屾爣娉ㄤ负涓嶆敮鎸侊細`node-gyp` 缂栬瘧鍘熺敓妯″潡銆乣git cvsserver` / `git send-email` / `gitweb` / `git p4` 鐢ㄤ笉浜嗐€?
-> 杩欐潯鏄?*鎵嬫満绔?agent 瀹炴祴鍑烘潵鐨?*锛屽畠缁欏嚭鐨勬竻鍗曪紙70 涓€佹寜 shebang 鍒嗙被锛夊拰鎴戜簨鍚庡鏍哥殑缁撴灉瀹屽叏涓€鑷淬€?
+两个关键细节：
+
+1. **必须写运行时路径 `/data/adb/modules/<id>/usr/...`，不是 `modules_update/...`** —— 安装期间在 `modules_update`，重启后就不在了。`id` 从 `module.prop` 读，不写死。
+2. **只改文本脚本**：先判前两字节是不是 `#!`（ELF 首字节是 `\x7f`，天然排除），而且只换第一行、其余字节原样保留。
+
+**那 22 个没解释器的**（python3 / perl / python）在 README 里标注为不支持：`node-gyp` 编译原生模块、`git cvsserver` / `git send-email` / `gitweb` / `git p4` 用不了。
+
+> 这条是**手机端 agent 实测出来的**，它给出的清单（70 个、按 shebang 分类）和我事后复核的结果完全一致。
+
 ---
 
-### 5. `git` 浜岃繘鍒堕噷缂栬瘧杩涗簡 Termux 鐨?exec-path
+## 工作区在 `/data/adb/dsh/workspace`，不在 `/sdcard`
 
-**杩欐潯鍜屼笂闈㈢ 4 鏉℃槸鐙珛闂锛屼絾鐥囩姸鍙犲湪鍚屼竴涓懡浠や笂銆?*
+**这是必须的，不是偏好。**
 
-淇畬 shebang 涔嬪悗锛宍npm` / `npx` / `wcurl` 閮借兘鐢ㄤ簡锛屼絾 git 鐨?*鑴氭湰鍨嬪瓙鍛戒护**浠嶇劧鍏ㄦ寕锛岃€屼笖鎶ョ殑鏄?*璇鎬?*鐨勯敊璇細
-
-```
-$ git submodule
-git: 'submodule' is not a git command. See 'git --help'.
-```
-
-鑰?`git-submodule` 鏄庢槑灏卞湪妯″潡閲屻€乻hebang 涔熷凡缁忎慨鎴?`#!/system/bin/sh` 浜嗐€?*闂鍦ㄤ簬 git 鍘嬫牴涓嶅幓妯″潡鐩綍鎵?*锛?
-```
-$ git --exec-path
-/data/data/com.termux/files/usr/libexec/git-core      鈫?杩欎釜鐩綍涓嶅瓨鍦?```
-
-exec-path 鏄?*缂栬瘧杩涗簩杩涘埗**鐨勶紝git 鎵惧瓙鍛戒护鏃跺彧鏌ュ畠銆俠uiltin 瀛愬懡浠わ紙`add` / `commit` / `status` 鈥︼級缂栬瘧鍦ㄤ簩杩涘埗閲屾墍浠ヤ笉鍙楀奖鍝?鈥斺€?杩欎篃鏄繖涓?bug 瀹规槗婕忔帀鐨勫師鍥犮€?
-鐩存帴璺戣剼鏈兘鐪嬪埌涓嬩竴灞傜棁鐘讹細
-
-```
-$ usr/libexec/git-core/git-submodule
-usr/libexec/git-core/git-submodule[22]: .: git-sh-setup: No such file or directory
-```
-
-`git-sh-setup` 鍚屾牱闈?exec-path 瀹氫綅銆?
-**淇硶**锛坄service.sh`锛夛細
-
-```sh
-export GIT_EXEC_PATH="$PREFIX/libexec/git-core"
-export GIT_TEMPLATE_DIR="$PREFIX/share/git-core/templates"
-```
-
-`GIT_EXEC_PATH` 鏄?git 瀹樻柟鏀寔鐨勮鐩栨柟寮忋€?*涓嶈鏀逛簩杩涘埗** 鈥斺€?閲岄潰閭ｆ潯 Termux 璺緞 48 瀛楄妭锛岃€屾ā鍧楄矾寰?49 瀛楄妭锛屽師鍦版墦琛ヤ竵浼氭孩鍑恒€?
-`GIT_TEMPLATE_DIR` 鏄『甯︾殑锛氭ā鏉跨洰褰曚篃鏄?Termux 璺緞锛屼笉璁剧殑璇?`git init` 瑁呭嚭 **0 涓?* hook 鏍锋湰锛堝疄娴嬭浜嗕箣鍚庢槸 14 涓級銆?
-**鐪熸満楠屾敹**锛堝湪 DSH 杩涚▼鑷繁鐨勭幆澧冮噷璺戯級锛?
-```
-git --exec-path -> /data/adb/modules/dsh_android/usr/libexec/git-core
-git submodule   -> fatal: not a git repository (...)     鈫?姝ｇ‘琛屼负: 鎵惧埌鑴氭湰骞舵墽琛屼簡
-git mergetool   -> warning: failed to exec 'man': ...    鈫?鑴氭湰璺戣捣鏉ヤ簡, 鍙槸娌℃墦鍖?man
-git init 鐨?hook 鏍锋湰鏁? 14
-```
-
-> 杩欐潯鍚屾牱鏄?*鎵嬫満绔?agent 瀹炴祴鍙戠幇鐨?*銆傚畠杩樻寚鍑轰竴涓鏄撹鍒ょ殑鐐癸細**闂 4 鍜岄棶棰?5 鏄袱涓嫭绔?bug锛屼慨鎺夊叾涓竴涓笉浼氳 `git submodule` 鐨勭棁鐘舵秷澶?* 鈥斺€?鎵€浠ャ€屼慨浜嗗嵈娌″彉鍖栥€嶄笉浠ｈ〃娌′慨瀵广€?
----
-
-## 宸ヤ綔鍖哄湪 `/data/adb/dsh/workspace`锛屼笉鍦?`/sdcard`
-
-**杩欐槸蹇呴』鐨勶紝涓嶆槸鍋忓ソ銆?*
-
-Android 鐨?`/sdcard` 鏄?**FUSE**锛?*涓嶅疄鐜?`link(2)`**锛堝疄娴?`ln a b` 鈫?`Function not implemented`锛夈€傝€?DSH 鐨?`writeFileAtomic` 缁欍€屽垱寤烘柊鏂囦欢銆嶈蛋鐨勬鏄?`link()`锛堜负浜嗘嬁 no-replace 璇箟锛夛細
+Android 的 `/sdcard` 是 **FUSE**，**不实现 `link(2)`**（实测 `ln a b` → `Function not implemented`）。而 DSH 的 `writeFileAtomic` 给「创建新文件」走的正是 `link()`（为了拿 no-replace 语义）：
 
 ```js
 // @deepseek-ai/dsh-fs-local
 if (createIfAbsent !== void 0) try {
-    await linkFile(tempPath, absolutePath);      // 鈫?鍒涘缓鏂版枃浠?} catch (error) {
-    await throwGuardedCreateFailure(error, ...); // 鈫?涓婃父娌℃湁闄嶇骇
+    await linkFile(tempPath, absolutePath);      // ← 创建新文件
+} catch (error) {
+    await throwGuardedCreateFailure(error, ...); // ← 上游没有降级
 }
 ...
-else await rename(tempPath, absolutePath);       // 鈫?瑕嗙洊宸叉湁鏂囦欢锛團USE 鏀寔锛?```
+else await rename(tempPath, absolutePath);       // ← 覆盖已有文件（FUSE 支持）
+```
 
-浜庢槸宸ヤ綔鍖哄湪 `/sdcard` 涓婃椂锛?
+于是工作区在 `/sdcard` 上时：
+
 ```
 ENOSYS: function not implemented, link
   '.../.foo.md.<pid>.<uuid>.tmpdir/foo.md.tmp' -> '.../foo.md'
 ```
 
-**agent 鏃犳硶鏂板缓浠讳綍鏂囦欢锛屽彧鑳芥敼宸茬粡瀛樺湪鐨勩€?* 鑰屽伐浣滃尯鏄富璺緞锛屾墍浠ヨ繖浼氳 harness 鍩烘湰涓嶅彲鐢ㄣ€?
-瀹炴祴瀵圭収锛堝悓涓€鍙拌澶囷級锛?
-| 浣嶇疆 | 鏂囦欢绯荤粺 | `link()` |
-|---|---|---|
-| `/sdcard/DroidHarness` | `fuse` | 鉁?`Function not implemented` |
-| `/data/adb/dsh/workspace` | ext4 | 鉁?|
+**agent 无法新建任何文件，只能改已经存在的。** 而工作区是主路径，所以这会让 harness 基本不可用。
 
-**浠ｄ环**锛氬伐浣滃尯鍙樻垚 root-only锛屾櫘閫氭枃浠剁鐞嗗櫒鐪嬩笉鍒帮紝瑕佺敤 root 绠＄悊鍣紙鎴?`adb pull`锛夈€?
-**鍙﹀鏋勫缓鏈熻繕缁?`dsh-fs-local` 鎵撲簡琛ヤ竵**锛坄dsh/tools/build-dsh-tree.mjs` 鐨?`TEXT_PATCHES`锛夛紝璁╁畠鍦?`link()` 澶辫触鏃堕檷绾ф垚 `copyFile` + `COPYFILE_EXCL` 鈥斺€?鍚屾牱鏄€岀洰鏍囧凡瀛樺湪灏?EEXIST銆嶇殑鍘熷瓙璇箟锛屼笉闇€瑕佺‖閾炬帴锛?*杩欐牱鍗充娇鐢ㄦ埛鑷繁鎶婂伐浣滃尯閫夊埌 `/sdcard` 涔熻兘鐢?*锛堜唬浠锋槸澶氫竴娆℃嫹璐濓級銆?
-> **涓嶈兘闄嶇骇鎴?`rename()`** 鈥斺€?閭ｄ細涓㈡帀 no-replace 璇箟锛屼袱涓苟鍙戝垱寤鸿€呬細浜掔浉瑕嗙洊锛岃€岃皟鐢ㄦ柟鐨?`throwGuardedCreateFailure` 閭ｅ瀹堝崼灏辨槸涓哄畠鍐欑殑銆?>
-> 琛ヤ竵甯?*閿氱偣鏍￠獙**锛氭壘涓嶅埌閿氱偣銆佹垨閿氱偣涓嶅敮涓€锛屽氨鐩存帴 die銆傚畞鍙瀯寤哄け璐ワ紝涔熶笉瑕侀潤榛樺け鏁?鈥斺€?閭ｇ bug 鍙湪鐪熸満涓娿€佸彧鍦?agent 鎯冲啓鏂囦欢鏃舵墠鏆撮湶銆?
+实测对照（同一台设备）：
+
+| 位置 | 文件系统 | `link()` |
+|---|---|---|
+| `/sdcard/DroidHarness` | `fuse` | ✗ `Function not implemented` |
+| `/data/adb/dsh/workspace` | ext4 | ✓ |
+
+**代价**：工作区变成 root-only，普通文件管理器看不到，要用 root 管理器（或 `adb pull`）。
+
+**另外构建期还给 `dsh-fs-local` 打了补丁**（`dsh/tools/build-dsh-tree.mjs` 的 `TEXT_PATCHES`），让它在 `link()` 失败时降级成 `copyFile` + `COPYFILE_EXCL` —— 同样是「目标已存在就 EEXIST」的原子语义，不需要硬链接，**这样即使用户自己把工作区选到 `/sdcard` 也能用**（代价是多一次拷贝）。
+
+> **不能降级成 `rename()`** —— 那会丢掉 no-replace 语义，两个并发创建者会互相覆盖，而调用方的 `throwGuardedCreateFailure` 那套守卫就是为它写的。
+>
+> 补丁带**锚点校验**：找不到锚点、或锚点不唯一，就直接 die。宁可构建失败，也不要静默失效 —— 那种 bug 只在真机上、只在 agent 想写文件时才暴露。
+
 ---
 
-## 鎻掍欢瀹夎锛坧npm锛?
-DSH 鐨勬彃浠剁鐞嗗櫒**鎶婂弬鏁板師鏍疯浆鍙戠粰 `pnpm` 鎵ц**锛屾墍浠ヨ繍琛屾椂閲屽繀椤绘湁 pnpm銆傛湰妯″潡甯︾殑鏄?**NDK 缂栫殑 Android ELF**锛坧npm 12.7.0锛?6.8 MiB锛沗ELF 64-bit LSB arm64, dynamic (/system/bin/linker64)` 鈥斺€?涓嶆槸 Termux 閭ｄ釜鍐欐璺緞鐨勬瀯寤猴級銆?
-瀹冨湪 Android 涓婃湁涓や釜鍧戯紝`service.sh` 宸茬粡澶勭悊浜嗙涓€涓細
+## 插件安装（pnpm）
 
-### 1. store 涓嶈兘钀藉湪 `/sdcard`
+DSH 的插件管理器**把参数原样转发给 `pnpm` 执行**，所以运行时里必须有 pnpm。本模块带的是 **NDK 编的 Android ELF**（pnpm 12.7.0，46.8 MiB；`ELF 64-bit LSB arm64, dynamic (/system/bin/linker64)` —— 不是 Termux 那个写死路径的构建）。
 
-pnpm 闈?*纭摼鎺?*鎶?store 閲岀殑鏂囦欢閾捐繘 `node_modules`銆傝€?`/sdcard` 鏄?FUSE/sdcardfs锛?*涓嶆敮鎸佺‖閾炬帴** 鈥斺€?璺ㄦ枃浠剁郴缁熶細鐩存帴鎶ワ細
+它在 Android 上有两个坑，`service.sh` 已经处理了第一个：
+
+### 1. store 不能落在 `/sdcard`
+
+pnpm 靠**硬链接**把 store 里的文件链进 `node_modules`。而 `/sdcard` 是 FUSE/sdcardfs，**不支持硬链接** —— 跨文件系统会直接报：
 
 ```
 Cross-device link not permitted
 ```
 
-pnpm 鐨?store 榛樿鍦?`$HOME` 涓嬨€傝€屾湰妯″潡鐨?`HOME` 鏄伐浣滃尯 鈥斺€?瀹?*鏇剧粡**鏄?`/sdcard/DroidHarness`锛團USE锛夛紝浜庢槸 pnpm 鎶ワ細
+pnpm 的 store 默认在 `$HOME` 下。而本模块的 `HOME` 是工作区 —— 它**曾经**是 `/sdcard/DroidHarness`（FUSE），于是 pnpm 报：
 
 ```
 ERR_PNPM_STORE_DIR_OPEN_OPERATION_LOCK
@@ -295,111 +303,146 @@ ERR_PNPM_STORE_DIR_OPEN_OPERATION_LOCK
   /sdcard/DroidHarness/.cache/pnpm-store-operation-locks-0
 ```
 
-**鎵嬫満绔?agent 瀹炴祴锛歚npm_config_cache_dir` / `npm_config_store_dir` / `npm_config_state_dir` / `XDG_CACHE_HOME` / `--cache-dir` / `--config.cacheDir` / `--store-dir` 鍏ㄩ兘鎸笉鍔ㄥ畠** 鈥斺€?pnpm 鏍规湰涓嶈閭ｅ嚑涓彉閲忋€?*鍞竴鏈夋晥鐨勬槸缁欏畠涓€涓崟鐙殑 `HOME`銆?*
+**手机端 agent 实测：`npm_config_cache_dir` / `npm_config_store_dir` / `npm_config_state_dir` / `XDG_CACHE_HOME` / `--cache-dir` / `--config.cacheDir` / `--store-dir` 全都挪不动它** —— pnpm 根本不读那几个变量。**唯一有效的是给它一个单独的 `HOME`。**
 
-鎵€浠ユ瀯寤烘湡鐢熸垚浜嗕竴灞傚惎鍔ㄥ櫒锛?
+所以构建期生成了一层启动器：
+
 ```
-usr/bin/pnpm-bin   鈫?鍘?ELF 鏀瑰悕 (46.8 MiB)
-usr/bin/pnpm       鈫?#!/system/bin/sh
+usr/bin/pnpm-bin   ← 原 ELF 改名 (46.8 MiB)
+usr/bin/pnpm       ← #!/system/bin/sh
                       export HOME="$DSH_HOME_DIR"
                       exec "${0%/*}/pnpm-bin" "$@"
 ```
 
-鍙敼 pnpm 瀛愯繘绋嬬殑 `HOME`锛孌SH 鑷繁鐨?`HOME` 涓嶅姩锛圙UI 鐨勫伐浣滃尯閫夋嫨鍣ㄤ粠瀹冭捣姝ワ級銆傝繖鏍蜂笉绠″伐浣滃尯琚€夊埌鍝紝pnpm 鐨?store 閮界ǔ鍦?`/data`銆?
-> 杩欎釜鍧戞槸**鎵嬫満绔?agent 瀹炴祴鍑烘潵鐨?*锛屼笉鏄垜鎺ㄧ殑銆?>
-> 鍙﹀锛歚service.sh` 閲岃繕鐣欑潃涓夎 `npm_config_*`锛岄偅瀵?**pnpm 鏄?no-op**锛堢暀鐫€鏄洜涓?**npm** 浼氳瀹冧滑锛夈€傛垜涓€寮€濮嬩互涓洪偅涓夎淇ソ浜嗛棶棰?鈥斺€?閭ｆ槸閿欑殑銆?
-### 2. JS 鐗?pnpm 鐨?shebang锛堟湰妯″潡涓嶅彈褰卞搷锛?
-npm 涓婂彂甯冪殑 pnpm 鐨?`bin/pnpm.mjs` shebang 鏄?`#!/usr/bin/env node`锛岃€?**Android 涓婃病鏈?`/usr/bin/env`**锛岀洿鎺?exec 浼氬け璐?鈥斺€?蹇呴』鍖呬竴灞傚惎鍔ㄥ櫒鏄惧紡鐢?node 鎷夎捣銆?
-**鏈ā鍧楃敤鐨勬槸 NDK 缂栫殑 Android ELF锛堜笉璇?shebang锛夛紝鎵€浠ヤ笉鍙楄繖鏉″奖鍝嶃€?* 浣嗗鏋滀綘鎶?`usr/bin/pnpm` 鎹㈡垚 npm 涓婄殑 pnpm JS 鍖咃紝灏辫娉ㄦ剰銆?
-### 瑁呮彃浠?
-Web GUI 鈫?**璁剧疆 鈫?鎻掍欢 鈫?娣诲姞鎻掍欢**锛屽～ npm 鍖呭悕锛堝 `dsh-web-mobile`锛夈€傝瀹屽埛鏂伴〉闈㈠嵆鍙紙瀹㈡埛绔彃浠惰蛋 HMR锛屼笉鐢ㄩ噸鍚?DSH锛夈€?
+只改 pnpm 子进程的 `HOME`，DSH 自己的 `HOME` 不动（GUI 的工作区选择器从它起步）。这样不管工作区被选到哪，pnpm 的 store 都稳在 `/data`。
+
+> 这个坑是**手机端 agent 实测出来的**，不是我推的。
+>
+> 另外：`service.sh` 里还留着三行 `npm_config_*`，那对 **pnpm 是 no-op**（留着是因为 **npm** 会读它们）。我一开始以为那三行修好了问题 —— 那是错的。
+
+### 2. JS 版 pnpm 的 shebang（本模块不受影响）
+
+npm 上发布的 pnpm 的 `bin/pnpm.mjs` shebang 是 `#!/usr/bin/env node`，而 **Android 上没有 `/usr/bin/env`**，直接 exec 会失败 —— 必须包一层启动器显式用 node 拉起。
+
+**本模块用的是 NDK 编的 Android ELF（不读 shebang），所以不受这条影响。** 但如果你把 `usr/bin/pnpm` 换成 npm 上的 pnpm JS 包，就要注意。
+
+### 装插件
+
+Web GUI → **设置 → 插件 → 添加插件**，填 npm 包名（如 `dsh-web-mobile`）。装完刷新页面即可（客户端插件走 HMR，不用重启 DSH）。
+
 ---
 
-## 涓轰粈涔堝彧缁?`127.0.0.1`
+## 为什么只绑 `127.0.0.1`
 
-鏈変竴绫昏璁￠敊璇殑鍚庢灉鐗瑰埆涓ラ噸锛屾瀯鎴愭槸涓変釜鍐冲畾鍙犲姞锛?*缁?`0.0.0.0` + 鏃犻壌鏉?+ 鎻愪緵浠绘剰鍛戒护鎵ц**銆備笁鑰呭彔鍔犵瓑浜庢妸璁惧 root 鏉冮檺鎸傚湪缃戠粶涓娿€?
-鑰屼笖杩樻湁绗簩鏉℃洿闅愯斀鐨勮矾寰勶細濡傛灉绔偣涓嶆牎楠岃姹傜被鍨嬨€佽€屽搷搴斿張甯﹂€氶厤 CORS 澶达紝**鎵嬫満涓婃祻瑙堝櫒鎵撳紑鐨勪换鎰忕綉椤?*涔熻兘閫犳垚鍛戒护鎵ц鈥斺€?*杩欐潯璺笉鍙楅槻鐏闄愬埗**锛堟湰鏈哄洖鐜祦閲忎笉鍙?iptables 绠★級銆?
-DSH 鏈韩灏辨槸涓€涓兘璺?shell 鐨?agent锛屾墍浠ヨ繖閲屾妸绗竴鏉￠拤姝伙細**鍙粦鍥炵幆**銆傝杩滅▼璁块棶灏辫蛋 `adb forward` 鎴?SSH 闅ч亾鈥斺€旈偅鏄湁鎰忎负涔嬨€佹湁鏄庣‘杈圭晫鐨勩€?
+有一类设计错误的后果特别严重，构成是三个决定叠加：**绑 `0.0.0.0` + 无鉴权 + 提供任意命令执行**。三者叠加等于把设备 root 权限挂在网络上。
+
+而且还有第二条更隐蔽的路径：如果端点不校验请求类型、而响应又带通配 CORS 头，**手机上浏览器打开的任意网页**也能造成命令执行——**这条路不受防火墙限制**（本机回环流量不受 iptables 管）。
+
+DSH 本身就是一个能跑 shell 的 agent，所以这里把第一条钉死：**只绑回环**。要远程访问就走 `adb forward` 或 SSH 隧道——那是有意为之、有明确边界的。
+
 ---
 
-## 鍏煎鎬?
-| 椤?| 鐘舵€?|
+## 兼容性
+
+| 项 | 状态 |
 |---|---|
-| Root 绠＄悊鍣?| **KernelSU 宸插疄娴?*銆侻agisk / APatch 搴旇涔熻兘瑁咃紙妯″潡鏍煎紡鍏煎锛夛紝浣?*鏈獙璇?* |
-| ABI | **鍙仛浜?arm64-v8a**銆傚叾浠?ABI 闇€瑕佸彟閰嶈繍琛屾椂锛坄fetch-runtime.mjs --arch`锛?|
-| Android 鐗堟湰 | 鍙湪 **Android 16** 涓婇獙杩囥€傝繍琛屾椂鏉ヨ嚜 Termux 鐨勫寘锛岀悊璁烘敮鎸佽寖鍥磋窡瀹冧竴鑷?|
-| ROM | 鍙湪 **HyperOS 3** 涓婇獙杩囥€?*妯″潡涓嶄緷璧栦换浣?OEM 鐗规€?*锛汬yperOS / MIUI 鐗规湁鐨勬敞鎰忎簨椤硅[骞冲彴绗旇](../docs/android-agent-harness-plan.md) 绗?3 绔狅紙濡傛灉浣犵殑 ROM 涓嶆槸杩欎竴绯伙紝閭ｇ珷鍙互鏁寸珷璺宠繃锛?|
-| 灞忓箷 | 涓嶄緷璧栧叿浣撳垎杈ㄧ巼 / DPI锛堣繍琛屾椂鎺㈡祴锛?|
-| SoC | 涓嶄緷璧栥€傚敮涓€娌捐竟鐨勬槸绔晶 OCR 鐨?NPU 鏀寔锛岃€岄偅涓姛鑳界幇鍦ㄦ病鍋?|
+| Root 管理器 | **KernelSU 已实测**。Magisk / APatch 应该也能装（模块格式兼容），但**未验证** |
+| ABI | **只做了 arm64-v8a**。其他 ABI 需要另配运行时（`fetch-runtime.mjs --arch`） |
+| Android 版本 | 只在 **Android 16** 上验过。运行时来自 Termux 的包，理论支持范围跟它一致 |
+| ROM | 只在 **HyperOS 3** 上验过。**模块不依赖任何 OEM 特性**；HyperOS / MIUI 特有的注意事项见[平台笔记](../docs/android-agent-harness-plan.md) 第 3 章（如果你的 ROM 不是这一系，那章可以整章跳过） |
+| 屏幕 | 不依赖具体分辨率 / DPI（运行时探测） |
+| SoC | 不依赖。唯一沾边的是端侧 OCR 的 NPU 支持，而那个功能现在没做 |
 
-## 宸茬煡闄愬埗
+## 已知限制
 
-- **棣栨瀹夎杈冩參**锛?4,228 涓枃浠惰瑙ｅ帇銆傚畨瑁呰剼鏈?*鏁呮剰涓嶅 `app/` 鍋?`set_perm_recursive`**锛堥偅鏄€愪釜 shell 璋冪敤锛屼細鎱㈠埌涓嶅彲鎺ュ彈锛夛紝鏀圭敤涓€鏉?`chmod -R 0755`銆?- **`node-pty` 娌℃湁鍘熺敓妯″潡**锛氬畨瑁呰剼鏈璺宠繃锛堝畠鍦?HOST 涓婅窇锛岃€屽寘鏄粰 TARGET 鐨勶級锛屾墍浠ユ寔涔呯粓绔笉鍙敤銆侱SH 璁捐涓婂蹇嶃€?- **`sharp` 娌℃湁 android 鍙樹綋**锛氬浘鐗囧鐞嗗彲鑳戒笉鍙敤銆?- **鏋勫缓浜х墿涓嶈繘 git**锛歚dsh/module/{app,usr}/` 鐢变笂闈袱鏉″懡浠ら噸寤恒€?
-## 瑁佸壀
+- **首次安装较慢**：14,228 个文件要解压。安装脚本**故意不对 `app/` 做 `set_perm_recursive`**（那是逐个 shell 调用，会慢到不可接受），改用一条 `chmod -R 0755`。
+- **`node-pty` 没有原生模块**：安装脚本被跳过（它在 HOST 上跑，而包是给 TARGET 的），所以持久终端不可用。DSH 设计上容忍。
+- **`sharp` 没有 android 变体**：图片处理可能不可用。
+- **构建产物不进 git**：`dsh/module/{app,usr}/` 由上面两条命令重建。
 
-`app/` 宸茬粡瑁佽繃涓€杞細**224.6 MiB / 25,715 鏂囦欢 鈫?111.8 MiB / 12,008 鏂囦欢**銆?
-瑁佹帀鐨勬槸杩愯鏈熺敤涓嶅埌鐨勪笢瑗匡細source map 44 MiB銆乣.d.ts` 绫诲瀷澹版槑 33 MiB銆乄indows 璋冭瘯绗﹀彿 20 MiB銆丮arkdown 涓庢祴璇曠洰褰?16 MiB銆?
+## 裁剪
+
+`app/` 已经裁过一轮：**224.6 MiB / 25,715 文件 → 111.8 MiB / 12,008 文件**。
+
+裁掉的是运行期用不到的东西：source map 44 MiB、`.d.ts` 类型声明 33 MiB、Windows 调试符号 20 MiB、Markdown 与测试目录 16 MiB。
+
 ```sh
-node dsh/tools/build-dsh-tree.mjs --skip-install --prune --dry-run   # 鍏堢湅浼氬垹浠€涔?node dsh/tools/build-dsh-tree.mjs --skip-install --prune             # 鐪熷垹
+node dsh/tools/build-dsh-tree.mjs --skip-install --prune --dry-run   # 先看会删什么
+node dsh/tools/build-dsh-tree.mjs --skip-install --prune             # 真删
 ```
 
-鎸?*寮曠敤鎵弿**鍒ゆ柇锛屼笉鏄寜鐩綍鍚嶇寽銆傝繖娆″畠鎷︿綇浜嗕竴涓湡浼氬潖浜嬬殑鍒犻櫎锛歚yaml/dist/doc/` 鍚嶅瓧鍍忔枃妗ｏ紝瀹為檯鏄?`Document.js` 杩欎簺**杩愯鏃朵唬鐮?*銆傚悓绫绘暀璁繕鏈?koffi 鐨?`src/`銆?
-## 浣撶Н
+按**引用扫描**判断，不是按目录名猜。这次它拦住了一个真会坏事的删除：`yaml/dist/doc/` 名字像文档，实际是 `Document.js` 这些**运行时代码**。同类教训还有 koffi 的 `src/`。
+
+## 体积
 
 ```
-usr/   183.9 MiB /  2,216 鏂囦欢     杩愯鏃?(node 47.4 + pnpm 46.8 + libicudata 33.1 + ...)
-app/   111.8 MiB / 12,008 鏂囦欢     DSH 搴旂敤鏍?(宸茶鍓?
-                               鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-       295.7 MiB / 14,228 鏂囦欢
-zip    113.3 MiB                   (Node 鎵撳寘鍣? 18.7 绉?
+usr/   183.9 MiB /  2,216 文件     运行时 (node 47.4 + pnpm 46.8 + libicudata 33.1 + ...)
+app/   111.8 MiB / 12,008 文件     DSH 应用树 (已裁剪)
+                               ─────────────
+       295.7 MiB / 14,228 文件
+zip    113.3 MiB                   (Node 打包器, 18.7 秒)
 ```
 
-**`pnpm` 涓€涓枃浠跺氨 46.8 MiB** 鈥斺€?瀹冩槸闈欐€侀摼鎺ョ殑 Rust 浜岃繘鍒讹紝鑰屼笖**宸茬粡 strip 杩?*锛坄.debug_*` 涓?`.symtab` 閮芥槸 0锛宍.text` 鍗?36 MiB锛夛紝娌″緱鍘嬨€傛兂鍐嶇槮韬彧鏈変袱鏉¤矾锛岄兘瑕佸厛鍦ㄧ湡鏈轰笂楠岃瘉鎻掍欢鑳借涓婏細鎹㈡垚 npm 涓婄殑 pnpm JS 鍖咃紙鐪佺害 33 MiB锛屾湭楠岃瘉鑳藉惁鍦?bionic 涓婅窇锛夈€佹垨涓嶈 `git`锛堢渷绾?17 MiB锛屼唬浠锋槸 `dsh plugin add github:...` 涓嶅彲鐢級銆?
-## 宸插疄娴?
-鍦ㄦ祴璇曟満锛圧EDMI K90 Pro Max 路 HyperOS 3 / Android 16 路 KernelSU锛変笂锛?
+**`pnpm` 一个文件就 46.8 MiB** —— 它是静态链接的 Rust 二进制，而且**已经 strip 过**（`.debug_*` 与 `.symtab` 都是 0，`.text` 占 36 MiB），没得压。想再瘦身只有两条路，都要先在真机上验证插件能装上：换成 npm 上的 pnpm JS 包（省约 33 MiB，未验证能否在 bionic 上跑）、或不要 `git`（省约 17 MiB，代价是 `dsh plugin add github:...` 不可用）。
+
+## 已实测
+
+在测试机（REDMI K90 Pro Max · HyperOS 3 / Android 16 · KernelSU）上：
+
 ```
-妯″潡鐩綍 exec: OK   (u:r:ksu:s0 + SELinux enforcing)
+模块目录 exec: OK   (u:r:ksu:s0 + SELinux enforcing)
 Node 26.4.0 / ABI 147 / platform=android / arch=arm64
-spawn / TLS / 绯荤粺 CA 搴? 鍏ㄨ繃
-shim 瀹炴祴閫氳繃: shim-ok object function
-dsh web 宸叉媺璧? 鐩戝惉 127.0.0.1:3080, Web GUI 鍙甯歌闂?```
+spawn / TLS / 系统 CA 库  全过
+shim 实测通过: shim-ok object function
+dsh web 已拉起, 监听 127.0.0.1:3080, Web GUI 可正常访问
+```
 
-**涓や釜 shim 閮藉湪鐪熸満涓婇獙杩?*锛堢敤鎵嬫満鑷繁鐨?Node 璺戠湡瀹?import锛屼笉鏄湪 PC 涓婃帹鏂級锛?
+**两个 shim 都在真机上验过**（用手机自己的 Node 跑真实 import，不是在 PC 上推断）：
+
 ```
 $ node --input-type=module -e 'import {tryLockExclusive,FLOCK_IMPLEMENTATION} from "@deepseek-ai/node-addon-system/flock"; ...'
 flock-ok js-shim-single-process
 ```
 
-**閰嶇疆 API 鍚庡璇濊兘姝ｅ父璺戝畬** 鈥斺€?2026-09-26 鐪熸満纭锛屼慨鎺変簡涔嬪墠閭ｅ彞
-`鏈疆杩愯澶辫触: flock is not supported on android-arm64`銆?
-### 楠岃瘉鏃惰俯鐨勫潙涓€锛歚adb shell su` 涓嶄竴瀹氬瓨鍦?
-杩欏彴璁惧涓?`su` 涓嶅湪 `adb shell` 鐨?PATH 閲岋紙KernelSU 榛樿涓嶅線 PATH 鏀?`su`锛夛細
+**配置 API 后对话能正常跑完** —— 2026-09-26 真机确认，修掉了之前那句
+`本轮运行失败: flock is not supported on android-arm64`。
+
+### 验证时踩的坑一：`adb shell su` 不一定存在
+
+这台设备上 `su` 不在 `adb shell` 的 PATH 里（KernelSU 默认不往 PATH 放 `su`）：
 
 ```
 $ adb shell 'su -c id'
 /system/bin/sh: su: inaccessible or not found
 ```
 
-**瑕佸湪 KernelSU 绠＄悊鍣ㄩ噷缁?`com.android.shell`锛坲id 2000锛夋巿鏉?root锛宍adb shell su` 鎵嶈兘鐢ㄣ€?* 鍦ㄩ偅涔嬪墠鎵€鏈?`adb shell "su -c '...'"` 褰㈠紡鐨勫懡浠ら兘浼氬け璐?鈥斺€?鑰屽け璐ヤ俊鎭槸 "not found"锛屽緢瀹规槗琚璇绘垚"娌?root"銆?
-### 楠岃瘉鏃惰俯鐨勫潙浜岋細鍒嬁绔彛鍙风寽鏈嶅姟
+**要在 KernelSU 管理器里给 `com.android.shell`（uid 2000）授权 root，`adb shell su` 才能用。** 在那之前所有 `adb shell "su -c '...'"` 形式的命令都会失败 —— 而失败信息是 "not found"，很容易被误读成"没 root"。
 
-PC 鐨?`127.0.0.1:3080` 鏄?*鐢佃剳绔嚜宸辩殑 DSH**銆傛墜鏈虹瑕佸彟寮€涓€涓浆鍙戠鍙ｏ紙鏈」鐩敤 `13080`锛夛細
+### 验证时踩的坑二：别拿端口号猜服务
+
+PC 的 `127.0.0.1:3080` 是**电脑端自己的 DSH**。手机端要另开一个转发端口（本项目用 `13080`）：
 
 ```powershell
 adb forward tcp=13080 tcp=3080
-adb forward --list          # 鈫?鍏堢湅鏄犲皠琛? 鍒嬁杩斿洖鍊肩寽鏄皝
+adb forward --list          # ← 先看映射表, 别拿返回值猜是谁
 ```
 
-涓嶅甫 token 璁块棶浼氬緱鍒?**401**锛圖SH 鐨?token 閴存潈锛夆€斺€?閭ｆ槸**杞彂閫氫簡**鐨勮瘉鎹紝涓嶆槸閿欒銆倀oken 姣忔閲嶅惎 DSH 閮戒細鍙橈紝鍙?`dshctl log` 閲屾渶鏂伴偅鏉°€?
-### 楠岃瘉鏃惰俯鐨勫潙涓夛細Windows 涓婂甫鍐掑彿鐨?deb 鏂囦欢鍚?
-瑙?`probe/tools/fetch-runtime.mjs` 閲?`safeCacheName()` 鐨勬敞閲娿€侱ebian 鐨?epoch 鐗堟湰鍙峰舰濡?`1:3.6.3`锛屼細鍘熸牱鍑虹幇鍦ㄧ储寮曠殑 `Filename` 閲岋紝鑰?Windows 鎶?`:` 褰?NTFS 澶囩敤鏁版嵁娴佸垎闅旂 鈥斺€?浜庢槸 `openssl` 涓?`ca-certificates` 琚潤榛樿烦杩囷紝**TLS 褰诲簳鍧忔帀涓旀病鏈変换浣曟姤閿?*銆?
-## 涓?`probe/` 鐨勫叧绯?
-`probe/` 鏄?*鍦板熀楠岃瘉妯″潡**锛屽畠鍥炵瓟浜?KernelSU 妯″潡閲岃兘涓嶈兘璺?bionic Node"杩欎釜闂锛?
+不带 token 访问会得到 **401**（DSH 的 token 鉴权）—— 那是**转发通了**的证据，不是错误。token 每次重启 DSH 都会变，取 `dshctl log` 里最新那条。
+
+### 验证时踩的坑三：Windows 上带冒号的 deb 文件名
+
+见 `probe/tools/fetch-runtime.mjs` 里 `safeCacheName()` 的注释。Debian 的 epoch 版本号形如 `1:3.6.3`，会原样出现在索引的 `Filename` 里，而 Windows 把 `:` 当 NTFS 备用数据流分隔符 —— 于是 `openssl` 与 `ca-certificates` 被静默跳过，**TLS 彻底坏掉且没有任何报错**。
+
+## 与 `probe/` 的关系
+
+`probe/` 是**地基验证模块**，它回答了"KernelSU 模块里能不能跑 bionic Node"这个问题：
+
 ```
-妯″潡鐩綍 exec: OK (u:r:ksu:s0 + enforcing)
+模块目录 exec: OK (u:r:ksu:s0 + enforcing)
 Node 26.4.0 / ABI 147 / platform=android / arch=arm64
-spawn / TLS / CA 鍏ㄨ繃
+spawn / TLS / CA 全过
 ```
 
-缁撹閫氳繃鍚庢墠鏈夎繖涓寮忔ā鍧椼€俙probe/` 淇濈暀鐫€锛屼互鍚庢帓鏌ュ钩鍙伴棶棰樿繕鑳界敤銆?
-骞冲彴浜嬪疄銆佸钩鍙拌涓轰笌鍧戞竻鍗曘€佸畨鍏ㄨ璁¤緭鍏ャ€侀闄╃櫥璁板唽鐨勫畬鏁磋褰曡 [`../docs/android-agent-harness-plan.md`](../docs/android-agent-harness-plan.md)銆?
+结论通过后才有这个正式模块。`probe/` 保留着，以后排查平台问题还能用。
+
+平台事实、平台行为与坑清单、安全设计输入、风险登记册的完整记录见 [`../docs/android-agent-harness-plan.md`](../docs/android-agent-harness-plan.md)。
