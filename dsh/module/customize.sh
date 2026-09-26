@@ -27,16 +27,20 @@ ui_print "- 工作区:   $WS"
 ui_print " "
 
 # ─────────────────────────────────────────────────────────────
-# 1. 运行时
+# 1. 运行时 (只查存在性, 不查执行位)
+#
+# 用 -f 而不是 -x: KernelSU/Magisk 解压模块时不保留 zip 里的 Unix 权限位,
+# 所以此刻 usr/bin/node 还没有执行位, 用 -x 会误判成"缺失".
+# 权限在第 5 步统一设置, 必须早于任何执行尝试.
 # ─────────────────────────────────────────────────────────────
-if [ ! -x "$PREFIX/bin/node" ]; then
+if [ ! -f "$PREFIX/bin/node" ]; then
 	ui_print "! 找不到 $PREFIX/bin/node"
 	ui_print "! 先跑: node probe/tools/fetch-runtime.mjs --out dsh/module"
 	abort "! 运行时缺失"
 fi
 ui_print "--- 运行时 ---"
 for b in node bash rg; do
-	if [ -x "$PREFIX/bin/$b" ]; then
+	if [ -f "$PREFIX/bin/$b" ]; then
 		ui_print "  [ OK ] usr/bin/$b"
 	else
 		ui_print "  [WARN] usr/bin/$b 缺失"
@@ -106,7 +110,37 @@ mkdir -p "$WS" 2>/dev/null && ui_print "  [ OK ] $WS"
 mkdir -p "$DSH_HOME_DIR/logs" 2>/dev/null
 
 # ─────────────────────────────────────────────────────────────
-# 5. 冒烟测试
+# 5. 权限
+#
+# 必须早于任何执行尝试. KernelSU/Magisk 解压模块时不保留 zip 里的 Unix 权限位,
+# 所以此刻 usr/bin/node 还没有执行位 —— 先设权限, 再跑冒烟测试.
+#
+# 注意: 绝对不要对 $MODPATH 做 set_perm_recursive —— app/ 有两万五千多个文件,
+# 而 set_perm 是逐个 shell 调用, 会慢到不可接受.
+# ─────────────────────────────────────────────────────────────
+ui_print " "
+ui_print "--- 权限 ---"
+# usr/ 只有一百多个文件, 递归没问题
+set_perm_recursive "$PREFIX" 0 0 0755 0755
+# app/ 两万多个文件, 用一条 chmod -R 解决 (只起一个进程).
+# 这里直接给 0755 而不是 a+rX: 解压出来的权限位不可靠, 而 X 依赖"本来就有执行位".
+# 给 JS 文件多一个执行位无害 —— 模块目录本来就只有 root 能进.
+chmod -R 0755 "$MODPATH/app" 2>/dev/null
+set_perm "$MODPATH/bin/dshctl" 0 0 0755 2>/dev/null
+set_perm "$MODPATH/service.sh" 0 0 0755 2>/dev/null
+set_perm "$MODPATH/module.prop" 0 0 0644 2>/dev/null
+ui_print "  usr/ 递归设置; app/ 用 chmod -R 一次搞定"
+
+# 复核一次. 如果 node 仍不可执行, 后面必然失败, 不如在这里就说清楚.
+if [ -x "$PREFIX/bin/node" ]; then
+	ui_print "  [ OK ] usr/bin/node 现在可执行"
+else
+	ui_print "  [FAIL] usr/bin/node 仍不可执行 —— 权限设置没生效"
+	abort "! 权限设置失败"
+fi
+
+# ─────────────────────────────────────────────────────────────
+# 6. 冒烟测试
 #
 # 一次测三件事: Node 能跑, --expose-internals 生效, shim 能把 internal 模块取出来.
 # 这三件是 dsh-app-boot 启动路径的前提.
@@ -138,23 +172,6 @@ case "$SMOKE" in
 	shim-ok*object*function*) ui_print "  [ OK ] 启动路径前提全部满足" ;;
 	*) ui_print "  [FAIL] 见上面输出" ;;
 esac
-
-# ─────────────────────────────────────────────────────────────
-# 6. 权限
-# ─────────────────────────────────────────────────────────────
-ui_print " "
-ui_print "--- 权限 ---"
-# 注意: 绝对不要对 $MODPATH 做 set_perm_recursive —— app/ 有两万五千多个文件,
-# 而 set_perm 是逐个 shell 调用, 会慢到不可接受.
-# usr/ 只有一百多个文件, 递归没问题.
-set_perm_recursive "$PREFIX" 0 0 0755 0755
-# app/ 用一条 chmod -R 解决: 大写 X 表示"目录、或本来就有执行位的文件"才加执行位,
-# 正好是这里要的语义, 而且只起一个进程.
-chmod -R a+rX "$MODPATH/app" 2>/dev/null
-ui_print "  usr/ 递归设置; app/ 用 chmod -R a+rX 一次搞定"
-set_perm "$MODPATH/bin/dshctl" 0 0 0755 2>/dev/null
-set_perm "$MODPATH/service.sh" 0 0 0755 2>/dev/null
-set_perm "$MODPATH/module.prop" 0 0 0644 2>/dev/null
 
 ui_print " "
 ui_print "*********************************************"

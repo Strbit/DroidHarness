@@ -64,9 +64,15 @@ if [ ! -f "$BIN" ]; then
 	echo "[$(date)] 找不到 DSH 入口: $BIN" >>"$LOG"
 	exit 1
 fi
-if [ ! -x "$PREFIX/bin/node" ]; then
+if [ ! -f "$PREFIX/bin/node" ]; then
 	echo "[$(date)] 找不到运行时: $PREFIX/bin/node" >>"$LOG"
 	exit 1
+fi
+if [ ! -x "$PREFIX/bin/node" ]; then
+	# customize.sh 会设权限, 正常不会走到这里. 走到这里说明权限丢了,
+	# 与其在后面报一个看不懂的错, 不如现在就修 + 记一笔.
+	echo "[$(date)] usr/bin/node 没有执行位, 尝试补上" >>"$LOG"
+	chmod 0755 "$PREFIX/bin/node" 2>/dev/null
 fi
 
 # ── 监督进程 ────────────────────────────────────────────────

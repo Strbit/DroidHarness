@@ -165,6 +165,11 @@ HyperOS 的「应用双开」= **另一个 Android user**（`user 999`，名字 
 ### 5.1 运行时与二进制
 
 - **W^X**：`targetSdk >= 29` 的 app 不能 exec 自己 data 目录里的文件。APK 路线要把二进制改名成 `lib*.so` 放 `jniLibs/` + `useLegacyPackaging = true`，靠 `nativeLibraryDir` 拿 exec 权限。**模块路线不需要。**
+- **KernelSU/Magisk 解压模块时不保留 zip 里的 Unix 权限位。** 两条推论必须同时记住：
+  1. 检查二进制"在不在"要用 `-f`，**不要用 `-x`** —— 此刻它还没有执行位；
+  2. `set_perm` / `chmod` 必须**早于任何执行尝试**。
+
+  这两条一起踩会得到一个**特别隐蔽**的故障：安装脚本在设权限之前就跑二进制做测试 → 测试全部失败 → 但脚本末尾又设了一次权限 → 重启后一切正常。于是你手上只有一份误导的安装日志，会去怀疑 SELinux、怀疑 exec 被拒，而真实原因只是权限位还没设。**安装脚本里凡是"先测试、后设权限"的顺序都是错的。**
 - **AGP 静默丢带点的 `.so` 名**（`libz.so.1` / `libcrypto.so.3` / `libicu*.so.78`）。必须 `patchelf --set-soname` + `--replace-needed` 归一，且 `--set-rpath '$ORIGIN'` 要打在**每一个**对象上（bionic 查的是**加载方自己**的 runpath）。
 - **16 KB 页对齐**：搬运现成 ELF 时不用管，`p_align` 已经是 `0x4000`。
 - **Termux 编出来的二进制有一批写死的 Termux 路径**（`/data/data/com.termux/files/usr/...`）。以下三个环境变量**少一个都起不来**：
