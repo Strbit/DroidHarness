@@ -102,6 +102,18 @@ else
 	ui_print "         检查 dsh/tools/build-dsh-tree.mjs 是否跑过"
 fi
 
+# ripgrep 垫片 (B2)。@vscode/ripgrep 按 platform-arch 找平台包, 而 npm 上没有
+# android-arm64 的 —— 没有这个垫片, agent 的 grep / glob 两个核心工具全部不可用,
+# 而且服务本身健康、日志干净, 只有调用时才报一句语义模糊的
+# "ripgrep launch failed"。
+RG_STUB="$APP/node_modules/@vscode/ripgrep-android-arm64"
+if [ -f "$RG_STUB/package.json" ] && [ -f "$RG_STUB/bin/rg" ] && [ -f "$RG_STUB/libexec/rg.real" ]; then
+	ui_print "  [ OK ] ripgrep 垫片在位 (grep / glob 可用)"
+else
+	ui_print "  [FAIL] 缺 @vscode/ripgrep-android-arm64 垫片 —— agent 的 grep / glob 会不可用"
+	ui_print "         检查 dsh/tools/build-dsh-tree.mjs 是否跑过"
+fi
+
 # ─────────────────────────────────────────────────────────────
 # 4. 目录
 # ─────────────────────────────────────────────────────────────
@@ -110,6 +122,26 @@ ui_print "--- 目录 ---"
 mkdir -p "$DSH_HOME_DIR" 2>/dev/null && ui_print "  [ OK ] $DSH_HOME_DIR"
 mkdir -p "$WS" 2>/dev/null && ui_print "  [ OK ] $WS"
 mkdir -p "$DSH_HOME_DIR/logs" 2>/dev/null
+
+# ── 数据目录权限: 这里放的是凭据, 不是公开数据 ────────────────
+#
+#   /data/adb/dsh/profiles/     会话 / 账号凭据
+#   /data/adb/dsh/logs/dsh.log  含启动 token (明文)
+#
+# 旧版本建出来是 0777 / 0666 —— 也就是**任何 app 都能读**。日志里那个 token
+# 等同于一次性登录凭据: 读到它就能拿到一个能跑 shell 的 agent 的入口。
+#
+# 这里**故意不用 umask**: 本脚本是被 installer.sh **source** 的 (见下面第 6 节的
+# 警告), umask 会留在安装器自己的 shell 里, 影响它后续的 unzip / find / set_perm。
+# 显式 chmod 没有这个副作用。
+#
+# 运行期新文件的权限由 bin/env.sh 里的 umask 077 保证 (DSH 会自己新建 profiles/)。
+chmod 0700 "$DSH_HOME_DIR" "$DSH_HOME_DIR/logs" "$WS" 2>/dev/null
+[ -d "$DSH_HOME_DIR/tmp" ] && chmod 0700 "$DSH_HOME_DIR/tmp" 2>/dev/null
+[ -d "$DSH_HOME_DIR/profiles" ] && chmod 0700 "$DSH_HOME_DIR/profiles" 2>/dev/null
+# 日志可能已经存在 (从旧版本升上来的), 一并收紧
+[ -f "$DSH_HOME_DIR/logs/dsh.log" ] && chmod 0600 "$DSH_HOME_DIR/logs/dsh.log" 2>/dev/null
+ui_print "  数据目录 0700; 日志 0600 (旧版本是 0777 / 0666)"
 
 # ─────────────────────────────────────────────────────────────
 # 5. 权限
@@ -128,10 +160,14 @@ set_perm_recursive "$PREFIX" 0 0 0755 0755
 # 这里直接给 0755 而不是 a+rX: 解压出来的权限位不可靠, 而 X 依赖"本来就有执行位".
 # 给 JS 文件多一个执行位无害 —— 模块目录本来就只有 root 能进.
 chmod -R 0755 "$MODPATH/app" 2>/dev/null
-set_perm "$MODPATH/bin/dshctl" 0 0 0755 2>/dev/null
+# bin/ 只有三个文件 (dsh / dshctl / env.sh), 递归一次比三条 set_perm 快也清楚。
+#   dsh      —— 文档里 `dsh plugin --profile web add <pkg>` 用的入口 (B1 修复)
+#   dshctl   —— 启停控制
+#   env.sh   —— 两者共用的环境变量 (只被 source, 但给执行位无害)
+set_perm_recursive "$MODPATH/bin" 0 0 0755 0755
 set_perm "$MODPATH/service.sh" 0 0 0755 2>/dev/null
 set_perm "$MODPATH/module.prop" 0 0 0644 2>/dev/null
-ui_print "  usr/ 递归设置; app/ 用 chmod -R 一次搞定"
+ui_print "  usr/ 递归设置; app/ 用 chmod -R 一次搞定; bin/ 三个入口"
 
 # 复核一次. 如果 node 仍不可执行, 后面必然失败, 不如在这里就说清楚.
 if [ -x "$PREFIX/bin/node" ]; then
@@ -204,6 +240,7 @@ ui_print "*********************************************"
 ui_print " 安装完成. 重启后 service.sh 会拉起 DSH."
 ui_print " 日志: $DSH_HOME_DIR/logs/dsh.log"
 ui_print " 控制: dshctl start|stop|status|log"
+ui_print " 命令行: dsh plugin --profile web list   (dsh 已在 PATH 上)"
 ui_print " 访问: PC 上 adb forward tcp:3080 tcp:3080"
 ui_print "       然后浏览器开 http://127.0.0.1:3080"
 ui_print "*********************************************"

@@ -868,6 +868,7 @@ async function main() {
 		log('重写脚本 shebang:');
 		rewriteShebangs(OUT);
 		wrapPnpm(OUT);
+		wrapSystemBinaries(OUT);
 		const nLinksOffline = writeSymlinkManifest(OUT);
 		if (nLinksOffline > 0) log(`符号链接清单: ${nLinksOffline} 条 -> usr/${MANIFEST_NAME}`);
 		verify(OUT);
@@ -951,6 +952,7 @@ async function main() {
 	log('重写脚本 shebang:');
 	rewriteShebangs(OUT);
 	wrapPnpm(OUT);
+	wrapSystemBinaries(OUT);
 	const nLinks = writeSymlinkManifest(OUT);
 	if (nLinks > 0) log(`符号链接清单: ${nLinks} 条 -> usr/${MANIFEST_NAME} (手机上由 customize.sh 重建)`);
 	verify(OUT);
@@ -1226,6 +1228,113 @@ function wrapPnpm(out) {
 	fs.writeFileSync(pnpm, wrapper, { mode: 0o755 });
 	log('  ✓ usr/bin/pnpm 已包启动器 (只改 HOME), 原 ELF 改名 pnpm-bin');
 	return 1;
+}
+
+/**
+ * 给「会被模块自身 LD_LIBRARY_PATH 搞坏的系统二进制」包一层壳。
+ *
+ * 为什么
+ * ------
+ * `service.sh` 全局 `export LD_LIBRARY_PATH="$PREFIX/lib"`, 模块的 node / rg / git
+ * 都靠它找到自己那份 libc++ / libpcre2 / OpenSSL 3。但这个变量会被**所有子进程继承**,
+ * 包括 agent 的 bash 工具和系统二进制。
+ *
+ * 而 Android 的 `/system/bin/curl` 链接的是 conscrypt 提供的 OpenSSL 1.x 兼容实现
+ * (`EVP_MD_CTX_create` 那套)。`$PREFIX/lib` 里的 OpenSSL 3 把它遮蔽之后, 报的是
+ * **linker 层 fatal**, 连 `--version` 都跑不出来:
+ *
+ *     CANNOT LINK EXECUTABLE "/system/bin/curl": cannot locate symbol
+ *     "EVP_MD_CTX_create" referenced by "/system/bin/curl"
+ *
+ * 注意报错里写的是 `/system/bin/curl` 而不是模块里的路径 —— 排查时极易看错,
+ * 以为"模块自带的 curl 坏了"(实际上模块**根本没有** usr/bin/curl, 只有 wcurl 脚本)。
+ *
+ * 做法
+ * ----
+ * 在 `usr/bin/` 放一个同名壳。因为 `service.sh` 把 `$PREFIX/bin` 排在 `/system/bin`
+ * 前面, shell 解析 `curl` 会先命中它; 壳里清掉变量再 exec 真正的系统 curl。
+ *
+ * 系统 curl 不需要模块里的任何库, 所以清掉是安全的。
+ *
+ * 还有哪些二进制受影响?
+ * ---------------------
+ * 只发现 curl 一个。要复查可以用 (在设备上):
+ *
+ *     PREFIX=/data/adb/modules/dsh_android/usr
+ *     for b in /system/bin/*; do
+ *         [ -x "$b" ] || continue
+ *         LD_LIBRARY_PATH=$PREFIX/lib "$b" --version >/dev/null 2>&1
+ *         case $? in 1) ;; *) ;; esac
+ *     done
+ *
+ * —— 但直接跑任意系统二进制有风险, 更稳的做法是只挑链了 libcrypto/libssl 的:
+ *
+ *     grep -l libcrypto /system/bin/* 2>/dev/null
+ *
+ * 名单是**显式列表**, 不做自动探测: 构建期猜错会静默生成一堆没用的壳。
+ *
+ * @returns {number} 实际创建/更新的壳数量
+ */
+function wrapSystemBinaries(out) {
+	const prefix = path.join(out, 'usr');
+	const binDir = path.join(prefix, 'bin');
+	if (!fs.existsSync(binDir)) {
+		log('  · 没有 usr/bin, 跳过系统二进制壳');
+		return 0;
+	}
+
+	// 每条: [壳名, 真实二进制, 为什么坏]
+	const SHIMMED = [
+		[
+			'curl',
+			'/system/bin/curl',
+			[
+				'系统 curl 链接 conscrypt 的 OpenSSL 1.x 兼容实现, 而 $PREFIX/lib 里的',
+				'OpenSSL 3 会遮蔽它, 导致 linker 直接失败:',
+				'  CANNOT LINK EXECUTABLE "/system/bin/curl": cannot locate symbol',
+				'  "EVP_MD_CTX_create" referenced by "/system/bin/curl"',
+			],
+		],
+	];
+
+	let n = 0;
+	for (const [name, realBin, why] of SHIMMED) {
+		const shell = path.join(binDir, name);
+
+		// 幂等: 已经是个壳 (含我们的标记) 就跳过
+		if (fs.existsSync(shell)) {
+			const head = fs.readFileSync(shell, 'utf8').slice(0, 400);
+			if (head.includes('DSH-ANDROID-WRAPPER')) {
+				log(`  · usr/bin/${name} 已经是壳, 跳过`);
+				continue;
+			}
+			// 不是壳又不是我们认识的 ELF —— 说明包布局变了, 别覆盖
+			const buf = fs.readFileSync(shell).subarray(0, 4);
+			const isElf = buf[0] === 0x7f && buf[1] === 0x45 && buf[2] === 0x4c && buf[3] === 0x46;
+			warn(`  ! usr/bin/${name} 已存在且不是我们的壳${isElf ? ' (是 ELF)' : ''}, 拒绝覆盖`);
+			continue;
+		}
+
+		const lines = [
+			'#!/system/bin/sh',
+			`# DSH-ANDROID-WRAPPER: ${name} — 清掉 LD_LIBRARY_PATH 再 exec ${realBin}`,
+			'#',
+			...why.map((w) => `# ${w}`),
+			'#',
+			'# 系统 curl 不需要模块里的任何库, 所以清掉变量是安全的.',
+			'#',
+			'# 注意: PATH 里 $PREFIX/bin 排在 /system/bin 前面 (见 service.sh),',
+			'# 所以 shell 解析 `curl` 会先命中本文件.',
+			'unset LD_LIBRARY_PATH',
+			'unset LD_PRELOAD',
+			`exec ${realBin} "$@"`,
+			'',
+		];
+		fs.writeFileSync(shell, lines.join('\n'), { mode: 0o755 });
+		log(`  ✓ usr/bin/${name} 已包壳 -> ${realBin}`);
+		n++;
+	}
+	return n;
 }
 
 function verify(out) {

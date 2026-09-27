@@ -240,7 +240,23 @@ for (let i = 0; i < files.length; i++) {
 			// Unix 模式位: usr/ 下的东西和 .sh 给 0755, 其余 0644。
 			// (KernelSU/Magisk 解压时并不保留 zip 里的模式位 —— customize.sh 会 chmod。
 			//  写进去只是为了别的解压工具看到合理值。)
-			const isExec = file.rel.startsWith('usr/') || file.rel.endsWith('.sh');
+			//
+			// 但有两条**必须**自己就是可执行的例外 —— 它们不满足上面那两条规则,
+			// 却真的会被 exec / spawn:
+			//
+			//   bin/                             模块的命令行入口 (dsh / dshctl)
+			//                                    —— 没有 .sh 后缀
+			//   app/.../ripgrep-android-arm64/   rg 垫片: bin/rg 是 wrapper,
+			//                                    libexec/rg.real 是被 exec 的二进制
+			//
+			// 这两处不可执行的后果不是"权限不整洁", 而是 DSH 的 grep / glob
+			// 在 spawn 时直接 EACCES —— 而报错会伪装成 "ripgrep launch failed"。
+			// 虽然 customize.sh 会兜底 chmod, 但不该把正确性押在安装器上。
+			const isExec =
+				file.rel.startsWith('usr/') ||
+				file.rel.endsWith('.sh') ||
+				file.rel.startsWith('bin/') ||
+				file.rel.startsWith('app/node_modules/@vscode/ripgrep-android-arm64/');
 			const mode = isExec ? 0o100755 : 0o100644;
 			const nameBuf = Buffer.from(file.rel, 'utf8');
 
