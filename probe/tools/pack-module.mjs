@@ -35,6 +35,7 @@
  */
 
 import fs from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import zlib from 'node:zlib';
 
@@ -189,22 +190,49 @@ let pending = [];
 const totalBytes = files.reduce((n, f) => n + fs.statSync(f.full).size, 0);
 let readBytes = 0;
 
+// 分阶段计时。打包耗时实测在 19~130 秒之间波动过 7 倍, 需要知道时间花在哪。
+const T = { stat: 0, read: 0, await: 0, crc: 0, write: 0 };
+const nowMs = () => Number(process.hrtime.bigint()) / 1e6;
+
+/**
+ * 读 + 压缩串成**一条流水线**, 由 libuv 线程池并发执行。
+ *
+ * 为什么不用 `readFileSync`: 那会在**主线程**同步阻塞。
+ * 实测 295 MiB / 14,207 次 open 要 8.6 秒 —— 而且这个数字**极不稳定**:
+ * 单次 open 只要从 0.3ms 变成 7ms (杀软按访问扫描、或缓存失效),
+ * 14,207 次就是 **100 秒**, 正好对上实测到的 118/128 秒那两次。
+ *
+ * 改成异步之后, 读和 deflate 都在线程池里排队, 主线程只做协调 ——
+ * 读变慢时它会和压缩重叠, 而不是把整条流水线堵死。
+ */
 for (let i = 0; i < files.length; i++) {
 	const f = files[i];
+	let _t = nowMs();
 	const st = fs.statSync(f.full);
-	const raw = fs.readFileSync(f.full);
-	readBytes += raw.length;
+	T.stat += nowMs() - _t;
 
 	pending.push(
-		compressOne(raw, LEVEL).then(({ data, method }) => ({ f, st, raw, data, method }))
+		(async () => {
+			const _tr = nowMs();
+			const raw = await readFile(f.full);
+			const dt = nowMs() - _tr;
+			T.read += dt; // 注意: 这是并发读的**累计**墙钟, 会大于总耗时, 只用来对比不同运行
+			readBytes += raw.length;
+			const { data, method } = await compressOne(raw, LEVEL);
+			return { f, st, raw, data, method };
+		})()
 	);
 
 	// 维持并发窗口
 	if (pending.length >= CONCURRENCY || i === files.length - 1) {
+		const _ta = nowMs();
 		const results = await Promise.all(pending);
+		T.await += nowMs() - _ta;
 		pending = [];
 		for (const { f: file, st: stat, raw: rawBuf, data, method } of results) {
+			const _tc = nowMs();
 			const crc = crc32(rawBuf);
+			T.crc += nowMs() - _tc;
 			const { time, date } = dosDateTime(stat.mtime);
 			// Unix 模式位: usr/ 下的东西和 .sh 给 0755, 其余 0644。
 			// (KernelSU/Magisk 解压时并不保留 zip 里的模式位 —— customize.sh 会 chmod。
@@ -228,9 +256,11 @@ for (let i = 0; i < files.length; i++) {
 			lfh.writeUInt16LE(0, 28); // extra len
 
 			const localOffset = offset;
+			const _tw = nowMs();
 			write(lfh);
 			write(nameBuf);
 			write(data);
+			T.write += nowMs() - _tw;
 
 			central.push({ nameBuf, crc, csize: data.length, usize: rawBuf.length, method, time, date, mode, localOffset });
 
@@ -292,6 +322,30 @@ log('==========================================================');
 log(`打包完成: ${zipPath}`);
 log(`大小:     ${zipMiB} MiB`);
 log(`耗时:     ${secs} 秒  (${files.length} 条目, 读入 ${(totalBytes / 1048576).toFixed(0)} MiB)`);
+log('');
+// 分阶段拆解 —— 这五项加起来应该接近总耗时, 差额是扫描目录与收尾
+const sumMs = T.stat + T.read + T.await + T.crc + T.write;
+// ⚠️ 读文件与等压缩是**并发**的, 所以它们各自是"累计墙钟", 加起来会**大于**总耗时。
+// 这不是 bug, 正是"它们在重叠执行"的证据 —— 反过来, 若两项之和≈总耗时,
+// 说明读把主线程堵住了 (以前用 readFileSync 就是这样)。
+log('分阶段耗时:');
+log(`  stat()       ${(T.stat / 1000).toFixed(1).padStart(7)} s`);
+log(`  读文件       ${(T.read / 1000).toFixed(1).padStart(7)} s`);
+log(`  等压缩完成   ${(T.await / 1000).toFixed(1).padStart(7)} s   ← 含 deflate + 线程池争用`);
+log(`  CRC32        ${(T.crc / 1000).toFixed(1).padStart(7)} s`);
+log(`  写盘         ${(T.write / 1000).toFixed(1).padStart(7)} s`);
+log(`  ─────────────────────`);
+const overlap = sumMs / 1000 - Number(secs);
+log(`  累计         ${(sumMs / 1000).toFixed(1).padStart(7)} s`);
+log(`  总耗时       ${Number(secs).toFixed(1).padStart(7)} s`);
+log(
+	overlap > 1
+		? `  重叠         ${overlap.toFixed(1).padStart(7)} s   <- 读与压缩并发执行的量 (越大越好)`
+		: `  重叠         ${overlap.toFixed(1).padStart(7)} s   <- 几乎没重叠: 读把主线程堵住了`
+);
+log(`  线程池       ${process.env.UV_THREADPOOL_SIZE ?? '4'} (默认 4; 实测调大到 16 反而更慢)`);
+log('');
+log(`  压缩比: ${(totalBytes / 1048576).toFixed(0)} MiB → ${zipMiB} MiB  (${((zipMiB * 1048576 / totalBytes) * 100).toFixed(0)}%)`);
 log('');
 log('刷入方式:');
 log('  1. 把 zip 传到手机');
