@@ -159,7 +159,10 @@ if (fs.existsSync(zipPath)) fs.rmSync(zipPath, { force: true });
 
 log('');
 log(`正在压缩 (level ${LEVEL}, 异步 deflate 走 libuv 线程池)...`);
-const t0 = Date.now();
+// 用单调时钟, 不用 Date.now() —— 后者是墙钟, 会被系统对时/NTP 调整影响,
+// 而各阶段计时用的是 hrtime。两者混用会给出互相矛盾的数字。
+const t0 = process.hrtime.bigint();
+const msSince = (t) => Number(process.hrtime.bigint() - t) / 1e6;
 
 const fd = fs.openSync(zipPath, 'w');
 const central = []; // 每个条目的中央目录记录
@@ -315,7 +318,7 @@ write(eocd);
 
 fs.closeSync(fd);
 
-const secs = ((Date.now() - t0) / 1000).toFixed(1);
+const secs = (msSince(t0) / 1000).toFixed(1);
 const zipMiB = (fs.statSync(zipPath).size / 1048576).toFixed(1);
 log('');
 log('==========================================================');
