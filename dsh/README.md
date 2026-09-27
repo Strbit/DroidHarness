@@ -106,7 +106,7 @@ adb shell su -c 'dshctl forward'   # 打印 PC 侧该敲的命令
 
 ---
 
-## 三个关键决定（都踩过）
+## 五个关键决定（都踩过）
 
 ### 1. `--ignore-scripts` 是必须的
 
@@ -195,11 +195,109 @@ if (platform !== 'linux' && platform !== 'darwin') throw ...
 
 那时可能出现会话日志撕裂。**真需要跨进程锁的话，正确做法是用 Android NDK 把本包自带的 `src/flock.c` 编成 android-arm64 的 `.node`**（源码是随包发的），而不是继续用替身。
 
+### 4. 脚本的 shebang 写死了 Termux 路径，必须重写
+
+**这条我一开始漏了，而且漏得很隐蔽：我只验证了 ELF 二进制"能跑"，没验证脚本。**
+
+Termux 的包里，**脚本**文件的 shebang 写死了：
+
+```
+#!/data/data/com.termux/files/usr/bin/sh
+```
+
+ELF 二进制不读 shebang，所以它们没事；但脚本的表现是「**文件明明在，却报 No such file or directory**」—— `execve` 找不到解释器。
+
+最阴的一例：`git-submodule` / `git-mergetool` 是 git 自带的 shell 脚本，在 `usr/libexec/git-core/` 下。git 找得到它们、但 execve 失败，于是**谎报**成：
+
+```
+git: 'submodule' is not a git command. See 'git --help'.
+```
+
+**这个错误信息会把排查方向带偏到「git 装得不全」。** 实际影响：`git clone --recurse-submodules`、`git submodule update`、`git mergetool`、`git filter-branch` 全部不可用。而且我加进运行时的 `npm` / `npx` / `wcurl` / `curl-config` **也是加了但不能用** —— 它们的入口 `npm-cli.js` 的 shebang 是 `#!/data/data/com.termux/files/usr/bin/env node`，而 **Android 上没有 `/usr/bin/env`**。
+
+实测共 **70 个**文件，`fetch-runtime.mjs` 的 `rewriteShebangs()` 在构建期重写其中 48 个：
+
+| 原 shebang | 个数 | 重写成 |
+|---|---|---|
+| `#!…/bin/sh` | 32 | `#!/system/bin/sh` |
+| `#!…/bin/env node` | 12 | `#!/data/adb/modules/dsh_android/usr/bin/node` |
+| `#!…/bin/env sh` | 2 | `#!/system/bin/sh` |
+| `#!…/bin/bash` | 2 | `#!/data/adb/modules/dsh_android/usr/bin/bash` |
+| `#!…/bin/env python3` | 14 | **删掉** —— 模块里没有 python |
+| `#!…/bin/perl` | 7 | **删掉** —— 没有 perl |
+| `#!…/bin/python` | 1 | **删掉** |
+
+两个关键细节：
+
+1. **必须写运行时路径 `/data/adb/modules/<id>/usr/...`，不是 `modules_update/...`** —— 安装期间在 `modules_update`，重启后就不在了。`id` 从 `module.prop` 读，不写死。
+2. **只改文本脚本**：先判前两字节是不是 `#!`（ELF 首字节是 `\x7f`，天然排除），而且只换第一行、其余字节原样保留。
+
+**那 22 个没解释器的**（python3 / perl / python）**直接删掉，不是留着改 shebang**：
+
+改了也跑不了（模块里没有那些解释器），而**留着会给出误导性的错误** —— 比如 `git cvsserver` 报的是 `No such file or directory`，看起来像文件缺失，而不是「这个功能不支持」。留着只会浪费排查时间。
+
+**代价（写在这里免得以后忘）**：下面这些功能在模块里彻底不可用 ——
+
+| 功能 | 原因 |
+|---|---|
+| `node-gyp` 编译原生模块 | 需要 python3（本来在 bionic 上也没有工具链） |
+| `git cvsserver` / `cvsexportcommit` / `cvsimport` / `archimport` | 需要 perl |
+| `git send-email` | 需要 perl |
+| `gitweb` | 需要 perl |
+| `git p4` | 需要 python |
+
+**被删的是这 22 个文件本身**，不是整个目录 —— 判断依据仍是「首行的 shebang 指向模块里没有的解释器」，不是目录名。
+
+> 这条是**手机端 agent 实测出来的**，它给出的清单（70 个、按 shebang 分类）和我事后复核的结果完全一致。
+
+---
+
+## 工作区在 `/data/adb/dsh/workspace`，不在 `/sdcard`
+
+**这是必须的，不是偏好。**
+
+Android 的 `/sdcard` 是 **FUSE**，**不实现 `link(2)`**（实测 `ln a b` → `Function not implemented`）。而 DSH 的 `writeFileAtomic` 给「创建新文件」走的正是 `link()`（为了拿 no-replace 语义）：
+
+```js
+// @deepseek-ai/dsh-fs-local
+if (createIfAbsent !== void 0) try {
+    await linkFile(tempPath, absolutePath);      // ← 创建新文件
+} catch (error) {
+    await throwGuardedCreateFailure(error, ...); // ← 上游没有降级
+}
+...
+else await rename(tempPath, absolutePath);       // ← 覆盖已有文件（FUSE 支持）
+```
+
+于是工作区在 `/sdcard` 上时：
+
+```
+ENOSYS: function not implemented, link
+  '.../.foo.md.<pid>.<uuid>.tmpdir/foo.md.tmp' -> '.../foo.md'
+```
+
+**agent 无法新建任何文件，只能改已经存在的。** 而工作区是主路径，所以这会让 harness 基本不可用。
+
+实测对照（同一台设备）：
+
+| 位置 | 文件系统 | `link()` |
+|---|---|---|
+| `/sdcard/DroidHarness` | `fuse` | ✗ `Function not implemented` |
+| `/data/adb/dsh/workspace` | ext4 | ✓ |
+
+**代价**：工作区变成 root-only，普通文件管理器看不到，要用 root 管理器（或 `adb pull`）。
+
+**另外构建期还给 `dsh-fs-local` 打了补丁**（`dsh/tools/build-dsh-tree.mjs` 的 `TEXT_PATCHES`），让它在 `link()` 失败时降级成 `copyFile` + `COPYFILE_EXCL` —— 同样是「目标已存在就 EEXIST」的原子语义，不需要硬链接，**这样即使用户自己把工作区选到 `/sdcard` 也能用**（代价是多一次拷贝）。
+
+> **不能降级成 `rename()`** —— 那会丢掉 no-replace 语义，两个并发创建者会互相覆盖，而调用方的 `throwGuardedCreateFailure` 那套守卫就是为它写的。
+>
+> 补丁带**锚点校验**：找不到锚点、或锚点不唯一，就直接 die。宁可构建失败，也不要静默失效 —— 那种 bug 只在真机上、只在 agent 想写文件时才暴露。
+
 ---
 
 ## 插件安装（pnpm）
 
-DSH 的插件管理器**把参数原样转发给 `pnpm` 执行**，所以运行时里必须有 pnpm。本模块带的是 **Termux 编的 pnpm 12.7.0**（ELF 二进制，46.8 MiB）。
+DSH 的插件管理器**把参数原样转发给 `pnpm` 执行**，所以运行时里必须有 pnpm。本模块带的是 **NDK 编的 Android ELF**（pnpm 12.7.0，46.8 MiB；`ELF 64-bit LSB arm64, dynamic (/system/bin/linker64)` —— 不是 Termux 那个写死路径的构建）。
 
 它在 Android 上有两个坑，`service.sh` 已经处理了第一个：
 
@@ -211,22 +309,36 @@ pnpm 靠**硬链接**把 store 里的文件链进 `node_modules`。而 `/sdcard`
 Cross-device link not permitted
 ```
 
-pnpm 的 store 默认在 `$HOME` 下，而本模块的 `HOME` 是 `/sdcard/DroidHarness`（这是有意的：GUI 的工作区选择器从 `HOME` 开始列）。所以 `service.sh` 必须显式把它们指到 `/data/adb/dsh`：
+pnpm 的 store 默认在 `$HOME` 下。而本模块的 `HOME` 是工作区 —— 它**曾经**是 `/sdcard/DroidHarness`（FUSE），于是 pnpm 报：
 
-```sh
-export PNPM_HOME="$DSH_HOME_DIR/pnpm-home"
-export npm_config_store_dir="$DSH_HOME_DIR/.pnpm-store"
-export npm_config_cache_dir="$DSH_HOME_DIR/.pnpm-cache"
-export npm_config_state_dir="$DSH_HOME_DIR/.pnpm-state"
+```
+ERR_PNPM_STORE_DIR_OPEN_OPERATION_LOCK
+  lock directory must be a real directory owned by the current user
+  /sdcard/DroidHarness/.cache/pnpm-store-operation-locks-0
 ```
 
-> 这个坑是**手机端 agent 实测出来的**，不是我推的。它当时的判断依据是"store 必须和 profile 目录（`/data/adb/dsh/profiles/*`）在同一个真实文件系统上"，方向完全正确。
+**手机端 agent 实测：`npm_config_cache_dir` / `npm_config_store_dir` / `npm_config_state_dir` / `XDG_CACHE_HOME` / `--cache-dir` / `--config.cacheDir` / `--store-dir` 全都挪不动它** —— pnpm 根本不读那几个变量。**唯一有效的是给它一个单独的 `HOME`。**
+
+所以构建期生成了一层启动器：
+
+```
+usr/bin/pnpm-bin   ← 原 ELF 改名 (46.8 MiB)
+usr/bin/pnpm       ← #!/system/bin/sh
+                      export HOME="$DSH_HOME_DIR"
+                      exec "${0%/*}/pnpm-bin" "$@"
+```
+
+只改 pnpm 子进程的 `HOME`，DSH 自己的 `HOME` 不动（GUI 的工作区选择器从它起步）。这样不管工作区被选到哪，pnpm 的 store 都稳在 `/data`。
+
+> 这个坑是**手机端 agent 实测出来的**，不是我推的。
+>
+> 另外：`service.sh` 里还留着三行 `npm_config_*`，那对 **pnpm 是 no-op**（留着是因为 **npm** 会读它们）。我一开始以为那三行修好了问题 —— 那是错的。
 
 ### 2. JS 版 pnpm 的 shebang（本模块不受影响）
 
 npm 上发布的 pnpm 的 `bin/pnpm.mjs` shebang 是 `#!/usr/bin/env node`，而 **Android 上没有 `/usr/bin/env`**，直接 exec 会失败 —— 必须包一层启动器显式用 node 拉起。
 
-**本模块用的是 Termux 编的 ELF 二进制，不读 shebang，所以不受这条影响。** 但如果你把 `usr/bin/pnpm` 换成 npm 上的 pnpm JS 包，就要注意。
+**本模块用的是 NDK 编的 Android ELF（不读 shebang），所以不受这条影响。** 但如果你把 `usr/bin/pnpm` 换成 npm 上的 pnpm JS 包，就要注意。
 
 ### 装插件
 
@@ -260,6 +372,7 @@ DSH 本身就是一个能跑 shell 的 agent，所以这里把第一条钉死：
 - **首次安装较慢**：14,228 个文件要解压。安装脚本**故意不对 `app/` 做 `set_perm_recursive`**（那是逐个 shell 调用，会慢到不可接受），改用一条 `chmod -R 0755`。
 - **`node-pty` 没有原生模块**：安装脚本被跳过（它在 HOST 上跑，而包是给 TARGET 的），所以持久终端不可用。DSH 设计上容忍。
 - **`sharp` 没有 android 变体**：图片处理可能不可用。
+- **这些功能没有**（构建期已**删掉入口**，不是留着报错 —— 见上文 §4）：`node-gyp` 编译原生模块、`git cvsserver` / `git cvsimport` / `git cvsexportcommit` / `git archimport` / `git send-email` / `git p4` / `gitweb`。原因是模块里没有 python3 / perl。
 - **构建产物不进 git**：`dsh/module/{app,usr}/` 由上面两条命令重建。
 
 ## 裁剪

@@ -865,6 +865,9 @@ async function main() {
 		if (totalLinkFailed > 0) warn(`有 ${totalLinkFailed} 个链接没能还原 (见下方说明).`);
 		const savedOffline = pruneRuntime(OUT);
 		log(`裁剪开发文件: 省下 ${human(savedOffline)}`);
+		log('重写脚本 shebang:');
+		rewriteShebangs(OUT);
+		wrapPnpm(OUT);
 		const nLinksOffline = writeSymlinkManifest(OUT);
 		if (nLinksOffline > 0) log(`符号链接清单: ${nLinksOffline} 条 -> usr/${MANIFEST_NAME}`);
 		verify(OUT);
@@ -945,6 +948,9 @@ async function main() {
 	}
 	const saved = pruneRuntime(OUT);
 	log(`裁剪开发文件 (include / man / doc / pkgconfig / cmake): 省下 ${human(saved)}`);
+	log('重写脚本 shebang:');
+	rewriteShebangs(OUT);
+	wrapPnpm(OUT);
 	const nLinks = writeSymlinkManifest(OUT);
 	if (nLinks > 0) log(`符号链接清单: ${nLinks} 条 -> usr/${MANIFEST_NAME} (手机上由 customize.sh 重建)`);
 	verify(OUT);
@@ -952,6 +958,274 @@ async function main() {
 	if (WITH_KOFFI) await installKoffi();
 
 	log('\n完成. 下一步: 用 tools/build-module.ps1 打包, 然后刷进 KernelSU.');
+}
+
+/**
+ * 模块最终会被挂到 `/data/adb/modules/<id>/`，而安装期间在 `modules_update/<id>/`。
+ * 写进脚本的绝对路径必须是**最终**那个，否则重启后就断了。
+ * id 从 out 目录里的 module.prop 读，避免写死。
+ */
+function moduleRuntimePrefix(out) {
+	let id = 'dsh_android';
+	try {
+		const prop = fs.readFileSync(path.join(out, 'module.prop'), 'utf8');
+		const m = /^id=(.+)$/m.exec(prop);
+		if (m) id = m[1].trim();
+	} catch {}
+	return `/data/adb/modules/${id}/usr`;
+}
+
+/**
+ * 重写脚本文件的 shebang。
+ *
+ * 问题
+ * ----
+ * Termux 的包里，**脚本**文件的 shebang 写死了 Termux 路径：
+ *
+ *     #!/data/data/com.termux/files/usr/bin/sh
+ *
+ * ELF 二进制不受影响（它们不读 shebang），所以之前只验证二进制"能跑"是不够的。
+ * 脚本的表现是「文件明明在，却报 No such file or directory」—— execve 找不到解释器。
+ *
+ * 最阴的一例：`git-submodule` / `git-mergetool` 是 git 自带的 shell 脚本，
+ * 在 `usr/libexec/git-core/` 下。git 找得到它们、但 execve 失败，于是**谎报**成：
+ *
+ *     git: 'submodule' is not a git command.
+ *
+ * 这个错误信息会把排查方向带偏到「git 装得不全」。实际影响：
+ * `git clone --recurse-submodules` / `git submodule update` / `git mergetool` /
+ * `git filter-branch` 全部不可用；`npm` / `npx` / `wcurl` / `curl-config` 也是
+ * **加了但不能用**。
+ *
+ * 改法
+ * ----
+ *   sh / env sh  →  `#!/system/bin/sh`     Android 自带，不依赖模块挂载，最稳
+ *   bash         →  `#!/data/adb/modules/<id>/usr/bin/bash`
+ *   env node     →  `#!/data/adb/modules/<id>/usr/bin/node`
+ *
+ * **删掉的**：`env python3` / `perl` / `python` —— 模块里没有这些解释器，重写 shebang
+ * 也跑不了（14 + 7 + 1 = 22 个）。**留着只会给出误导性的错误**（`git cvsserver` 报的是
+ * "No such file or directory"，看起来像文件缺失，而不是"这个功能不支持"），所以直接删。
+ * 具体代价列在下面 `!rule` 分支的注释里。
+ *
+ * 只改**文本脚本**：先判前两字节是不是 `#!`（ELF 的首字节是 \x7f，天然排除）。
+ */
+function rewriteShebangs(out) {
+	const prefix = path.join(out, 'usr');
+	const runtime = moduleRuntimePrefix(out);
+	const termux = '/data/data/com.termux/files/usr';
+
+	// shebang 里的解释器路径 → 替换成什么
+	const rules = [
+		[`#!${termux}/bin/env sh`, '#!/system/bin/sh'],
+		[`#!${termux}/bin/sh`, '#!/system/bin/sh'],
+		[`#!${termux}/bin/env node`, `#!${runtime}/bin/node`],
+		[`#!${termux}/bin/bash`, `#!${runtime}/bin/bash`],
+	];
+
+	const stats = new Map();
+	const dropped = new Map();
+	const droppedFiles = [];
+	let scanned = 0;
+
+	const walk = (dir) => {
+		let entries;
+		try {
+			entries = fs.readdirSync(dir, { withFileTypes: true });
+		} catch {
+			return;
+		}
+		for (const e of entries) {
+			const full = path.join(dir, e.name);
+			if (e.isDirectory()) {
+				walk(full);
+				continue;
+			}
+			// 只看小文件；真正的脚本不会很大（最大的是 npm 的 completion.sh）
+			let st;
+			try {
+				st = fs.statSync(full);
+			} catch {
+				continue;
+			}
+			if (st.size > 512 * 1024) continue;
+			scanned++;
+
+			let buf;
+			try {
+				buf = fs.readFileSync(full);
+			} catch {
+				continue;
+			}
+			if (buf.length < 2 || buf[0] !== 0x23 || buf[1] !== 0x21) continue; // '#!'
+			const nl = buf.indexOf(0x0a);
+			const firstLine = buf.subarray(0, nl === -1 ? buf.length : nl).toString('utf8').replace(/\r$/, '');
+			if (!firstLine.includes(termux)) continue;
+
+			const rule = rules.find(([from]) => firstLine === from || firstLine.startsWith(from + ' '));
+			if (!rule) {
+				// 这个 shebang 指向模块里**没有**的解释器 (python3 / perl / python)。
+				// 改 shebang 也跑不了, 而留着只会给出**误导性**的错误 ——
+				// 例如 `git cvsserver` 报的是 "No such file or directory"(看起来像
+				// 文件缺失), 而不是"这个功能不支持"。所以**直接删掉**。
+				//
+				// 代价 (写在这里免得以后忘):
+				//   · node-gyp 编译原生模块      —— 不可用 (本来也没有 python, 且 bionic 上没有工具链)
+				//   · git cvsserver / cvsexportcommit / cvsimport / archimport
+				//   · git send-email
+				//   · gitweb
+				//   · git p4
+				// 想恢复这些功能, 只能把 python3 / perl 一起打进模块 (体积换功能)。
+				const key = firstLine.replace(termux, 'TERMUX');
+				try {
+					fs.rmSync(full, { force: true });
+					dropped.set(key, (dropped.get(key) ?? 0) + 1);
+					droppedFiles.push(path.relative(out, full).replace(/\\/g, '/'));
+				} catch (err) {
+					warn(`  ! 删不掉 ${path.relative(out, full)}: ${err.message}`);
+				}
+				continue;
+			}
+			const [from, to] = rule;
+			const rest = firstLine.slice(from.length);
+			const newLine = to + rest;
+			// 只换第一行，其余字节原样保留
+			const out2 = Buffer.concat([Buffer.from(newLine, 'utf8'), nl === -1 ? Buffer.alloc(0) : buf.subarray(nl)]);
+			try {
+				fs.writeFileSync(full, out2, { mode: st.mode });
+			} catch (err) {
+				warn(`  ! 改不了 ${path.relative(out, full)}: ${err.message}`);
+				continue;
+			}
+			const key = `${firstLine.replace(termux, 'TERMUX')}  →  ${newLine.split(' ')[0].replace(runtime, '<RUNTIME>')}`;
+			stats.set(key, (stats.get(key) ?? 0) + 1);
+		}
+	};
+	walk(prefix);
+
+	let total = 0;
+	for (const [k, n] of [...stats.entries()].sort((a, b) => b[1] - a[1])) {
+		log(`  ✓ ${String(n).padStart(3)}  ${k}`);
+		total += n;
+	}
+	for (const [k, n] of [...dropped.entries()].sort((a, b) => b[1] - a[1])) {
+		log(`  ✂ ${String(n).padStart(3)}  ${k}  (模块里没有该解释器, 已删除)`);
+	}
+	if (droppedFiles.length > 0) {
+		log(`  删掉 ${droppedFiles.length} 个跑不了的脚本:`);
+		for (const f of droppedFiles.sort()) log(`      ${f}`);
+	}
+	// 删完之后清掉空目录 (例如 node-gyp/gyp/pylib/... 整棵)
+	const pruneEmpty = (d) => {
+		let entries;
+		try {
+			entries = fs.readdirSync(d, { withFileTypes: true });
+		} catch {
+			return true;
+		}
+		let empty = true;
+		for (const e of entries) {
+			const full = path.join(d, e.name);
+			if (e.isDirectory()) {
+				if (!pruneEmpty(full)) empty = false;
+			} else empty = false;
+		}
+		if (empty && d !== prefix) {
+			try {
+				fs.rmdirSync(d);
+			} catch {}
+		}
+		return empty;
+	};
+	pruneEmpty(prefix);
+
+	log(`  扫描 ${scanned} 个文件, 重写 ${total} 个 shebang, 删除 ${droppedFiles.length} 个`);
+	return total;
+}
+
+/**
+ * 给 pnpm 包一层启动器，只改它自己的 HOME。
+ *
+ * 为什么
+ * ------
+ * pnpm 的 **store 操作锁目录**取自 `$HOME/.cache`，并要求它是「当前用户拥有的真实目录」。
+ * 而本模块的 `HOME` 是 `/sdcard/DroidHarness`（有意为之：GUI 的工作区选择器从 HOME 起步），
+ * 它属于 `u0_a257:media_rw`，而 DSH 进程是 root，于是：
+ *
+ *     ERR_PNPM_STORE_DIR_OPEN_OPERATION_LOCK
+ *       lock directory must be a real directory owned by the current user:
+ *       /sdcard/DroidHarness/.cache/pnpm-store-operation-locks-0
+ *
+ * 实测 `npm_config_cache_dir` / `npm_config_store_dir` / `npm_config_state_dir` /
+ * `XDG_CACHE_HOME` / `--cache-dir` / `--config.cacheDir` / `--store-dir` **全都挪不动它**
+ * —— pnpm 根本不读那三个 `npm_config_*`。唯一有效的是给它一个单独的 `HOME`。
+ *
+ * 另外 store 必须和 profile 目录（`/data/adb/dsh/profiles/*`）在同一个真实文件系统上
+ * （它靠硬链接把 store 里的文件链进 node_modules），而 `/sdcard` 是 FUSE，
+ * **不支持硬链接** → `Cross-device link not permitted`。把 HOME 指到 `/data/adb/dsh`
+ * 顺带把这条也解决了。
+ *
+ * 做法
+ * ----
+ *   `usr/bin/pnpm-bin`  ← 原来的 ELF 改名
+ *   `usr/bin/pnpm`      ← `#!/system/bin/sh`，只 export HOME 再 exec pnpm-bin
+ *
+ * 这样是**自包含**的（不依赖模块外的文件），而且 `.dsh-symlinks` 里的
+ * `bin/pnpx → pnpm` 仍然正确（指向包装脚本）。
+ *
+ * 注意本模块的 pnpm 是 **NDK 编的 Android ELF**，不读 shebang，所以不需要
+ * 「`#!/usr/bin/env node` 在 Android 上不存在」那条绕法（那条只对 npm 上的
+ * pnpm JS 包成立）。
+ */
+function wrapPnpm(out) {
+	const prefix = path.join(out, 'usr');
+	const binDir = path.join(prefix, 'bin');
+	const pnpm = path.join(binDir, 'pnpm');
+	const pnpmBin = path.join(binDir, 'pnpm-bin');
+
+	if (!fs.existsSync(pnpm)) {
+		log('  · 没有 usr/bin/pnpm, 跳过包装');
+		return 0;
+	}
+	// 幂等: 已经包过就不重复
+	if (fs.existsSync(pnpmBin)) {
+		log('  · usr/bin/pnpm 已经包过, 跳过');
+		return 0;
+	}
+	// 只包 ELF —— 如果 pnpm 本身是脚本, 说明包布局变了, 应该停下来看
+	const head = fs.readFileSync(pnpm).subarray(0, 4);
+	if (!(head[0] === 0x7f && head[1] === 0x45 && head[2] === 0x4c && head[3] === 0x46)) {
+		warn('  ! usr/bin/pnpm 不是 ELF, 与预期不符, 跳过包装');
+		return 0;
+	}
+
+	fs.renameSync(pnpm, pnpmBin);
+	const wrapper = [
+		'#!/system/bin/sh',
+		'# pnpm 启动器 —— 只给 pnpm 换一个 HOME, 不动 DSH 的 HOME。',
+		'#',
+		'# 为什么必须换 HOME (见 probe/tools/fetch-runtime.mjs 里 wrapPnpm 的注释):',
+		'#   · pnpm 的 store 操作锁目录取自 $HOME/.cache, 且要求它是「当前用户拥有的真实目录」;',
+		'#     而 DSH 的 HOME 是 /sdcard/DroidHarness (属于 u0_a257:media_rw, 进程是 root),',
+		'#     于是报 ERR_PNPM_STORE_DIR_OPEN_OPERATION_LOCK。',
+		'#     实测 npm_config_cache_dir / XDG_CACHE_HOME / --cache-dir / --store-dir 全都挪不动它。',
+		'#   · store 还必须和 profile 目录在同一个真实文件系统上 (它靠硬链接),',
+		'#     而 /sdcard 是 FUSE, 不支持硬链接 → Cross-device link not permitted。',
+		'#',
+		'# 把 HOME 指到 /data/adb/dsh 同时解决这两条。',
+		'',
+		`DSH_HOME_DIR="\${DSH_HOME:-/data/adb/dsh}"`,
+		'export HOME="$DSH_HOME_DIR"',
+		'export PNPM_HOME="${PNPM_HOME:-$DSH_HOME_DIR/pnpm-home}"',
+		'mkdir -p "$PNPM_HOME" "$DSH_HOME_DIR/tmp" 2>/dev/null',
+		'export TMPDIR="${TMPDIR:-$DSH_HOME_DIR/tmp}"',
+		'',
+		'exec "${0%/*}/pnpm-bin" "$@"',
+		'',
+	].join('\n');
+	fs.writeFileSync(pnpm, wrapper, { mode: 0o755 });
+	log('  ✓ usr/bin/pnpm 已包启动器 (只改 HOME), 原 ELF 改名 pnpm-bin');
+	return 1;
 }
 
 function verify(out) {

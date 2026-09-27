@@ -183,6 +183,97 @@ for (const s of SHIMS) {
 	shimTargets.push(target);
 }
 
+// ─────────────────── 2b. 针对第三方库内部逻辑的文本补丁 ───────────────────
+//
+// 与 shim 的区别: shim 是**整文件替换**(顶替一个在 Android 上装不上的原生模块),
+// 这里是**改上游源码里的几行**。所以每条都必须有锚点校验 —— 找不到锚点就 die,
+// 不能静默跳过(否则 DSH 升级后补丁悄悄失效, 而症状只在真机上才暴露)。
+
+/** 给 dsh-fs-local 的 writeFileAtomic 加 FUSE 降级。 */
+const LINK_FALLBACK_HELPER = `/**
+ * [Android 补丁] link() 的 FUSE 降级版。
+ *
+ * 上游用 link() 给「创建新文件」拿 no-replace 语义(目标已存在则 EEXIST)。
+ * 但 Android 的 /sdcard 是 FUSE, **不实现 link()**, 于是新建文件直接报:
+ *
+ *   ENOSYS: function not implemented, link
+ *
+ * 而默认工作区就在 /sdcard 上 —— agent 因此无法新建任何文件, 只能改已存在的
+ * (覆盖走 rename(), 那个 FUSE 支持)。
+ *
+ * 降级成 copyFile + COPYFILE_EXCL: 同样是「目标已存在就 EEXIST」的原子语义,
+ * 不需要硬链接, 代价是多一次拷贝。
+ *
+ * **注意不能降级成 rename()** —— 那会丢掉 no-replace 语义, 两个并发创建者会
+ * 互相覆盖, 而调用方的 throwGuardedCreateFailure 那套守卫就是为它写的。
+ */
+async function linkOrCopyExcl(from, to) {
+	try {
+		await link(from, to);
+		return;
+	} catch (error) {
+		const code = error?.code;
+		// 只有「这个文件系统不支持硬链接」才降级; EEXIST 等语义错误必须原样抛出
+		if (code !== "ENOSYS" && code !== "EOPNOTSUPP" && code !== "EXDEV" && code !== "EPERM") throw error;
+	}
+	await copyFile(from, to, fsConstants.COPYFILE_EXCL);
+}
+`;
+
+const TEXT_PATCHES = [
+	{
+		label: 'dsh-fs-local: writeFileAtomic 在 FUSE 上把 link() 降级成 copyFile',
+		file: ['@deepseek-ai', 'dsh-fs-local', 'lib', 'index.js'],
+		edits: [
+			{
+				// 上游没 import copyFile, 而 constants 是从 node:buffer 来的(另一个东西),
+				// 所以两个都要补, 且 constants 要起别名避免撞名。
+				find: 'import { chmod, link, lstat, mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";',
+				replace:
+					'import { chmod, constants as fsConstants, copyFile, link, lstat, mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";',
+			},
+			{
+				find: 'async function writeFileAtomic(absolutePath, content, mode, signal, internals = {}, createIfAbsent) {',
+				replace: `${LINK_FALLBACK_HELPER}async function writeFileAtomic(absolutePath, content, mode, signal, internals = {}, createIfAbsent) {`,
+			},
+			{
+				find: '\tconst linkFile = internals.linkFile ?? link;',
+				replace: '\tconst linkFile = internals.linkFile ?? linkOrCopyExcl;',
+			},
+		],
+	},
+];
+
+log('');
+log('=== 文本补丁 (改上游内部逻辑) ===');
+for (const p of TEXT_PATCHES) {
+	const target = path.join(APP, 'node_modules', ...p.file);
+	if (!fs.existsSync(target)) die(`找不到补丁目标: ${path.relative(APP, target)}`);
+	let text = fs.readFileSync(target, 'utf8');
+	// 幂等: 所有 replace 都已经在了 = 补丁过了。否则重跑会找不到锚点而 die。
+	if (p.edits.every((e) => text.includes(e.replace))) {
+		log(`  · ${p.label} (已经打过, 跳过)`);
+		continue;
+	}
+	let applied = 0;
+	for (const [i, e] of p.edits.entries()) {
+		const count = text.split(e.find).length - 1;
+		if (count === 0) {
+			warn(`  ! ${p.label}: 第 ${i + 1} 个锚点找不到 —— 上游可能改过了`);
+			warn(`      锚点: ${e.find.slice(0, 90)}${e.find.length > 90 ? '…' : ''}`);
+			die('补丁锚点不匹配, 拒绝继续 (宁可失败, 也不要静默失效)');
+		}
+		if (count > 1) {
+			warn(`  ! ${p.label}: 第 ${i + 1} 个锚点出现 ${count} 次, 无法确定改哪个`);
+			die('补丁锚点不唯一, 拒绝继续');
+		}
+		text = text.replace(e.find, e.replace);
+		applied++;
+	}
+	fs.writeFileSync(target, text);
+	log(`  ✓ ${p.label} (${applied} 处)`);
+}
+
 // ─────────────────────────── 3. 校验 ───────────────────────────
 log('\n=== 校验 ===');
 
@@ -229,6 +320,49 @@ const negative = spawnSync(
 	{ cwd: APP, encoding: 'utf8' }
 );
 log(`  · 不带旗标时: ${((negative.stdout ?? '') + (negative.stderr ?? '')).trim()}`);
+
+// dsh-fs-local 的文本补丁: 至少要能 import 成功 —— 补丁写坏了语法/import 会在这里暴露,
+// 而不是等到真机上 agent 想写文件时才发现.
+const fsLocalSmoke = spawnSync(
+	nodeBin,
+	['--input-type=module', '-e', "await import('@deepseek-ai/dsh-fs-local'); console.log('fslocal-ok');"],
+	{ cwd: APP, encoding: 'utf8' }
+);
+const fsLocalOut = ((fsLocalSmoke.stdout ?? '') + (fsLocalSmoke.stderr ?? '')).trim();
+if (/fslocal-ok/.test(fsLocalOut)) {
+	log('  ✓ dsh-fs-local 补丁后仍能 import');
+} else {
+	warn(`  ✗ dsh-fs-local import 失败: ${fsLocalOut.slice(0, 300)}`);
+	bad++;
+}
+
+// 降级路径的语义: copyFile + COPYFILE_EXCL 必须是「目标已存在就 EEXIST」.
+// 这是 no-replace 语义的替代品, 语义错了会让两个并发创建者互相覆盖.
+const copyExclSmoke = spawnSync(
+	nodeBin,
+	[
+		'--input-type=module',
+		'-e',
+		[
+			"import { copyFile, constants, writeFile, rm } from 'node:fs/promises';",
+			"const a = '.__copyexcl_a', b = '.__copyexcl_b';",
+			"await writeFile(a, 'x');",
+			'await copyFile(a, b, constants.COPYFILE_EXCL);',
+			'let eexist = false;',
+			'try { await copyFile(a, b, constants.COPYFILE_EXCL); } catch (e) { eexist = e.code === "EEXIST"; }',
+			'await rm(a, { force: true }); await rm(b, { force: true });',
+			"console.log('copyexcl-ok', eexist);",
+		].join(' '),
+	],
+	{ cwd: APP, encoding: 'utf8' }
+);
+const copyExclOut = ((copyExclSmoke.stdout ?? '') + (copyExclSmoke.stderr ?? '')).trim();
+if (/copyexcl-ok true/.test(copyExclOut)) {
+	log('  ✓ copyFile+COPYFILE_EXCL 的 no-replace 语义正确 (已存在 -> EEXIST)');
+} else {
+	warn(`  ✗ copyFile+COPYFILE_EXCL 语义不对: ${copyExclOut.slice(0, 200)}`);
+	bad++;
+}
 
 // flock shim 实测: 真开一个文件拿 fd, 走一遍 tryLockExclusive.
 // 这是唯一能证明"会话写入路径不会在 Android 上抛 unsupported platform"的方法.

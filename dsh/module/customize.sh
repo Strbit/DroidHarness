@@ -8,8 +8,10 @@ SKIPUNZIP=0
 
 # DSH_HOME 放在模块目录之外, 这样重装模块不会丢掉配置与凭据
 DSH_HOME_DIR=/data/adb/dsh
-# 工作区放在共享存储, 文件管理器能翻到
-WS=/sdcard/DroidHarness
+# 工作区放在 /data 下, **不是 /sdcard** —— /sdcard 是 FUSE, 不实现 link(2),
+# 而 DSH 的 writeFileAtomic 用 link() 创建新文件, 会导致 agent 建不了任何文件。
+# 详见 service.sh 顶部的说明。
+WS="$DSH_HOME_DIR/workspace"
 PREFIX="$MODPATH/usr"
 APP="$MODPATH/app"
 TAB=$(printf '\t')
