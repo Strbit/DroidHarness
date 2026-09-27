@@ -121,11 +121,103 @@ if (!fs.existsSync(path.join(APP, 'node_modules'))) {
 	die(`找不到 ${path.join(APP, 'node_modules')} —— 先不带 --skip-install 跑一次`);
 }
 
-// ─────────────────────────── 2. 打补丁 ───────────────────────────
+// ─────────────────────────── 2a. 创建 ripgrep-android-arm64 stub ───────────────────────────
+//
+// @vscode/ripgrep 的 resolveRgPath() 期望 platform-specific package
+// @vscode/ripgrep-android-arm64, 但 npm registry 没有这个包 (404)。
+// 模块自带 usr/bin/rg (ripgrep 15.2.0) + usr/lib/libpcre2-8.so(PIE 动态链接),
+// 缺的只是一个能连上的路径。构建一个 stub 包即可:
+//
+//   app/node_modules/@vscode/ripgrep-android-arm64/
+//     ├── package.json      # minimal metadata
+//     ├── libexec/rg.real   # 拷贝 usr/bin/rg (二进制)
+//     └── bin/rg            # shell wrapper that sets LD_LIBRARY_PATH
+//
+// 关键: wrapper 必须是自包含的——targetEnvironment(spec)允许调用方完全自定义 env,
+// 不应赌 scrubbedParentEnv() 带着 LD_LIBRARY_PATH。
+
+log('=== 2a. 创建 @vscode/ripgrep-android-arm64 stub ===');
+log('创建 @vscode/ripgrep-android-arm64 stub...');
+
+const RG_STUB_DIR = path.join(APP, 'node_modules', '@vscode', 'ripgrep-android-arm64');
+const USR_RG = path.join(ROOT, 'dsh', 'module', 'usr', 'bin', 'rg');
+const USR_LIB = path.join(ROOT, 'dsh', 'module', 'usr', 'lib');
+
+if (!fs.existsSync(USR_RG)) {
+	die(`找不到 $USR_RG —— 请先跑 fetch-runtime 或确认模块已装好`);
+}
+if (!fs.existsSync(USR_LIB)) {
+	die(`找不到 $USR_LIB —— 缺少 pcre2 so`);
+}
+
+if (fs.existsSync(RG_STUB_DIR)) fs.rmSync(RG_STUB_DIR, { recursive: true, force: true });
+fs.mkdirSync(RG_STUB_DIR, { recursive: true });
+fs.mkdirSync(path.join(RG_STUB_DIR, 'libexec'), { recursive: true });
+fs.mkdirSync(path.join(RG_STUB_DIR, 'bin'), { recursive: true });
+
+// package.json
+fs.writeFileSync(
+	path.join(RG_STUB_DIR, 'package.json'),
+	JSON.stringify({
+		name: '@vscode/ripgrep-android-arm64',
+		version: '15.2.0',
+		license: 'MIT',
+		description: 'Stub for Android arm64 — wraps module-local rg with correct LD_LIBRARY_PATH'
+	}, null, 2) + '\n'
+);
+
+// 拷贝二进制 + 它唯一需要的外部 so
+// rg 的 DT_NEEDED 里只有 libpcre2-8.so 来自模块 (libc.so/libdl.so 由系统提供).
+// 把它一起拷进 libexec/, stub 就**自包含**了: 不需要从 bin/ 往上数层数去找
+// 模块根 (数错了就 exec 一个不存在的文件), 也不会因为 app 树被移动而失效.
+// 代价是一份 489 KiB 的副本 —— 值得.
+const RG_REAL = path.join(RG_STUB_DIR, 'libexec', 'rg.real');
+fs.copyFileSync(USR_RG, RG_REAL);
+fs.chmodSync(RG_REAL, 0o755);
+
+const PCRE2 = path.join(USR_LIB, 'libpcre2-8.so');
+if (!fs.existsSync(PCRE2)) die(`找不到 ${PCRE2} —— rg 是动态链接的, 少了它跑不起来`);
+fs.copyFileSync(PCRE2, path.join(RG_STUB_DIR, 'libexec', 'libpcre2-8.so'));
+
+// wrapper: 只依赖自己的位置, **且只用 shell 内建命令**.
+//
+// 为什么不用 dirname / command -v / basename:
+//   调用方走的是 targetEnvironment(spec), 可以完全自定义子进程环境 ——
+//   包括给一个**没有 PATH** 的 env. 那时任何外部命令都会 "not found",
+//   而 rg 是 dsh-tool-fs-search 的启动路径, 失败表现是语义模糊的
+//   "ripgrep launch failed", 极难定位.
+//   `${SELF%/*}` / cd / pwd 全是内建, 不吃 PATH.
+//
+// 注意: 这里是 JS 模板字符串, shell 的 ${VAR:+...} 必须写成 \${...},
+// 否则 JS 会把它当插值表达式, 直接 SyntaxError.
+const WRAPPER = `#!/system/bin/sh
+# rg wrapper (Android) — 补齐 PIE 二进制需要的 so 搜索路径.
+# 自包含: libpcre2-8.so 就在同目录的 libexec/ 里.
+# 只用 shell 内建 (参数展开 / cd / pwd), 不依赖 PATH —— 调用方可能给一个空 env.
+SELF="$0"
+case "$SELF" in
+	*/*) BIN="\${SELF%/*}" ;;
+	*)   BIN="." ;;
+esac
+BIN=$(cd "$BIN" && pwd) || exit 127
+LIBEXEC="$BIN/../libexec"
+LD_LIBRARY_PATH="$LIBEXEC\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH
+exec "$LIBEXEC/rg.real" "$@"
+`;
+fs.writeFileSync(path.join(RG_STUB_DIR, 'bin', 'rg'), WRAPPER);
+fs.chmodSync(path.join(RG_STUB_DIR, 'bin', 'rg'), 0o755);
+
+log(`  ✓ stub created: ${path.relative(ROOT, RG_STUB_DIR)}`);
+log(`    - package.json`);
+log(`    - libexec/rg.real (${(fs.statSync(path.join(RG_STUB_DIR, 'libexec', 'rg.real')).size / 1024).toFixed(0)} KiB)`);
+log(`    - bin/rg (wrapper)`);
+
+// ─────────────────────────── 2b. Shim JS 替身 ───────────────────────────
 //
 // 每个 shim 一条. 全部是同一个根因: **原包带的原生模块没有 android 变体**.
 // 各 shim 文件顶部写清了"为什么可以降级", 以及降级丢掉了什么.
-log('=== 打补丁 ===');
+log('=== 2b. Shim JS 替身 ===');
 
 const SHIMS = [
 	{
@@ -282,6 +374,10 @@ const checks = [
 	['koffi 平台预编译包', path.join(APP, 'node_modules', '@koromix', 'koffi-android-arm64', 'android_arm64', 'koffi.node')],
 	['koffi 加载器入口', path.join(APP, 'node_modules', 'koffi', 'src', 'koffi', 'index.cjs')],
 	['DSH 入口', path.join(APP, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')],
+	['ripgrep stub: package.json', path.join(RG_STUB_DIR, 'package.json')],
+	['ripgrep stub: bin/rg (入口)', path.join(RG_STUB_DIR, 'bin', 'rg')],
+	['ripgrep stub: libexec/rg.real', path.join(RG_STUB_DIR, 'libexec', 'rg.real')],
+	['ripgrep stub: libpcre2-8.so', path.join(RG_STUB_DIR, 'libexec', 'libpcre2-8.so')],
 	...shimTargets.map((t) => [`shim 落点 (${path.relative(APP, t)})`, t]),
 ];
 let bad = 0;
@@ -292,6 +388,38 @@ for (const [label, p] of checks) {
 		warn(`  ✗ ${label} 缺失: ${path.relative(APP, p)}`);
 		bad++;
 	}
+}
+
+// ── B2 的核心验证: 模拟 android/arm64, 看 @vscode/ripgrep 能否解析出 rgPath ──
+//
+// 为什么必须覆写: process.platform 在 Windows 上是 'win32', 而 @vscode/ripgrep
+// 是按 `${process.platform}-${process.arch}` 拼包名的. 不覆写就永远走 win32 分支,
+// 测出来"通过"也证明不了 stub 在设备上能被找到.
+//
+// arch 同理: 本机是 x64, 但设备是 arm64 —— 包名差一个字符就 404.
+const rgSmoke = spawnSync(
+	nodeBin,
+	[
+		'--input-type=module',
+		'-e',
+		[
+			"Object.defineProperty(process,'platform',{value:'android',configurable:true});",
+			"Object.defineProperty(process,'arch',{value:'arm64',configurable:true});",
+			"try{",
+			"const {rgPath}=await import('@vscode/ripgrep');",
+			"console.log('rgresolve-ok '+rgPath);",
+			"}catch(e){console.log('rgresolve-fail '+String(e.message).slice(0,160));}",
+		].join(' '),
+	],
+	{ cwd: APP, encoding: 'utf8' }
+);
+const rgOut = ((rgSmoke.stdout ?? '') + (rgSmoke.stderr ?? '')).trim();
+if (/rgresolve-ok /.test(rgOut)) {
+	log(`  ✓ @vscode/ripgrep 在模拟 android-arm64 下解析成功`);
+	log(`      ${rgOut.replace(/^rgresolve-ok /, 'rgPath = ')}`);
+} else {
+	warn(`  ✗ @vscode/ripgrep 解析失败 (B2 没修好): ${rgOut.slice(0, 300)}`);
+	bad++;
 }
 
 // 真正跑一次 shim —— 这是唯一能证明"dsh-app-boot 那处无保护的 require 能过"的方法.

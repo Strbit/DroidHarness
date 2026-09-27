@@ -1,0 +1,50 @@
+#!/system/bin/sh
+# dsh — DSH 的命令行入口
+#
+# 为什么需要它
+# ------------
+# 官方文档里的插件安装命令是:
+#
+#     dsh plugin --profile web add <pkg>
+#
+# 但模块只把运行时装进了 `usr/bin` (node / pnpm / rg / git ...), **没有 `dsh`
+# 这个名字的入口** —— DSH 本体是 `app/node_modules/@deepseek-ai/dsh/lib/bin.js`,
+# 由 `service.sh` 用绝对路径拉起。于是文档里那条命令在设备上直接
+# "dsh: not found", 而 user 会以为是 DSH 没装好。
+#
+# 做法
+# ----
+# 一个薄壳: source 共享环境 (bin/env.sh, 与 service.sh 同一份), 再把参数原样
+# 交给 node + DSH 入口。这样 `dsh plugin ...` / `dsh --help` 等都能用。
+#
+# 环境一致性是刻意的: `bin/env.sh` 就是 service.sh 用的那一份。
+# 如果两边环境不同, 会出现「服务里能用、dsh 命令里不能用」的分裂, 极难排查。
+#
+# 用法
+# ----
+#   dsh --help
+#   dsh plugin --profile web add <pkg>
+#   dsh plugin --profile web list
+#
+# 注意 `--expose-internals`: DSH 的 node-addon-require-builtin 垫片需要它
+# (见 dsh/shim/node-addon-require-builtin.js)。少这个旗标会在启动早期报错。
+
+MODDIR=$(cd "${0%/*}/.." && pwd)
+
+. "$MODDIR/bin/env.sh"
+
+if [ ! -f "$BIN" ]; then
+	echo "dsh: 找不到 DSH 入口: $BIN" >&2
+	echo "     应用树可能没装全, 或模块被挂到了别处。" >&2
+	exit 1
+fi
+
+if [ ! -x "$PREFIX/bin/node" ]; then
+	echo "dsh: 找不到可执行的运行时: $PREFIX/bin/node" >&2
+	exit 1
+fi
+
+# cd 到工作区: DSH 有些相对路径行为依赖 cwd, 和服务进程保持一致
+cd "$WS" 2>/dev/null || cd / 2>/dev/null
+
+exec "$PREFIX/bin/node" --expose-internals "$BIN" "$@"
