@@ -223,16 +223,30 @@ git: 'submodule' is not a git command. See 'git --help'.
 | `#!…/bin/env node` | 12 | `#!/data/adb/modules/dsh_android/usr/bin/node` |
 | `#!…/bin/env sh` | 2 | `#!/system/bin/sh` |
 | `#!…/bin/bash` | 2 | `#!/data/adb/modules/dsh_android/usr/bin/bash` |
-| `#!…/bin/env python3` | 14 | **不动** —— 模块里没有 python |
-| `#!…/bin/perl` | 7 | **不动** —— 没有 perl |
-| `#!…/bin/python` | 1 | **不动** |
+| `#!…/bin/env python3` | 14 | **删掉** —— 模块里没有 python |
+| `#!…/bin/perl` | 7 | **删掉** —— 没有 perl |
+| `#!…/bin/python` | 1 | **删掉** |
 
 两个关键细节：
 
 1. **必须写运行时路径 `/data/adb/modules/<id>/usr/...`，不是 `modules_update/...`** —— 安装期间在 `modules_update`，重启后就不在了。`id` 从 `module.prop` 读，不写死。
 2. **只改文本脚本**：先判前两字节是不是 `#!`（ELF 首字节是 `\x7f`，天然排除），而且只换第一行、其余字节原样保留。
 
-**那 22 个没解释器的**（python3 / perl / python）在 README 里标注为不支持：`node-gyp` 编译原生模块、`git cvsserver` / `git send-email` / `gitweb` / `git p4` 用不了。
+**那 22 个没解释器的**（python3 / perl / python）**直接删掉，不是留着改 shebang**：
+
+改了也跑不了（模块里没有那些解释器），而**留着会给出误导性的错误** —— 比如 `git cvsserver` 报的是 `No such file or directory`，看起来像文件缺失，而不是「这个功能不支持」。留着只会浪费排查时间。
+
+**代价（写在这里免得以后忘）**：下面这些功能在模块里彻底不可用 ——
+
+| 功能 | 原因 |
+|---|---|
+| `node-gyp` 编译原生模块 | 需要 python3（本来在 bionic 上也没有工具链） |
+| `git cvsserver` / `cvsexportcommit` / `cvsimport` / `archimport` | 需要 perl |
+| `git send-email` | 需要 perl |
+| `gitweb` | 需要 perl |
+| `git p4` | 需要 python |
+
+**被删的是这 22 个文件本身**，不是整个目录 —— 判断依据仍是「首行的 shebang 指向模块里没有的解释器」，不是目录名。
 
 > 这条是**手机端 agent 实测出来的**，它给出的清单（70 个、按 shebang 分类）和我事后复核的结果完全一致。
 
@@ -358,6 +372,7 @@ DSH 本身就是一个能跑 shell 的 agent，所以这里把第一条钉死：
 - **首次安装较慢**：14,228 个文件要解压。安装脚本**故意不对 `app/` 做 `set_perm_recursive`**（那是逐个 shell 调用，会慢到不可接受），改用一条 `chmod -R 0755`。
 - **`node-pty` 没有原生模块**：安装脚本被跳过（它在 HOST 上跑，而包是给 TARGET 的），所以持久终端不可用。DSH 设计上容忍。
 - **`sharp` 没有 android 变体**：图片处理可能不可用。
+- **这些功能没有**（构建期已**删掉入口**，不是留着报错 —— 见上文 §4）：`node-gyp` 编译原生模块、`git cvsserver` / `git cvsimport` / `git cvsexportcommit` / `git archimport` / `git send-email` / `git p4` / `gitweb`。原因是模块里没有 python3 / perl。
 - **构建产物不进 git**：`dsh/module/{app,usr}/` 由上面两条命令重建。
 
 ## 裁剪

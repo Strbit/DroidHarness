@@ -1003,8 +1003,10 @@ function moduleRuntimePrefix(out) {
  *   bash         →  `#!/data/adb/modules/<id>/usr/bin/bash`
  *   env node     →  `#!/data/adb/modules/<id>/usr/bin/node`
  *
- * **不动的**：`env python3` / `perl` / `python` —— 模块里没有这些解释器，
- * 重写 shebang 也跑不了（14 + 7 + 1 = 22 个）。这些功能由 README 标注为不支持。
+ * **删掉的**：`env python3` / `perl` / `python` —— 模块里没有这些解释器，重写 shebang
+ * 也跑不了（14 + 7 + 1 = 22 个）。**留着只会给出误导性的错误**（`git cvsserver` 报的是
+ * "No such file or directory"，看起来像文件缺失，而不是"这个功能不支持"），所以直接删。
+ * 具体代价列在下面 `!rule` 分支的注释里。
  *
  * 只改**文本脚本**：先判前两字节是不是 `#!`（ELF 的首字节是 \x7f，天然排除）。
  */
@@ -1022,7 +1024,8 @@ function rewriteShebangs(out) {
 	];
 
 	const stats = new Map();
-	const skipped = new Map();
+	const dropped = new Map();
+	const droppedFiles = [];
 	let scanned = 0;
 
 	const walk = (dir) => {
@@ -1061,9 +1064,26 @@ function rewriteShebangs(out) {
 
 			const rule = rules.find(([from]) => firstLine === from || firstLine.startsWith(from + ' '));
 			if (!rule) {
-				// python / perl / python3 —— 没有解释器，改了也没用
+				// 这个 shebang 指向模块里**没有**的解释器 (python3 / perl / python)。
+				// 改 shebang 也跑不了, 而留着只会给出**误导性**的错误 ——
+				// 例如 `git cvsserver` 报的是 "No such file or directory"(看起来像
+				// 文件缺失), 而不是"这个功能不支持"。所以**直接删掉**。
+				//
+				// 代价 (写在这里免得以后忘):
+				//   · node-gyp 编译原生模块      —— 不可用 (本来也没有 python, 且 bionic 上没有工具链)
+				//   · git cvsserver / cvsexportcommit / cvsimport / archimport
+				//   · git send-email
+				//   · gitweb
+				//   · git p4
+				// 想恢复这些功能, 只能把 python3 / perl 一起打进模块 (体积换功能)。
 				const key = firstLine.replace(termux, 'TERMUX');
-				skipped.set(key, (skipped.get(key) ?? 0) + 1);
+				try {
+					fs.rmSync(full, { force: true });
+					dropped.set(key, (dropped.get(key) ?? 0) + 1);
+					droppedFiles.push(path.relative(out, full).replace(/\\/g, '/'));
+				} catch (err) {
+					warn(`  ! 删不掉 ${path.relative(out, full)}: ${err.message}`);
+				}
 				continue;
 			}
 			const [from, to] = rule;
@@ -1088,10 +1108,38 @@ function rewriteShebangs(out) {
 		log(`  ✓ ${String(n).padStart(3)}  ${k}`);
 		total += n;
 	}
-	for (const [k, n] of [...skipped.entries()].sort((a, b) => b[1] - a[1])) {
-		log(`  · ${String(n).padStart(3)}  ${k}  (模块里没有该解释器, 不动)`);
+	for (const [k, n] of [...dropped.entries()].sort((a, b) => b[1] - a[1])) {
+		log(`  ✂ ${String(n).padStart(3)}  ${k}  (模块里没有该解释器, 已删除)`);
 	}
-	log(`  扫描 ${scanned} 个文件, 重写 ${total} 个 shebang`);
+	if (droppedFiles.length > 0) {
+		log(`  删掉 ${droppedFiles.length} 个跑不了的脚本:`);
+		for (const f of droppedFiles.sort()) log(`      ${f}`);
+	}
+	// 删完之后清掉空目录 (例如 node-gyp/gyp/pylib/... 整棵)
+	const pruneEmpty = (d) => {
+		let entries;
+		try {
+			entries = fs.readdirSync(d, { withFileTypes: true });
+		} catch {
+			return true;
+		}
+		let empty = true;
+		for (const e of entries) {
+			const full = path.join(d, e.name);
+			if (e.isDirectory()) {
+				if (!pruneEmpty(full)) empty = false;
+			} else empty = false;
+		}
+		if (empty && d !== prefix) {
+			try {
+				fs.rmdirSync(d);
+			} catch {}
+		}
+		return empty;
+	};
+	pruneEmpty(prefix);
+
+	log(`  扫描 ${scanned} 个文件, 重写 ${total} 个 shebang, 删除 ${droppedFiles.length} 个`);
 	return total;
 }
 
