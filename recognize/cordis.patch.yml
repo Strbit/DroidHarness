@@ -1,0 +1,23 @@
+# Your patch layer for this dsh profile, applied after every bundle layer:
+# a top-level YAML array of loader patch entries (id-targeted config
+# overrides, disables, and insert lists; `!!js` expressions allowed).
+#
+# 屏幕识别: 让模型能"看见"这台手机自己的屏幕。
+#
+# 两条互补的识别路线(失效场景不重叠):
+#   · 无障碍树 (uiautomator dump) —— 精确文字 / 坐标 / 可点祖先。平台限制: 只作用于主屏
+#   · 屏幕图片 (screencap)       —— 支持任意屏(含虚拟副屏), 交给模型视觉理解
+#
+# 分层(为将来换 harness 做准备):
+#   /data/adb/dsh/tools/screen-mcp   独立 MCP 服务, 不绑 harness, 换 harness 一行不改
+#   @deepseek-ai/dsh-mcp-client      通用 MCP 适配器(DSH 自带), 只做协议翻译
+#
+# 工具以 mcp__screen__<name> 出现:
+#   mcp__screen__list_displays / __screen_tree / __screen_targets / __screen_image
+- insert:
+    - id: mcp-screen
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: screen
+        transport: stdio
+        command: /data/adb/dsh/tools/screen-mcp
