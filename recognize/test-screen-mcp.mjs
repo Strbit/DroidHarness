@@ -131,11 +131,20 @@ function report() {
   }
 
   // ── 5. #3 list_displays 必须报出屏信息 ────────────────
+  // 注意形态: 必须**先判 isError**, 不能写成 `if (r3 && !r3.result?.isError) { ... }` ——
+  // 那样 isError=true 时整段断言被静默跳过, 照样报"全部通过"。
+  // (这正是 @Strbit 在第二轮审阅里指出的: 真机上 #3 恰恰是 isError, 而输出仍报通过。)
+  // #4 用的是正确形态, 这里对齐。
   const r3 = byId.get(3);
-  if (r3 && !r3.result?.isError) {
-    const txt = (r3.result.content || []).find((x) => x.type === 'text')?.text || '';
-    if (!/displayId|surfaceFlingerId/.test(txt)) failures.push('#3 list_displays 输出里没有屏信息');
-    else notes.push('#3 list_displays: 解析出屏信息 ✓');
+  if (r3) {
+    const txt = (r3.result?.content || []).find((x) => x.type === 'text')?.text || '';
+    if (r3.result?.isError) {
+      failures.push('#3 list_displays 失败: ' + txt.split('\n')[0].slice(0, 200));
+    } else if (!/displayId|surfaceFlingerId/.test(txt)) {
+      failures.push('#3 list_displays 输出里没有屏信息');
+    } else {
+      notes.push('#3 list_displays: 解析出屏信息 ✓');
+    }
   }
 
   // ── 6. #4 screen_targets 必须成功（这是主路线）────────

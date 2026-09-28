@@ -225,9 +225,12 @@ recognize/
 │   ├── observe.mjs               识别引擎（屏状态/截屏/树/OCR/合并）
 │   ├── fields.mjs                字段有界化（head+tail 截断）+ 帧缓存（新鲜度契约）
 │   ├── spawn-env.mjs             子进程环境分类（系统二进制剔除 LD_LIBRARY_PATH）
+│   ├── displays.mjs              跨设备屏解析（只用两台真机都稳定的形态）
 │   └── ocr-windows.ps1           Windows OCR 后端（纯 ASCII）
 ├── launcher.sh                   设备侧启动脚本（POSIX sh，探测模块提供的 node 运行时）
 ├── cordis.patch.yml              接入 DSH 的 patch 配置（必须用 - insert: 包裹）
+├── test-displays.mjs             单元测试：跨设备屏解析（28 项）
+├── test-fixtures-displays.mjs    屏解析的夹具（注明每个样本的来源）
 ├── test-fields.mjs               单元测试：截断 / 有界化 / 缓存契约
 ├── test-spawn-env.mjs            单元测试：子进程环境分类（拦住 LD_LIBRARY_PATH 污染）
 ├── test-screen-image-cache.mjs   单元测试：screen_image 缓存链路
@@ -296,15 +299,42 @@ node recognize.mjs observe
 >
 > 换 harness 时改的是适配器层，识别内核一行不动。
 
-### 设备侧平台事实（实测于 Android 16 / arm64）
+### 设备侧平台事实（实测于 Android 16 / arm64，**两台设备**）
 
 | 事实 | 值 |
 |---|---|
 | `screencap` 用法 | `[-ahp] [-d display-id] [FILENAME]`；`-d` 收 SurfaceFlinger id；**不接受 `--display`** |
-| 默认 display id | `4630946903293830803`（64 位，但 < 2^53，JS 数字精度足够） |
+| 稳定锚点 | `DisplayDeviceInfo{...}` 段 —— OnePlus 与 Xiaomi **都有** |
+| **屏状态** | 必须锚定 `mState=`。裸 `state=` 在 OnePlus 上命中 **101 次**，绝大多数是 `BrightnessEvent` 历史行（含状态迁移记录）→ 会静默抓到历史值 |
+| 逻辑 id ↔ uniqueId | `mViewports=[DisplayViewport{... displayId=0, uniqueId='local:...'}]`（两台都有） |
 | `uiautomator dump --display` | **被静默忽略** —— 传不存在的 id 也成功并输出主屏的树 |
 | 由此的结论 | 主屏：树 + 图都可用；虚拟副屏：**只有图**，树需要 App 内 `AccessibilityService` |
 | 设备侧 OCR | 无 tesseract、无 ML Kit 入口 → 图片路线交给模型视觉，不在本地做 OCR |
+
+#### 跨设备适配：只用两台真机都稳定的形态
+
+这是 PR #11 第二轮的核心缺陷。**原实现只看 OnePlus 专属的这一种形态**：
+
+```
+Display 0 [id=local:4630...,stack=0],isFirst=true,activeMode=5,state=ON,...
+```
+
+它在 Xiaomi 25102RKBEC / Android 16 上 `grep -c` 命中 **0 次** → `list_displays` 整条工具失效。
+
+现在改用的稳定形态（见 [`lib/displays.mjs`](lib/displays.mjs)，28 项测试）：
+
+| 形态 | 来源 | 用途 |
+|---|---|---|
+| `DisplayDeviceInfo{...}` | 两台都有 | 尺寸 / 密度 / 唯一 id / 类型 |
+| `mState=` | 两台都有 | 真实屏状态（**不**用裸 `state=`） |
+| `mViewports` | 两台都有 | 逻辑 `displayId` ↔ `uniqueId` 映射 |
+| `dumpsys SurfaceFlinger --display-id` | 两台都有 | sfId 列表（`screencap -d` 要的） |
+
+`surfaceFlingerId` 直接从 `uniqueId` 去 `local:` 前缀推导 —— 两台实测一致（`local:4630946903293830803` / `local:4630946964337362323`）。
+
+**拿不到 `mViewports` 的机型**：`logicalId` 为 `null`（不编一个数），`list_displays` 打印 `displayId ?` 并提示用 `sfId` 指定屏。
+
+> **段边界的坑**：`dumpsys` 的顶层分组是**顶格行**，其后紧跟一条纯分隔线。最初把那条分隔线当成段尾，于是段内一行都没读到 —— 而测试没发现，**因为夹具里没放那条线**。现在夹具已对齐真机，并加了一条**直接喂真机 dump 文件**的回归测试，夹具再偏离现实也会被发现。
 
 ---
 
@@ -340,12 +370,18 @@ node 自身仍健康                 -> v26.4.0
 screencap 不受影响              -> 562471 / 563077 B（带与不带都能出图）
 ```
 
-单元测试（本机，无需设备）
+单元测试（本机，无需设备）—— 共 82 项
+  recognize.mjs selftest  : 11/11 通过（解析器 + 合并逻辑）
   test-fields             : 22/22 通过（head+tail 截断 / 数组有界化 / 缓存新鲜度契约）
   test-spawn-env          : 15/15 通过（子进程环境分类 —— 拦住上面设备 B 那个坑）
   test-screen-image-cache : 6/6 通过（screen_image 缓存链路 / 主副屏不串味）
+  test-displays           : 28/28 通过（跨设备屏解析 —— 只用两台真机都稳定的形态，
+                            含一条直接喂真机 dump 文件的回归）
   test-screen-mcp         : 端到端 MCP 协议，带断言（已实测"该失败时 exit=1"）
   bench-frame-path        : zlib 量化（level 1 = 21 ms, level 9 = 546 ms, 体积几乎一样）
+
+设备侧自检（device-selftest.mjs，在 OnePlus 上实跑）
+  6/6 通过：screencap / tmpfile / uitree / displays / ocr(符合设计) / loopback
 ```
 
 **未实测**：
@@ -357,8 +393,9 @@ screencap 不受影响              -> 562471 / 563077 B（带与不带都能出
 - OCR 对图标小字的准确率（PC 侧会误读成 `0@0`、`00` 之类噪声）
 - **帧缓存的真机收益**：设备上 `screencap -p` 的真实耗时（本机只有 zlib 量级，不是手机数字）
 - **JPEG 替代 PNG 的可行性**：需要先知道 `screencap` 无参数输出的原始格式 —— 没设备取不到
-- **设备 B 上修复后的完整端到端**：`run()` 的环境分类已在本机被 15 项断言覆盖，
-  但"在 Xiaomi 上装新模块并跑通四条工具"需要在设备上确认
+- **第三台设备的形态**：目前稳定形态只来自 OnePlus + Xiaomi 两台样本。
+  遇到别的厂商 ROM 时 `lib/displays.mjs` 的 `findSegment`/`parseDisplayDevices`
+  是唯一需要看的地方；解析不出来时会**明确报错**并说明期望的形态，不会兜底。
 
 ---
 
@@ -402,6 +439,28 @@ screencap 不受影响              -> 562471 / 563077 B（带与不带都能出
 
 9. **测试 runner 必须支持 async**。最初的 runner 是 `try { fn() }`，对 async 测试抓不到 rejection，
    7 个缓存测试的失败被静默吞掉（显示"22 通过"是假的）。现在是顺序 `await` 的 runner。
+
+10. **夹具会不知不觉偏离真机 —— 这是最隐蔽的一类问题。**
+    本轮踩了三次，每次都让测试"通过"但测的不是真机形态：
+
+    | 夹具偏离 | 后果 |
+    |---|---|
+    | `mState` 写在 `DisplayDeviceInfo` **之前** | 真机是之后；解析器只向后读，测不到真问题 |
+    | 少写段头后的分隔线 | 真机有；解析器把它当段尾，**段内一行都没读到** |
+    | `DisplayDeviceInfo` 块里多写了 `state ON` | 真机那个 `state` 不是状态来源，会诱使写错正则 |
+
+    对策：**加一条直接喂真机 dump 文件的回归测试**（`test-displays.mjs` 末尾那条）。
+    喂真机文件就不会被骗。另外每个夹具都注明来源（实机抓取 / 审阅者给的行）。
+
+11. **`execFileSync` 默认返回 Buffer，不是字符串。** `device-selftest.mjs` 里漏了 `encoding: 'utf8'`，
+    于是 `dumpsys` 的输出是 Buffer，传给解析器后报 `text.split is not a function` ——
+    看着像解析器的错，其实是调用方漏了一个参数。
+
+12. **同一段文本被两个正则处理时，作用域很容易搞混。**
+    `parseDisplayDevices` 里 `raw` 是 `DisplayDeviceInfo{` **之后**的内容，
+    但 name 正则写成了 `/DisplayDeviceInfo\s*\{\s*"([^"]*)"/` —— 在别处能匹配，在 `raw` 上永不匹配，
+    于是 `name` 恒为 `null`。而当时的测试只断言"解析出几块屏"，没查字段值，所以漏了过去。
+    → **断言要查字段值，不能只查数量。**
 
 ---
 

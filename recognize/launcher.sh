@@ -71,4 +71,22 @@ if [ ! -f "$SERVER" ]; then
     exit 127
 fi
 
+# ── 自备 LD_LIBRARY_PATH ────────────────────────────────────────
+# 模块自带的 node 是 Termux 编的, 需要 <模块>/usr/lib 里的 libz 等库,
+# 否则报 `library "libz.so.1" not found`。
+#
+# DSH 这条主路径上该变量本来就有(service.sh 导出, 服务进程继承),
+# 所以之前没暴露。但换一个不带该变量的 harness、或手动跑这个脚本时,
+# node 就起不来 —— 而本脚本的定位是"harness 中立", 应该自给自足。
+#
+# 只在缺失时补, 不覆盖已有值: 已有值可能包含调用方有意设置的其它路径。
+if [ -z "${LD_LIBRARY_PATH:-}" ]; then
+    # $NODE 形如 <模块>/usr/bin/node -> 库在 <模块>/usr/lib
+    NODE_PREFIX=$(cd "$(dirname "$NODE")/.." && pwd)
+    if [ -d "$NODE_PREFIX/lib" ]; then
+        LD_LIBRARY_PATH="$NODE_PREFIX/lib"
+        export LD_LIBRARY_PATH
+    fi
+fi
+
 exec "$NODE" "$SERVER"

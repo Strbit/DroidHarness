@@ -25,6 +25,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { FrameCache, truncateField, boundArray } from './lib/fields.mjs';
 import { runCommand } from './lib/spawn-env.mjs';
+import { parseDisplays } from './lib/displays.mjs';
 
 const PROTOCOL_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05', '2024-10-07'];
 const LATEST = PROTOCOL_VERSIONS[0];
@@ -55,48 +56,62 @@ function run(cmd, args, opts = {}) {
   return runCommand(cmd, args, { ...opts, spawnImpl: execFile });
 }
 
-/** 屏列表: 从 dumpsys display 解析, 运行时推导不硬编码 */
+/**
+ * 屏列表: 跨设备解析, 运行时推导不硬编码。
+ *
+ * 解析逻辑在 lib/displays.mjs —— 那是本轮修跨设备缺陷的地方, 有独立测试。
+ * 这里只负责取原始文本。
+ *
+ * 为什么改成这样: 旧实现只看 `Display 0 [id=local:...,stack=0],isFirst=true,...`,
+ * 而该形态在 Xiaomi 25102RKBEC / Android 16 上**一次都不存在**
+ * (grep 命中 0), 于是整个工具失效。现在只认两台真机都稳定的形态:
+ *   · DisplayDeviceInfo{...}  每块屏的尺寸/密度/唯一 id
+ *   · mState=                 真实屏状态（**不是**裸 state=, 那个有 100+ 条历史噪声）
+ *   · mViewports              逻辑 displayId ↔ uniqueId 映射
+ *   · SurfaceFlinger --display-id   sfId 列表
+ */
 async function listDisplays() {
   const out = { displays: [], wakefulness: null, error: null };
+  let dumpsysDisplay = '';
+  let surfaceFlinger = '';
+  let power = '';
+
   try {
-    const { stdout } = await run('/system/bin/dumpsys', ['display']);
-    // 形如: Display 0 [id=local:4630946903293830803,stack=0],isFirst=true,activeMode=5,state=ON,...
-    const re = /Display (\d+) \[id=([^,\]]+),stack=(-?\d+)\]([\s\S]*?)(?=\n\s*Display \d+ \[id=|$)/g;
-    let m;
-    while ((m = re.exec(stdout)) !== null) {
-      const seg = m[4];
-      const state = seg.match(/\bstate=([A-Z_]+)/);
-      const size = seg.match(/(\d+) x (\d+), modeId/);
-      const dens = seg.match(/\bdensity (\d+)/);
-      const fps = seg.match(/renderFrameRate ([\d.]+)/);
-      const nameMatch = seg.match(/DisplayDeviceInfo\{"([^"]*)"/);
-      out.displays.push({
-        logicalId: Number(m[1]),
-        // SurfaceFlinger(screencap -d) 用的 id。实测就是 dumpsys display 里的局部 id,
-        // 去掉 "local:" 前缀。64 位无符号, 但它 < 2^53 所以 JS 数字精度够。
-        surfaceFlingerId: m[2].replace(/^local:/, ''),
-        stack: Number(m[3]),
-        isFirst: /isFirst=true/.test(seg),
-        state: state ? state[1] : null,
-        width: size ? Number(size[1]) : null,
-        height: size ? Number(size[2]) : null,
-        density: dens ? Number(dens[1]) : null,
-        renderFrameRate: fps ? Number(fps[1]) : null,
-        name: nameMatch ? nameMatch[1] : null,
-      });
-    }
-    if (!out.displays.length) out.error = '未能从 dumpsys display 解析出任何屏';
-    // 默认屏: screencap 不带 -d 时用的那个
-    const first = out.displays.find((d) => d.isFirst) || out.displays[0];
-    out.defaultSurfaceFlingerId = first ? first.surfaceFlingerId : null;
+    dumpsysDisplay = (await run('/system/bin/dumpsys', ['display'])).stdout;
   } catch (e) {
     out.error = 'dumpsys display 失败: ' + e.message;
+    return out;
   }
+  // 这两段拿不到不致命: sfId 可从 uniqueId 前缀推导, 唤醒状态可为 null
   try {
-    const { stdout } = await run('/system/bin/dumpsys', ['power']);
-    const w = stdout.match(/mWakefulness=(\w+)/);
-    if (w) out.wakefulness = w[1];
-  } catch { /* 拿不到不致命 */ }
+    surfaceFlinger = (await run('/system/bin/dumpsys', ['SurfaceFlinger', '--display-id'])).stdout;
+  } catch { /* 忽略 */ }
+  try {
+    power = (await run('/system/bin/dumpsys', ['power'])).stdout;
+  } catch { /* 忽略 */ }
+
+  const parsed = parseDisplays({ dumpsysDisplay, surfaceFlinger, power });
+  out.displays = parsed.displays;
+  out.wakefulness = parsed.wakefulness;
+  out.defaultSurfaceFlingerId = parsed.defaultSurfaceFlingerId;
+  out.error = parsed.error;
+
+  // wm size / wm density 补充: 这是**逻辑**尺寸与密度覆盖, 与物理值可能不同
+  // (实测 OnePlus: 物理 560dpi, 覆盖 476)
+  try {
+    const wsz = (await run('/system/bin/wm', ['size'])).stdout;
+    const om = wsz.match(/Override size:\s*(\d+)x(\d+)/);
+    const pm = wsz.match(/Physical size:\s*(\d+)x(\d+)/);
+    out.wmOverride = om ? { width: Number(om[1]), height: Number(om[2]) } : null;
+    out.wmSize = pm ? { width: Number(pm[1]), height: Number(pm[2]) } : null;
+  } catch { /* 忽略 */ }
+  try {
+    const wd = (await run('/system/bin/wm', ['density'])).stdout;
+    const od = wd.match(/Override density:\s*(\d+)/);
+    const pd = wd.match(/Physical density:\s*(\d+)/);
+    out.wmDensity = { physical: pd ? Number(pd[1]) : null, override: od ? Number(od[1]) : null };
+  } catch { /* 忽略 */ }
+
   return out;
 }
 
@@ -418,12 +433,25 @@ async function toolsCall(name, args) {
     case 'list_displays': {
       const info = await listDisplays();
       if (info.error) return { isError: true, text: info.error };
-      const lines = info.displays.map((d) =>
-        `  displayId ${d.logicalId}${d.isFirst ? ' (主屏)' : ''}  ${d.name || ''}  ` +
-        `${d.width}x${d.height} @${d.density}dpi  ${d.renderFrameRate}fps  ` +
-        `状态=${d.state}  sfId=${d.surfaceFlingerId}`).join('\n');
+      const lines = info.displays.map((d) => {
+        // logicalId 可能为 null（拿不到 mViewports 映射的机型）—— 如实显示, 别编一个数
+        const lid = d.logicalId === null || d.logicalId === undefined ? '?' : d.logicalId;
+        const parts = [
+          `displayId ${lid}${d.isFirst ? ' (主屏)' : ''}`,
+          d.name || '(无名)',
+          `${d.width}x${d.height} @${d.density}dpi`,
+          d.renderFrameRate ? `${d.renderFrameRate}fps` : null,
+          `状态=${d.state ?? '未知'}`,
+          `sfId=${d.surfaceFlingerId}`,
+          d.type ? `type=${d.type}` : null,
+        ].filter(Boolean);
+        return '  ' + parts.join('  ');
+      }).join('\n');
+      const warn = info.displays.some((d) => d.logicalId === null || d.logicalId === undefined)
+        ? '\n⚠ 本机未提供 mViewports 映射，logicalId 显示为 ? —— 用 sfId 指定屏（screen_image 接受）'
+        : '';
       return {
-        text: `唤醒状态: ${info.wakefulness}\n共 ${info.displays.length} 块屏:\n${lines}\n\n` +
+        text: `唤醒状态: ${info.wakefulness ?? '未知'}\n共 ${info.displays.length} 块屏:\n${lines}${warn}\n\n` +
           JSON.stringify(info, null, 2),
       };
     }
