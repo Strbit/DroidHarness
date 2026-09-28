@@ -11,6 +11,7 @@ import {
   parseDisplays, parseDisplayDevices, parseSurfaceFlingerIds,
   parseViewports, parseWakefulness, mergeDisplaySources,
 } from './lib/displays.mjs';
+import { parseCmdDisplays, parseDisplaysPreferred } from './lib/cmd-display.mjs';
 import { ONEPLUS, XIAOMI, VIRTUAL_DISPLAY, MALFORMED, ALL } from './test-fixtures-displays.mjs';
 
 let pass = 0, fail = 0;
@@ -235,18 +236,32 @@ t('mState 在 DisplayDeviceInfo 之前时不猜状态（如实为 null）', () =
 
 g('对真机原始 dump 的回归（夹具若偏离现实，这里会失败）');
 
-t('真机 dump 文件能解析出屏（若文件存在）', () => {
-  // 这条测试的意义: 夹具是我手写的, 可能不知不觉偏离真机结构
-  // (已经发生过两次: 字段顺序、段头后的分隔线)。直接喂真机文件就不会被骗。
-  const p = 'D:\\DroidHarness-recon-20260926\\fixtures\\oneplus-dumpsys-display.txt';
-  if (!fs.existsSync(p)) {
-    console.log('      （跳过: 未找到真机 dump，属正常——该文件是调试期抓取的）');
-    return;
+// 夹具走**仓库内相对路径**，且缺文件时 fail（PR #11 第三轮 M2）：
+//   · 旧版硬编码了开发机绝对路径（违反"不硬编码"纪律），而夹具没进仓库 ——
+//     于是文件永远不存在、测试永远走 `return` 然后计为 [ OK ]，
+//     28 项通过里含一条空跑，而 README 把这条测试写成"夹具再偏离现实也会被发现"的对策。
+//   · 现在夹具在 recognize/fixtures/，缺文件就是**真的坏了**，必须报出来。
+const FIXTURE_DIR = new URL('./fixtures/', import.meta.url);
+const fx = (name) => new URL(name, FIXTURE_DIR);
+
+t('夹具文件都在仓库里（缺了就是坏了，不是"跳过"）', () => {
+  const required = [
+    'oneplus-cmd-display-get-displays.txt',
+    'oneplus-dumpsys-display.txt',
+    'oneplus-sf-display-id.txt',
+    'oneplus-dumpsys-power.txt',
+  ];
+  for (const name of required) {
+    ok(fs.existsSync(fx(name)), `夹具缺失: recognize/fixtures/${name}`);
   }
+  console.log(`      （${required.length} 份真机 dump 均在仓库内）`);
+});
+
+t('真机 dump 能解析出屏（dumpsys 兜底路径）', () => {
   const r = parseDisplays({
-    dumpsysDisplay: fs.readFileSync(p, 'utf8'),
-    surfaceFlinger: fs.readFileSync(p.replace('dumpsys-display', 'sf-display-id'), 'utf8'),
-    power: fs.readFileSync(p.replace('dumpsys-display', 'dumpsys-power'), 'utf8'),
+    dumpsysDisplay: fs.readFileSync(fx('oneplus-dumpsys-display.txt'), 'utf8'),
+    surfaceFlinger: fs.readFileSync(fx('oneplus-sf-display-id.txt'), 'utf8'),
+    power: fs.readFileSync(fx('oneplus-dumpsys-power.txt'), 'utf8'),
   });
   eq(r.error, null, `真机 dump 应能解析, 实际报错: ${r.error}`);
   ok(r.displays.length >= 1, '至少一块屏');
@@ -257,8 +272,71 @@ t('真机 dump 文件能解析出屏（若文件存在）', () => {
   ok(d.surfaceFlingerId, 'sfId 应解析出来');
   ok(['ON', 'OFF', 'DOZE', 'DOZE_SUSPEND'].includes(d.state), `状态应是合法枚举, 实际 ${d.state}`);
   // 真机里裸 state= 有 100+ 次命中, mState 只有 1 次 —— 状态必须来自后者
-  const rawNoise = (fs.readFileSync(p, 'utf8').match(/\bstate=[A-Z_]+/g) || []).length;
+  const rawNoise = (fs.readFileSync(fx('oneplus-dumpsys-display.txt'), 'utf8').match(/\bstate=[A-Z_]+/g) || []).length;
   ok(rawNoise > 50, `真机裸 state= 应有大量噪声, 实际 ${rawNoise} —— 若变少说明该测试的假设失效`);
+});
+
+t('真机 dump 能解析出屏（cmd-display 主路径）', () => {
+  // 主路径新增（第三轮 B1）：`cmd display get-displays` 是机器可读的，
+  // 2 行 vs dumpsys 的 985 行，且全文 `state` 只出现 1 次（dumpsys 有 101 处噪声）。
+  const ds = parseCmdDisplays(fs.readFileSync(fx('oneplus-cmd-display-get-displays.txt'), 'utf8'));
+  eq(ds.length, 1, '真机应有 1 块屏');
+  const d = ds[0];
+  eq(d.logicalId, 0);
+  eq(d.state, 'ON', 'state 必须来自 state 字段，不能撞 committedState');
+  eq(d.committedState, 'ON');
+  eq(d.surfaceFlingerId, '4630946903293830803', 'uniqueId 去 local: 前缀 = screencap 要的 sfId');
+  eq(d.realWidth, 1272); eq(d.realHeight, 2772);
+  eq(d.width, 1272, 'app 宽高（逻辑像素）');
+  eq(d.height, 2772, 'app 宽高（逻辑像素）');
+  eq(d.type, 'INTERNAL');
+  eq(d.name, '内置屏幕');
+  eq(d.isFirst, true, 'logicalId=0 即默认屏');
+});
+
+t('cmd display 的字段正则不能被同行其他字段撞到', () => {
+  // 这个 bug 实测踩到过：裸 `\bapp\s+(\d+)x(\d+)` 会先命中
+  // `largest app 2772 x 2772`，于是解析出 width=2772 height=2772（错）。
+  // 必须用「逗号/行首 + 字段名」锚定。
+  const ds = parseCmdDisplays(fs.readFileSync(fx('oneplus-cmd-display-get-displays.txt'), 'utf8'));
+  const d = ds[0];
+  ok(d.width !== 2772 || d.height !== 2772,
+    `width/height 撞到了 largest app: ${d.width}x${d.height}`);
+  eq(d.width, 1272, 'width 应是 app 1272（不是 largest app 2772）');
+  // real 同理不能被 largestAppWidth 之类干扰
+  eq(d.realWidth, 1272);
+});
+
+t('cmd display 主路径与 dumpsys 兜底路径结论一致', () => {
+  const viaCmd = parseCmdDisplays(fs.readFileSync(fx('oneplus-cmd-display-get-displays.txt'), 'utf8'))[0];
+  const viaDumpsys = parseDisplays({
+    dumpsysDisplay: fs.readFileSync(fx('oneplus-dumpsys-display.txt'), 'utf8'),
+    surfaceFlinger: fs.readFileSync(fx('oneplus-sf-display-id.txt'), 'utf8'),
+    power: fs.readFileSync(fx('oneplus-dumpsys-power.txt'), 'utf8'),
+  }).displays[0];
+  eq(viaCmd.surfaceFlingerId, viaDumpsys.surfaceFlingerId, 'sfId 两条路必须一致');
+  eq(viaCmd.state, viaDumpsys.state, 'state 两条路必须一致');
+  eq(viaCmd.logicalId, viaDumpsys.logicalId, 'logicalId 两条路必须一致');
+});
+
+t('parseDisplaysPreferred: 主路径失效才退回兜底，两条都失效就报错', () => {
+  const cmd = fs.readFileSync(fx('oneplus-cmd-display-get-displays.txt'), 'utf8');
+  const dd = fs.readFileSync(fx('oneplus-dumpsys-display.txt'), 'utf8');
+  const sf = fs.readFileSync(fx('oneplus-sf-display-id.txt'), 'utf8');
+  const pw = fs.readFileSync(fx('oneplus-dumpsys-power.txt'), 'utf8');
+
+  const a = parseDisplaysPreferred({ cmdDisplay: cmd, dumpsysDisplay: dd, surfaceFlinger: sf, power: pw }, parseDisplays);
+  eq(a.source, 'cmd-display', '有 cmd 输出时应走主路径');
+  eq(a.displays.length, 1);
+
+  const b = parseDisplaysPreferred({ cmdDisplay: '', dumpsysDisplay: dd, surfaceFlinger: sf, power: pw }, parseDisplays);
+  eq(b.source, 'dumpsys', 'cmd 空时应退回兜底');
+  eq(b.displays.length, 1);
+
+  const c = parseDisplaysPreferred({ cmdDisplay: '', dumpsysDisplay: 'garbage', surfaceFlinger: '', power: '' }, parseDisplays);
+  eq(c.displays.length, 0, '两条都失效时不能兜底编造屏');
+  ok(c.error, '两条都失效必须有明确 error');
+  eq(c.source, null);
 });
 
 t('每块屏都要解析出 name（不能用永不匹配的正则）', () => {
