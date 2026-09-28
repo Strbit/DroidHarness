@@ -58,6 +58,26 @@ listening() {
 	netstat -tln 2>/dev/null | grep -q ":$PORT "
 }
 
+# ── 打印日志时的 token 掩码 (B6 的收尾) ──────────────────────
+# dsh web 每次启动会把**当前有效**的 token 明文写一行到日志里。日志文件本身
+# 0600, 真正的泄漏发生在"把日志打到屏幕上给人看 / 截图求助"这一步:
+#   · dshctl log  (用户主动看日志)
+#   · start 失败分支的 tail -n 20  (状态卡里就带着)
+# 实测 (这台设备): 旧 token 已失效 (HTTP 401), 只有最后那次启动的是活的
+# (HTTP 303) —— 所以掩码要防的是**当前**那一个, 不是历史凭证.
+#
+# 只掩码"展示"这一层, 不改日志文件: 上游 dsh web 没有 quiet 参数, 而在
+# service.sh 里给 node 套管道会破坏它靠 $? 做的熔断 (上一轮实测确认过).
+mask_token() {
+	sed -E 's#(token=)[A-Za-z0-9_-]+#\1<已掩码: dshctl token>#g'
+}
+
+# 取当前有效 token (从日志最后一条取). 单独一个 verb, 是为了让"看 token"
+# 成为一次**显式**动作 —— 它不该在随便看看日志时就滚到屏幕上.
+current_token() {
+	grep -o 'token=[A-Za-z0-9_-]*' "$LOG" 2>/dev/null | tail -1 | cut -d= -f2
+}
+
 # HTTP 层就绪判据。实测证据 (冷启动逐 0.5s 采样, 同一台设备):
 #
 #     +10s listen=0  HTTP=000
@@ -129,11 +149,11 @@ start)
 	elif running; then
 		# 进程活着但 25 秒没听到端口: 这是另一种故障, 别和"没起来"混成一条文案.
 		echo "进程在, 但 $PORT 端口 25 秒内没就绪 (最后一次 HTTP=$LAST_CODE) —— 可能在等什么, 看日志:"
-		tail -n 20 "$LOG" 2>/dev/null
+		tail -n 20 "$LOG" 2>/dev/null | mask_token
 		exit 1
 	else
 		echo "启动后没看到进程, 看日志:"
-		tail -n 20 "$LOG" 2>/dev/null
+		tail -n 20 "$LOG" 2>/dev/null | mask_token
 		exit 1
 	fi
 	;;
@@ -196,10 +216,31 @@ status)
 log)
 	n=${2:-40}
 	if [ -f "$LOG" ]; then
-		tail -n "$n" "$LOG"
+		tail -n "$n" "$LOG" | mask_token
 	else
 		echo "还没有日志: $LOG"
 	fi
+	;;
+
+token)
+	# 显式取当前有效 token. 这是**唯一**会把它打到屏幕上的入口 ——
+	# log / status / 失败分支一律走 mask_token, 免得"随手看一眼"就把它带出去.
+	T=$(current_token)
+	if [ -z "$T" ]; then
+		echo "日志里还没有 token ($LOG): DSH 大概没起来过, 试 dshctl log 20"
+		exit 1
+	fi
+	echo "$T"
+	;;
+
+url)
+	# 整条可直接打开的链接 (含 token). 和 token 一样是显式动作.
+	T=$(current_token)
+	if [ -z "$T" ]; then
+		echo "日志里还没有 token ($LOG)"
+		exit 1
+	fi
+	echo "http://127.0.0.1:$PORT/?token=$T"
 	;;
 
 forward)
@@ -223,7 +264,9 @@ forward)
 	echo "  restart    重启"
 	echo "  status     是否在跑, 监听哪里"
 	echo "  running    只用退出码表态 (给脚本用, 不打印)"
-	echo "  log [n]    看日志 (默认 40 行)"
+	echo "  log [n]    看日志 (默认 40 行; token 已掩码)"
+	echo "  token      打印当前有效 token (显式动作)"
+	echo "  url        打印可直接打开的完整链接 (含 token)"
 	echo "  forward    打印 PC 侧该敲的 adb forward 命令"
 	;;
 esac
