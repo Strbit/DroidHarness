@@ -139,7 +139,8 @@ while [ $_i -lt 15 ] && ! netstat -tln 2>/dev/null | grep -q ":$PORT "; do
 	_i=$((_i + 1))
 done
 if netstat -tln 2>/dev/null | grep -q ":$PORT "; then
-	echo "[$(date)] 端口已监听 $HOST:$PORT (等端口 ${_i}s); HTTP 就绪时刻见 dshctl status" >>"$LOG"
+	# 给人抄的命令一律绝对路径: su -c 的 PATH 是空的, 裸 "dshctl status" 抄进去跑不通.
+	echo "[$(date)] 端口已监听 $HOST:$PORT (等端口 ${_i}s); HTTP 就绪时刻见 $MODDIR/bin/dshctl status" >>"$LOG"
 elif sh "$MODDIR/bin/dshctl" running; then
 	echo "[$(date)] 进程在, 但端口 $PORT 15 秒内没打开, 看上面日志" >>"$LOG"
 else

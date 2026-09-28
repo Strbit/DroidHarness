@@ -1,17 +1,22 @@
 #!/system/bin/sh
 # dshctl — 控制 DSH 的启停
 #
-# 用法:
-#   dshctl toggle     反向切换 (KernelSU「执行」按钮走这条)
-#   dshctl start      拉起 (后台)
-#   dshctl stop       停掉 (含监督进程)
-#   dshctl restart
-#   dshctl status     是否在跑, 监听哪里
-#   dshctl running    只用退出码表态 (给脚本用, 不打印)
-#   dshctl log [n]    看日志 (默认 40 行)
-#   dshctl forward    打印在 PC 上该敲的 adb forward 命令
+# 用法 (以激活后的绝对路径写; 实测 `su -c` 起来的 shell **PATH 是空的**,
+# 且本模块没有 system/ 目录 → 裸 `dshctl` 抄进去跑不通):
+#   /data/adb/modules/dsh_android/bin/dshctl <命令>
 #
-# 在手机上 (adb shell su -c 'dshctl status') 或经 Termux 都能用.
+# 命令:
+#   toggle     反向切换 (KernelSU「执行」按钮走这条)
+#   start      拉起 (后台)
+#   stop       停掉 (含监督进程)
+#   restart
+#   status     是否在跑, 监听哪里
+#   running    只用退出码表态 (给脚本用, 不打印)
+#   log [n]    看日志 (默认 40 行; token 已掩码)
+#   token      打印当前有效 token (显式动作)
+#   url        打印可直接打开的完整链接 (含 token)
+#   forward    打印在 PC 上该敲的 adb forward 命令
+#
 # 启停逻辑只有这一份: action.sh (KernelSU 的「执行」按钮) 和 service.sh
 # 都调本脚本, 免得按钮、开机脚本、命令行三套实现各自漂移.
 
@@ -20,6 +25,8 @@ DSH_HOME_DIR=/data/adb/dsh
 LOG="$DSH_HOME_DIR/logs/dsh.log"
 PIDFILE="$DSH_HOME_DIR/supervisor.pid"
 PORT=3080
+# 面向人的提示里用绝对路径: su -c 起的 shell PATH 是空的, 裸 "dshctl" 抄不通.
+ME="$MODDIR/bin/dshctl"
 
 # ── 识别串: 全模块唯一一份 ──────────────────────────────────
 # 写成 '[@]deepseek-...' 而不是 '@deepseek-...'. 作为 ERE 两者都匹配目标
@@ -176,7 +183,7 @@ stop)
 	done
 	sleep 1
 	if running; then
-		echo "仍有进程存活, 请手动检查: dshctl status"
+		echo "仍有进程存活, 请手动检查: $ME status"
 		exit 1
 	fi
 	echo "已停止"
@@ -209,7 +216,7 @@ status)
 		fi
 	else
 		echo "状态: 未运行"
-		echo "用 dshctl start 拉起, 或重启手机让 service.sh 自动拉起"
+		echo "用 $ME start 拉起, 或重启手机让 service.sh 自动拉起"
 	fi
 	;;
 
@@ -227,7 +234,7 @@ token)
 	# log / status / 失败分支一律走 mask_token, 免得"随手看一眼"就把它带出去.
 	T=$(current_token)
 	if [ -z "$T" ]; then
-		echo "日志里还没有 token ($LOG): DSH 大概没起来过, 试 dshctl log 20"
+		echo "日志里还没有 token ($LOG): DSH 大概没起来过, 试 $ME log 20"
 		exit 1
 	fi
 	echo "$T"
@@ -254,9 +261,9 @@ forward)
 	;;
 
 *)
-	echo "dshctl — 控制 DSH 的启停"
+	echo "$ME — 控制 DSH 的启停"
 	echo ""
-	echo "用法: dshctl <命令>"
+	echo "用法: $ME <命令>"
 	echo ""
 	echo "  toggle     反向切换 (KernelSU「执行」按钮用这条)"
 	echo "  start      拉起 (后台)"

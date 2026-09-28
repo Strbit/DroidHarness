@@ -98,8 +98,9 @@ if [ "$WAS_RUNNING" = 1 ]; then
 	echo "已关闭。想再用: 再按一次这个按钮。"
 else
 	echo "手机上直接开:  http://127.0.0.1:$PORT"
-	echo "  (要先取 token:  su -c 'dshctl url'  会打印一条带 token 的完整链接)"
-	echo "  日志里的 token 已掩码, 只有 dshctl url / dshctl token 给出真值。"
+	echo "  带 token 的完整链接:  su -c '$DSHCTL url'"
+	# 提示里写 $DSHCTL 不写裸 "dshctl": su -c 的 PATH 是空的, 裸命令抄进去跑不通.
+	echo "  (日志里的 token 已掩码, 只有 $DSHCTL url / $DSHCTL token 给出真值)"
 	echo "从 PC 开:      adb forward tcp:$PORT tcp:$PORT"
 	echo "               然后浏览器访问上面那条链接"
 fi
@@ -124,7 +125,7 @@ if [ "$WAS_RUNNING" = 1 ]; then
 	fi
 elif ! sh "$DSHCTL" running; then
 	echo ""
-	echo "!! 执行后仍没起来, 切换失败 —— 试试 dshctl log 40"
+	echo "!! 执行后仍没起来, 切换失败 —— 试试 su -c '$DSHCTL log 40'"
 	exit 1
 fi
 

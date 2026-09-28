@@ -292,13 +292,25 @@ esac
 # 收尾: 确认没有污染安装器的 TMPDIR (那会害安装器删错目录)
 ui_print "  (安装器 TMPDIR = ${TMPDIR:-未设} —— 不应是 /data/local/tmp)"
 
+# ── 结尾提示: 这里印的每一条命令都必须是**能直接抄着跑**的 ──────────
+#
+# 为什么全用绝对路径: 实测 `su -c` 起来的 shell **PATH 是空的**
+# (adb shell 里 `su -c 'echo $PATH'` -> 空串), 而本模块没有 system/ 目录,
+# 也就不会被 magic mount 挂进 /system/bin。所以之前那句"dsh 已在 PATH 上"
+# 是假的 —— `su -c 'command -v dsh'` 直接报找不到。同理裸写 `dshctl url`
+# 也抄不通。激活后的固定路径就是 /data/adb/modules/<id>/bin/。
+# MODID 由安装器注入; 万一没有, 兜底用 module.prop 里那个固定的 id。
+CTL="/data/adb/modules/${MODID:-dsh_android}/bin/dshctl"
+DSHBIN="/data/adb/modules/${MODID:-dsh_android}/bin/dsh"
 ui_print " "
 ui_print "*********************************************"
 ui_print " 安装完成. 重启后 service.sh 会拉起 DSH."
 ui_print " 日志: $DSH_HOME_DIR/logs/dsh.log"
-ui_print " 控制: dshctl start|stop|status|log"
-ui_print " 命令行: dsh plugin --profile web list   (dsh 已在 PATH 上)"
-ui_print " 访问: PC 上 adb forward tcp:3080 tcp:3080"
-ui_print "       然后浏览器开 http://127.0.0.1:3080"
+ui_print " 控制: su -c '$CTL start|stop|status|log|token|url'"
+ui_print " 命令行: su -c '$DSHBIN plugin --profile web list'"
+# 别写"浏览器开 http://127.0.0.1:3080" 就完事: 不带 token 直接开只会得到一个 401,
+# 然后人就以为没装好。入口给成 url —— 它打出的就是能直接用的整条链接。
+ui_print " 访问: 手机上 su -c '$CTL url'  取带 token 的完整链接"
+ui_print "       PC 上再加一步 adb forward tcp:3080 tcp:3080"
 ui_print "*********************************************"
 ui_print " "
