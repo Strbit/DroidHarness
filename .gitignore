@@ -28,3 +28,6 @@ Desktop.ini
 dsh/module/app/
 dsh/module/usr/
 
+
+# android-probe 的构建产物（dex 由 tools/build-probe.mjs 生成）
+android-probe/dist/

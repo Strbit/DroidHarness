@@ -1,0 +1,5 @@
+OK|list-displays
+SOURCE|DisplayManagerGlobal
+COUNT|1
+DISPLAY|0|name=内置屏幕|uniqueId=local:4630946903293830803|type=1|state=4|rotation=0|modeId=3|renderFrameRate=90.0|logicalWidth=1272|logicalHeight=2772|appWidth=1272|appHeight=2772|logicalDensityDpi=476|flags=16515|displayGroupId=0|displayId=0
+END
