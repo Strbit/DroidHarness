@@ -339,6 +339,27 @@ t('parseDisplaysPreferred: 主路径失效才退回兜底，两条都失效就�
   eq(c.source, null);
 });
 
+t('面板能力字段齐全（R-6：模型不必自己去挖 dumpsys）', () => {
+  // 起因：真机上模型拿到 list_displays 后**又自己跑了一次 dumpsys display 挖了 20KB**，
+  // 因为返回里缺 HDR / 亮度 / 色彩模式 / 物理尺寸。这些字段 cmd display 本来就有。
+  const d = parseCmdDisplays(fs.readFileSync(fx('oneplus-cmd-display-get-displays.txt'), 'utf8'))[0];
+  eq(d.displayGroupId, 0, 'displayGroupId');
+  eq(d.colorMode, 0, 'colorMode');
+  eq(d.supportedColorModes, [0, 7, 9], 'supportedColorModes');
+  eq(d.isForceSdr, false, 'isForceSdr');
+  eq(d.canHostTasks, true, 'canHostTasks');
+  // installOrientation 是 ROTATION_0 —— 正则用 [A-Z_]+ 会被截成 "ROTATION_"
+  eq(d.installOrientation, 'ROTATION_0', 'installOrientation 必须含数字（[A-Z0-9_]+）');
+  ok(d.hdrCapabilities, 'hdrCapabilities 应解析出来');
+  eq(d.hdrCapabilities.supportedTypes, [1, 2, 3, 4], 'HDR 类型');
+  eq(d.hdrCapabilities.maxLuminance, 2000, '峰值亮度');
+  eq(d.brightness.minimum, 0.016, '亮度下限');
+  eq(d.brightness.maximum, 1, '亮度上限');
+  eq(d.brightness.default, 1823.9003, '默认亮度');
+  eq(d.realWidth, 1272, '物理宽');
+  eq(d.realHeight, 2772, '物理高');
+});
+
 t('每块屏都要解析出 name（不能用永不匹配的正则）', () => {
   // 这个 bug 真踩了: name 正则写成了 /DisplayDeviceInfo\s*\{\s*"([^"]*)"/,
   // 但跑它的作用域里 `DisplayDeviceInfo{` 已被剥掉, 于是恒为 null ——

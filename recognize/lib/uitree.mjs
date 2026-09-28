@@ -142,6 +142,12 @@ export function labelOf(node) {
  *   判据应该是"有没有值得动手的节点", 不是"树是否为空"。
  */
 export function isUsefulTree(parsed) {
+  // 同 toTargets：入口先校验，避免深处抛 TypeError（R-3 加固）
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.nodes)) {
+    throw new TypeError(
+      `isUsefulTree 需要一个带 .nodes 数组的解析结果对象，收到的是 ` +
+      `${parsed === null ? 'null' : Array.isArray(parsed) ? '数组' : typeof parsed}`);
+  }
   const actionable = parsed.nodes.filter((n) =>
     (n.clickable || n.longClickable || n.scrollable || n.checkable) ||
     (labelOf(n) && n.depth > 0));
@@ -170,6 +176,18 @@ export function isUsefulTree(parsed) {
  * 三个目标全保留）。所以这里按 bounds 算出来，而不是留给调用方各自补。
  */
 export function toTargets(parsed, { includeDisabled = false } = {}) {
+  // R-3 加固：这里曾经因为调用方传了**节点数组**而不是解析结果对象而崩
+  // （recognize.mjs:81 的 `toTargets(t.nodes)` -> `for...of undefined`）。
+  // 与其让它在深处抛 TypeError，不如在入口给出说得清的错 —— 含实际收到的类型与键。
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.nodes)) {
+    const got = parsed === null ? 'null'
+      : Array.isArray(parsed) ? `数组(长度 ${parsed.length})`
+        : typeof parsed === 'object' ? `对象(键: ${Object.keys(parsed).slice(0, 8).join(', ') || '无'})`
+          : typeof parsed;
+    throw new TypeError(
+      `toTargets 需要一个带 .nodes 数组的解析结果对象，收到的是 ${got}。` +
+      `（常见误用：把 parsed.nodes 数组本身传了进来 —— 传 parsed 即可）`);
+  }
   const out = [];
   for (const n of parsed.nodes) {
     const clickableAncestor = n.clickableAncestorIndices.length

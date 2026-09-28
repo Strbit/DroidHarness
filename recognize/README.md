@@ -30,10 +30,12 @@
 ```powershell
 cd recognize
 
-# 不连设备也能跑的测试
+# 不连设备也能跑的测试（共 89 项）
 node recognize.mjs selftest        # 解析器 + 合并逻辑（11 项）
 node test-fields.mjs               # 截断 / 有界化 / 缓存新鲜度契约（22 项）
+node test-spawn-env.mjs            # 子进程环境分类（15 项）
 node test-screen-image-cache.mjs   # screen_image 缓存链路（6 项）
+node test-displays.mjs             # 跨设备屏解析 + 真机 dump 回归（34 项）
 node bench-frame-path.mjs          # 帧路径编码代价量化
 
 # 需要设备
@@ -42,14 +44,17 @@ node recognize.mjs observe         # 一次完整识别（两条路都跑并合�
 node recognize.mjs tree            # 只看无障碍树
 node recognize.mjs ocr             # 只看图像识别
 node recognize.mjs targets --limit 30   # 只输出可操作目标清单
+
+# 需要设备的测试（无设备时**明确失败**，不会静默通过）
+$env:ADB = "D:\platform-tools\adb.exe"
+node test-serve.mjs                # PC 侧 CLI 的逐行 JSON 协议（5 项断言）
+node test-screen-mcp.mjs --exec $env:ADB shell `
+  "export LD_LIBRARY_PATH=/data/adb/modules/dsh_android/usr/lib; exec /data/adb/modules/dsh_android/usr/bin/node /data/adb/dsh/tools/screen-mcp.mjs"
 ```
 
-> 真机上的 MCP 协议测试（需设备）：
-> ```powershell
-> $adb = "D:\platform-tools\adb.exe"
-> $node = "/data/adb/modules/dsh_android/usr/bin/node"
-> node test-screen-mcp.mjs --exec $adb shell "$node /data/adb/dsh/tools/screen-mcp.mjs"
-> ```
+> `test-displays.mjs` 会读 `fixtures/` 里的**真机 dump**。缺文件时**判 fail**（不是跳过）——
+> 因为那条测试的作用就是"夹具偏离现实时被发现"，跳过就等于没守。
+> 夹具入库时 `.gitattributes` 会把 CRLF 转成 LF，这一点已实测两种行尾解析结果一致。
 
 ### 参数
 
@@ -225,18 +230,24 @@ recognize/
 │   ├── observe.mjs               识别引擎（屏状态/截屏/树/OCR/合并）
 │   ├── fields.mjs                字段有界化（head+tail 截断）+ 帧缓存（新鲜度契约）
 │   ├── spawn-env.mjs             子进程环境分类（系统二进制剔除 LD_LIBRARY_PATH）
-│   ├── displays.mjs              跨设备屏解析（只用两台真机都稳定的形态）
+│   ├── cmd-display.mjs           屏解析主路径（cmd display get-displays）+ 统一入口
+│   ├── displays.mjs              屏解析兜底路径（dumpsys display）
 │   └── ocr-windows.ps1           Windows OCR 后端（纯 ASCII）
+├── fixtures/                     真机原始 dump（测试用，缺文件即 fail）
+│   ├── oneplus-cmd-display-get-displays.txt   主路径样本
+│   ├── oneplus-dumpsys-display.txt            兜底路径样本（985 行）
+│   ├── oneplus-sf-display-id.txt
+│   └── oneplus-dumpsys-power.txt
 ├── launcher.sh                   设备侧启动脚本（POSIX sh，探测模块提供的 node 运行时）
 ├── cordis.patch.yml              接入 DSH 的 patch 配置（必须用 - insert: 包裹）
-├── test-displays.mjs             单元测试：跨设备屏解析（28 项）
-├── test-fixtures-displays.mjs    屏解析的夹具（注明每个样本的来源）
-├── test-fields.mjs               单元测试：截断 / 有界化 / 缓存契约
-├── test-spawn-env.mjs            单元测试：子进程环境分类（拦住 LD_LIBRARY_PATH 污染）
-├── test-screen-image-cache.mjs   单元测试：screen_image 缓存链路
-├── test-serve.mjs                测试：PC 侧 CLI 的逐行 JSON 服务协议
-├── test-screen-mcp.mjs           端到端：MCP 协议（带断言，可真机跑）
-├── device-selftest.mjs           设备侧自检（原语可用性）
+├── test-displays.mjs             单元测试：跨设备屏解析（34 项，含真机 dump 回归）
+├── test-fixtures-displays.mjs    手写夹具（注明每个样本的来源；真机 dump 在 fixtures/）
+├── test-fields.mjs               单元测试：截断 / 有界化 / 缓存契约（22 项）
+├── test-spawn-env.mjs            单元测试：子进程环境分类（15 项，拦住 LD_LIBRARY_PATH 污染）
+├── test-screen-image-cache.mjs   单元测试：screen_image 缓存链路（6 项）
+├── test-serve.mjs                PC 侧 CLI 的逐行 JSON 协议（**需要设备**，5 项断言）
+├── test-screen-mcp.mjs           端到端：MCP 协议（**需要设备**，6 项断言）
+├── device-selftest.mjs           设备侧自检（走 spawn-env，含归因）
 ├── bench-frame-path.mjs          帧路径性能量化
 └── README.md
 ```
@@ -299,19 +310,19 @@ node recognize.mjs observe
 >
 > 换 harness 时改的是适配器层，识别内核一行不动。
 
-### 设备侧平台事实（实测于 Android 16 / arm64，**两台设备**）
+### 设备侧平台事实（Android 16 / arm64）
 
 | 事实 | 值 |
 |---|---|
 | `screencap` 用法 | `[-ahp] [-d display-id] [FILENAME]`；`-d` 收 SurfaceFlinger id；**不接受 `--display`** |
-| 稳定锚点 | `DisplayDeviceInfo{...}` 段 —— OnePlus 与 Xiaomi **都有** |
+| 稳定锚点 | `cmd display get-displays`（机器可读，2 行）；`DisplayDeviceInfo{...}` 段作为 dumpsys 兜底 |
 | **屏状态** | 必须锚定 `mState=`。裸 `state=` 在 OnePlus 上命中 **101 次**，绝大多数是 `BrightnessEvent` 历史行（含状态迁移记录）→ 会静默抓到历史值 |
 | 逻辑 id ↔ uniqueId | `mViewports=[DisplayViewport{... displayId=0, uniqueId='local:...'}]`（两台都有） |
 | `uiautomator dump --display` | **被静默忽略** —— 传不存在的 id 也成功并输出主屏的树 |
 | 由此的结论 | 主屏：树 + 图都可用；虚拟副屏：**只有图**，树需要 App 内 `AccessibilityService` |
 | 设备侧 OCR | 无 tesseract、无 ML Kit 入口 → 图片路线交给模型视觉，不在本地做 OCR |
 
-#### 跨设备适配：只用两台真机都稳定的形态
+#### 跨设备适配：先换命令，再谈"多收几台样本"
 
 这是 PR #11 第二轮的核心缺陷。**原实现只看 OnePlus 专属的这一种形态**：
 
@@ -321,7 +332,7 @@ Display 0 [id=local:4630...,stack=0],isFirst=true,activeMode=5,state=ON,...
 
 它在 Xiaomi 25102RKBEC / Android 16 上 `grep -c` 命中 **0 次** → `list_displays` 整条工具失效。
 
-现在改用的稳定形态（见 [`lib/displays.mjs`](lib/displays.mjs)，28 项测试）：
+现在改用的稳定形态（见 [`lib/displays.mjs`](lib/displays.mjs) 与 [`lib/cmd-display.mjs`](lib/cmd-display.mjs)，34 项测试）：
 
 | 形态 | 来源 | 用途 |
 |---|---|---|
@@ -340,7 +351,7 @@ Display 0 [id=local:4630...,stack=0],isFirst=true,activeMode=5,state=ON,...
 
 ## 已实测 / 未实测
 
-**已实测 —— 两台设备**：
+**已实测**：
 
 **设备 A：OnePlus PLK110 · Android 16 · KernelSU v3.3.0**（`u:r:ksu:s0` + Enforcing）
 
@@ -370,12 +381,12 @@ node 自身仍健康                 -> v26.4.0
 screencap 不受影响              -> 562471 / 563077 B（带与不带都能出图）
 ```
 
-单元测试（本机，无需设备）—— 共 82 项
+单元测试（本机，无需设备）—— 共 89 项
   recognize.mjs selftest  : 11/11 通过（解析器 + 合并逻辑）
   test-fields             : 22/22 通过（head+tail 截断 / 数组有界化 / 缓存新鲜度契约）
   test-spawn-env          : 15/15 通过（子进程环境分类 —— 拦住上面设备 B 那个坑）
   test-screen-image-cache : 6/6 通过（screen_image 缓存链路 / 主副屏不串味）
-  test-displays           : 28/28 通过（跨设备屏解析 —— 只用两台真机都稳定的形态，
+  test-displays           : 34/34 通过（跨设备屏解析 —— 主路径 cmd display，dumpsys 兜底，
                             含一条直接喂真机 dump 文件的回归）
   test-screen-mcp         : 端到端 MCP 协议，带断言（已实测"该失败时 exit=1"）
   bench-frame-path        : zlib 量化（level 1 = 21 ms, level 9 = 546 ms, 体积几乎一样）
@@ -386,16 +397,117 @@ screencap 不受影响              -> 562471 / 563077 B（带与不带都能出
 
 **未实测**：
 
-- Redmi K90 Pro Max / HyperOS 3（文档里的另一台目标设备）—— 尚未接入
+- **Redmi K90 Pro Max / HyperOS 3（`25102RKBEC` / Android 16）——
+  只跑到「暴露问题」，没跑到「确认稳定」。**
+  @Strbit 用它做端到端复核，暴露了 `LD_LIBRARY_PATH` 与 `list_displays` 两个跨设备缺陷
+  （这两条的修复都因此而来），也确认了修复后 `screen_targets` 可用；
+  但那条 `DisplayDeviceInfo` 稳定形态**我方没有该机的原始 dump 可核**，
+  所以它不算"已验证的第二样本"，只算"已确认能暴露缺陷的设备"。
+  仓库 `fixtures/` 里留档的仍是 OnePlus 的 dump。
 - 加固应用、游戏等"没用的树"场景
 - 虚拟副屏的实际截图（设备上无副屏可测）
 - 视觉模型读截图的端到端效果（需要模型侧实际调用一次）
 - OCR 对图标小字的准确率（PC 侧会误读成 `0@0`、`00` 之类噪声）
 - **帧缓存的真机收益**：设备上 `screencap -p` 的真实耗时（本机只有 zlib 量级，不是手机数字）
 - **JPEG 替代 PNG 的可行性**：需要先知道 `screencap` 无参数输出的原始格式 —— 没设备取不到
-- **第三台设备的形态**：目前稳定形态只来自 OnePlus + Xiaomi 两台样本。
-  遇到别的厂商 ROM 时 `lib/displays.mjs` 的 `findSegment`/`parseDisplayDevices`
+- **第三台设备的形态**：稳定形态目前**只有 OnePlus 一份经我方核实的原始 dump**。
+  遇到别的厂商 ROM 时 `lib/displays.mjs` 的 `findSegment` / `parseDisplayDevices`
   是唯一需要看的地方；解析不出来时会**明确报错**并说明期望的形态，不会兜底。
+- **副屏的无障碍树**：`uiautomator dump --display` 被平台静默忽略，
+  所以副屏**只有截图、没有树**。这是正则解决不了的，需要 App 内的
+  `AccessibilityService.getWindowsOnAllDisplays()`（见下面「架构方向」）。
+
+---
+
+## 架构方向：从「解析文本」转向「调 API」（已做最小验证，未落地）
+
+这一节记录一个**方向性判断**与它的实测依据，供后续决定。**当前代码没有走这条路。**
+
+### 为什么现在这套脆弱
+
+这个模块真正脆的地方**只有"屏枚举"一处**：`screencap` / `uiautomator` 是平台二进制、
+CLI 稳定，像素路线本身通用；树路线的失效来自 App 加固/自绘（与机型无关）。
+唯一"必须从文本里挖事实"的就是屏列表 / 逻辑 id ↔ sfId ↔ uniqueId / 屏状态。
+
+而文本这条路**无法靠加机型收敛**。实测到的形态方差：
+
+```
+同一个 uniqueId 字段，三种拼法:
+  cmd display:        uniqueId "local:4630946964337362323"   无等号
+  DisplayDeviceInfo:  uniqueId="local:4630946964337362323"   双引号
+  mViewports:         uniqueId='local:4630946964337362323'   单引号
+```
+
+这些差异已经咬过两次（`mState` vs 裸 `state=` 的 101 处噪声、
+`DisplayDeviceInfo` 段边界的判错）。**整栋楼压在一个"切段 + 锚定"的启发式上。**
+
+### 更稳的两步（第一步已落地）
+
+**第一步（已做）**：主路径改用 `cmd display get-displays`。它是给机器看的，
+每块屏一条记录，字段直接可解析：
+
+```
+cmd display get-displays   2 行     5.3 KB
+dumpsys display            985 行   125 KB
+```
+
+`dumpsys` 降为兜底。解析面小了三个数量级，也不再需要切段。
+
+**第二步（未做，但已实测可行）**：用 `app_process` 调 `DisplayManager`，拿**类型化对象**。
+
+`lib/cmd-display.mjs` 仍然在解析文本 —— 只是文本变简单了。真正通用的是 API。
+`uiautomator` 自己就是这条路线的活证据（见 `/system/bin/uiautomator`）：
+
+```sh
+CLASSPATH=/system/framework/uiautomator.jar
+exec app_process /system/bin com.android.commands.uiautomator.Launcher
+```
+
+它**不带 App、不用 root、跨机型可用**，就因为它走 `UiAutomation` API 而不是解析文本。
+
+#### 已实测：最小可行性验证通过
+
+本机（OnePlus PLK110 / Android 16）用 JDK 17 + d8 编了一个 5 KB 的 dex，
+在 `app_process` 里跑通 `DisplayManagerGlobal.getDisplayInfo(id)`：
+
+```
+DISPLAY|id=0|name=内置屏幕|type=1|uniqueId=local:4630946903293830803|
+        state=2|rotation=0|modeId=5|renderFrameRate=165.0|
+        logicalWidth=1272|logicalHeight=2772|appWidth=1272|appHeight=2772|
+        densityDpi=476|flags=16515|group=0
+```
+
+`state=2` 就是 `Display.STATE_ON` —— **没有任何正则**。踩到并修掉的两个坑：
+
+1. **必须先 `Looper.prepare()` 再 `ActivityThread.systemMain()`**
+   （反过来报 `Can't create handler inside thread that has not called Looper.prepare()`）
+2. `getType()` / `getUniqueId()` 是 **@hide**，编译期 `android.jar` 里没有 → 必须反射
+
+#### 它还能解决一个正则**永远**解决不了的问题
+
+```
+uiautomator dump --display 2   →  被 Android 静默忽略，永远返回主屏的树
+```
+
+实测确认（传不存在的 id 999 都成功）。所以**副屏只有图、没有树** —— 文本解析无解。
+而 API 路线能解：`AccessibilityService.getWindowsOnAllDisplays()`（API 30+）。
+设计文档 §3 已写了这个方案。
+
+#### 代价（要诚实说）
+
+| 项 | 说明 |
+|---|---|
+| 需要 dex 构建链 | javac + d8 + android.jar（本机已具备，CI 要配） |
+| 多一个构建产物 | 5 KB dex 要么进仓库、要么构建期生成 |
+| 代码从 JS 变 Java | 现在全是 `.mjs`，要加 Java 源与构建脚本 |
+| 引用了 @hide API | 大版本升级可能变（但 `uiautomator` 也这么活了很多年） |
+
+#### 落地前还要验证
+
+- 副屏枚举（`getDisplayIds()` 是否含虚拟屏）
+- 从 `app_process` 里拿无障碍树（反射构造 `UiAutomation`）—— 这才是副屏树的正解
+- 构建链进 CI 的可行性
+- dex 拿不到时的回退：仍走 `cmd display` → `dumpsys` 两级文本兜底
 
 ---
 
@@ -461,6 +573,33 @@ screencap 不受影响              -> 562471 / 563077 B（带与不带都能出
     但 name 正则写成了 `/DisplayDeviceInfo\s*\{\s*"([^"]*)"/` —— 在别处能匹配，在 `raw` 上永不匹配，
     于是 `name` 恒为 `null`。而当时的测试只断言"解析出几块屏"，没查字段值，所以漏了过去。
     → **断言要查字段值，不能只查数量。**
+
+13. **同一个缺陷往往有两份实现，修一份等于没修 —— 而且会以"修复已验证"的形式骗过自己。**
+    这个 PR 里同样的事发生了**两次，方向相反**：
+
+    | 轮次 | 修好了 | 漏掉了 | 后果 |
+    |---|---|---|---|
+    | 第二轮 | 设备侧 `screen-mcp.mjs` 新建 `lib/displays.mjs` | PC 侧 `observe.mjs` 仍是旧解析的副本 | PC 侧 CLI 静默返回 0 块屏 |
+    | 第三轮 | PC 侧改走 `parseDisplaysPreferred` | 设备侧 `list_displays` 仍直连 `parseDisplays` | R-6 修完在设备上**没生效**（只走 dumpsys 兜底） |
+
+    第二次尤其值得记：我刚批评完"只落一半"，接着自己又只落了一半。
+    → **收敛到单一路径时，要能回答"还有谁在直接调底层解析器"**，
+    并且这条要有测试守（`test-displays.mjs` 的"主路径与兜底路径结论一致"就是干这个的）。
+
+14. **工具太能干，会掩盖工具坏了。**
+    模型有 root + bash + node，实测它会绕过坏掉的工具自己造轮子：
+    轮 7-8 用 `awk` 自己解析 XML 出坐标；轮 9 因为 `screen_image` 的图被 harness 拒收，
+    它**自己写了两个 Node 脚本**用 `zlib.inflateSync` 解 PNG + 逐行反滤波，数出了颜色直方图。
+
+    危险在于**结果通常是对的** —— 用户从界面上看不出工具挂了，只感受到慢
+    （轮 9 花了 29 秒写脚本）和偶发错误（轮 8 它自己承认"第一次坐标全错"）。
+    → 工具描述里必须明确要求"报错就报原文，不要自己重实现"（见 `HONESTY_NOTE`）。
+
+15. **断言写粗了会误报，而误报会让人把正确的行为改坏。**
+    `test-serve.mjs` 的去重断言第一版写成"原始数 == 去重数就失败"，真机上立刻报错。
+    查证后发现那台设备 25 个目标**一对重叠都没有**（最小间距远超 8px 容差），
+    25 → 25 是**正确**的。改成"只在真有重叠却没合并时失败"才对准。
+    → 断言的粒度要跟着**被测逻辑的判据**走，不能只看数量的守恒。
 
 ---
 

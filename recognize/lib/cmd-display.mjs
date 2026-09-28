@@ -70,6 +70,34 @@ export function parseCmdDisplays(text) {
     const layerStack = (body.match(/layerStack\s+(-?\d+)/) || [])[1] ?? null;
     const name = (body.match(/DisplayInfo\s*\{\s*"([^"]*)"/) || [])[1] ?? null;
 
+    // ── 下面这组是 R-6 补的 ──────────────────────────────
+    // 起因：真机上模型拿到 list_displays 后**又自己跑了一次 dumpsys display 挖了 20KB**，
+    // 因为我们的返回里缺 HDR / 亮度 / 色彩模式 / 挖孔这些面板能力字段。
+    // 而这些字段 `cmd display` 本来就有 —— 只是解析器没取。
+    // 与其让模型自己挖（格式不受我们控制），不如在这里一次给全。
+
+    // HDR：HdrCapabilities{mSupportedHdrTypes=[1, 2, 3, 4], mMaxLuminance=..., ...}
+    const hdr = body.match(/HdrCapabilities\{([^}]*)\}/);
+    let hdrCapabilities = null;
+    if (hdr) {
+      const seg = hdr[1];
+      const types = seg.match(/mSupportedHdrTypes=\[([^\]]*)\]/);
+      hdrCapabilities = {
+        supportedTypes: types ? types[1].split(',').map((s) => Number(s.trim())).filter(Number.isFinite) : [],
+        maxLuminance: Number((seg.match(/mMaxLuminance=([\d.]+)/) || [])[1]) || null,
+        maxAverageLuminance: Number((seg.match(/mMaxAverageLuminance=([\d.]+)/) || [])[1]) || null,
+        minLuminance: Number((seg.match(/mMinLuminance=([\d.]+)/) || [])[1]) || null,
+      };
+    }
+    const num = (re) => {
+      const m = body.match(re);
+      return m ? Number(m[1]) : null;
+    };
+    const supportedColorModes = (() => {
+      const m = body.match(/supportedColorModes\s*\[([^\]]*)\]/);
+      return m ? m[1].split(',').map((s) => Number(s.trim())).filter(Number.isFinite) : null;
+    })();
+
     out.push({
       order: out.length,
       logicalId,
@@ -92,6 +120,20 @@ export function parseCmdDisplays(text) {
       type,
       modeId: mode ? Number(mode) : null,
       layerStack: layerStack !== null ? Number(layerStack) : null,
+      // ── R-6 新增的面板能力字段 ──
+      displayGroupId: num(/displayGroupId\s+(\d+)/),
+      colorMode: num(/(?:^|[\s,])colorMode\s+(\d+)/),
+      supportedColorModes,
+      hdrCapabilities,
+      isForceSdr: /isForceSdr\s+true/.test(body),
+      brightness: {
+        minimum: num(/brightnessMinimum\s+([\d.]+)/),
+        maximum: num(/brightnessMaximum\s+([\d.]+)/),
+        default: num(/brightnessDefault\s+([\d.]+)/),
+        dim: num(/brightnessDim\s+([\d.]+)/),
+      },
+      installOrientation: (body.match(/installOrientation\s+([A-Z0-9_]+)/) || [])[1] ?? null,
+      canHostTasks: /canHostTasks\s+true/.test(body),
       // cmd display 不提供 isFirst；逻辑 id 0 即默认屏
       isFirst: logicalId === 0,
       source: 'cmd-display',

@@ -26,6 +26,7 @@ import path from 'node:path';
 import { FrameCache, truncateField, boundArray } from './lib/fields.mjs';
 import { runCommand } from './lib/spawn-env.mjs';
 import { parseDisplays } from './lib/displays.mjs';
+import { parseDisplaysPreferred } from './lib/cmd-display.mjs';
 import { parseUiXml, labelOf, toTargets, isUsefulTree } from './lib/uitree.mjs';
 
 const PROTOCOL_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05', '2024-10-07'];
@@ -73,15 +74,24 @@ function run(cmd, args, opts = {}) {
  */
 async function listDisplays() {
   const out = { displays: [], wakefulness: null, error: null };
+
+  // 主路径：`cmd display get-displays`（机器可读，2 行）
+  let cmdDisplay = '';
+  try {
+    cmdDisplay = (await run('/system/bin/cmd', ['display', 'get-displays'])).stdout;
+  } catch { /* 老版本可能没有这个子命令, 走兜底 */ }
+
+  // 兜底路径：`dumpsys display`（人类可读转储，1000+ 行）
   let dumpsysDisplay = '';
   let surfaceFlinger = '';
   let power = '';
-
   try {
     dumpsysDisplay = (await run('/system/bin/dumpsys', ['display'])).stdout;
   } catch (e) {
-    out.error = 'dumpsys display 失败: ' + e.message;
-    return out;
+    if (!cmdDisplay) {
+      out.error = 'dumpsys display 失败，且 cmd display 无输出: ' + e.message;
+      return out;
+    }
   }
   // 这两段拿不到不致命: sfId 可从 uniqueId 前缀推导, 唤醒状态可为 null
   try {
@@ -91,10 +101,18 @@ async function listDisplays() {
     power = (await run('/system/bin/dumpsys', ['power'])).stdout;
   } catch { /* 忽略 */ }
 
-  const parsed = parseDisplays({ dumpsysDisplay, surfaceFlinger, power });
+  // 统一入口 —— **不要再直接调 parseDisplays**。
+  // 这条与 B1 是同构的错误，只是方向相反：B1 是 PC 侧直连旧解析、
+  // 这里是设备侧直连兜底解析。两边都必须走同一个入口，
+  // 否则"收敛到单一路径"就只是换了个人重复同一个失误。
+  const parsed = parseDisplaysPreferred(
+    { cmdDisplay, dumpsysDisplay, surfaceFlinger, power },
+    parseDisplays,
+  );
   out.displays = parsed.displays;
   out.wakefulness = parsed.wakefulness;
   out.defaultSurfaceFlingerId = parsed.defaultSurfaceFlingerId;
+  out.source = parsed.source;
   out.error = parsed.error;
 
   // wm size / wm density 补充: 这是**逻辑**尺寸与密度覆盖, 与物理值可能不同
@@ -300,6 +318,27 @@ function dedupe(targets) {
 
 // ── 工具定义 ──────────────────────────────────────────────
 
+/**
+ * 每个工具描述都会追加这段（R-5 / R-4）。
+ *
+ * 起因是真机实测：模型有 root + bash + node，工具一旦不好用，它会**自己造轮子** ——
+ *   · 轮 7-8：screen_targets 返回 `Error: [object Object]`，它改用
+ *     `uiautomator dump` + awk 自己解析，产出了坐标清单（还发现了 11 个零尺寸伪目标）
+ *   · 轮 9：screen_image 的图被 harness 拒收，它**自己写了两个 Node 脚本**，
+ *     用 zlib.inflateSync 解 PNG + 逐行反滤波，数出了颜色直方图
+ *   · 轮 4：全程没用我们的工具，直接用 `dumpsys activity`
+ *
+ * 危险之处在于**结果通常是对的** —— 从用户视角看不出工具挂了，
+ * 而代价是慢（轮 9 花了 29 秒写脚本）和不可靠（轮 8 它自己承认"第一次坐标全错"）。
+ * 所以这里明确要求：工具报错就把原始错误报出来，别默默绕过。
+ */
+const HONESTY_NOTE =
+  '\n\n⚠ **若本工具返回错误，请把原始错误原文报给用户并停止**，不要自己用 bash / ' +
+  '`uiautomator dump` / `screencap` 等命令重新实现一遍同样的功能。' +
+  '原因：你绕过工具产出正确结果时，用户完全看不出工具已经坏了 —— ' +
+  '而这类绕过更慢、更容易出错（实测有一次自己解析 XML 时下标写错，坐标全错）。' +
+  '把错误暴露出来，问题才能被修掉。';
+
 const TOOLS = [
   {
     name: 'list_displays',
@@ -307,7 +346,19 @@ const TOOLS = [
       '列出设备上的所有屏：逻辑 displayId、SurfaceFlinger id、尺寸、DPI、刷新率与**屏状态**（ON/OFF/DOZE）。\n\n' +
       '先用这个确定要观察哪块屏，再把它作为 displayId 传给其他工具。\n' +
       '带 isFirst 的那块是默认屏（主屏）。',
-    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        detail: {
+          type: 'boolean',
+          description:
+            '是否附带面板能力细节：HDR 类型 / 峰值亮度 / 色彩模式 / 亮度范围 / 物理像素 / ' +
+            '安装朝向。默认 false（只有 displayId / 尺寸 / 密度 / 刷新率 / 状态 / sfId）。' +
+            '需要这些细节时传 true，不必自己去跑 dumpsys display。',
+        },
+      },
+      additionalProperties: false,
+    },
   },
   {
     name: 'screen_tree',
@@ -398,6 +449,16 @@ const TOOLS = [
   },
 ];
 
+/**
+ * tools/list 的返回：给每个工具描述追加"错误要如实上报"那一段。
+ *
+ * 为什么在返回时追加、而不是直接写进 TOOLS 常量里：
+ * 4 处描述各贴一遍容易漏、也容易改一处忘三处。集中生成，加新工具自动带上。
+ */
+function toolsWithHonestyNote() {
+  return TOOLS.map((t) => ({ ...t, description: t.description + HONESTY_NOTE }));
+}
+
 // ── 工具实现 ──────────────────────────────────────────────
 
 async function toolsCall(name, args) {
@@ -405,6 +466,7 @@ async function toolsCall(name, args) {
     case 'list_displays': {
       const info = await listDisplays();
       if (info.error) return { isError: true, text: info.error };
+      const detail = !!args?.detail;
       const lines = info.displays.map((d) => {
         // logicalId 可能为 null（拿不到 mViewports 映射的机型）—— 如实显示, 别编一个数
         const lid = d.logicalId === null || d.logicalId === undefined ? '?' : d.logicalId;
@@ -417,13 +479,35 @@ async function toolsCall(name, args) {
           `sfId=${d.surfaceFlingerId}`,
           d.type ? `type=${d.type}` : null,
         ].filter(Boolean);
-        return '  ' + parts.join('  ');
+        let out = '  ' + parts.join('  ');
+        if (detail) {
+          // R-6：面板能力字段一次给全，省得模型自己跑 dumpsys display 挖 20KB。
+          const extra = [];
+          if (d.realWidth && (d.realWidth !== d.width || d.realHeight !== d.height)) {
+            extra.push(`物理=${d.realWidth}x${d.realHeight}`);
+          }
+          if (d.hdrCapabilities?.supportedTypes?.length) {
+            extra.push(`HDR类型=[${d.hdrCapabilities.supportedTypes.join(',')}]` +
+              (d.hdrCapabilities.maxLuminance ? ` 峰值亮度=${d.hdrCapabilities.maxLuminance}nits` : ''));
+          }
+          if (d.supportedColorModes) extra.push(`色彩模式=[${d.supportedColorModes.join(',')}] 当前=${d.colorMode}`);
+          if (d.brightness?.maximum !== null && d.brightness?.maximum !== undefined) {
+            extra.push(`亮度范围=${d.brightness.minimum}~${d.brightness.maximum}`);
+          }
+          if (d.refreshRateOverride) extra.push(`刷新率覆盖=${d.refreshRateOverride}`);
+          if (d.installOrientation) extra.push(`安装朝向=${d.installOrientation}`);
+          if (d.canHostTasks === false) extra.push('不可承载任务');
+          if (d.layerStack !== null && d.layerStack !== undefined) extra.push(`layerStack=${d.layerStack}`);
+          if (extra.length) out += '\n      ' + extra.join('  ');
+        }
+        return out;
       }).join('\n');
       const warn = info.displays.some((d) => d.logicalId === null || d.logicalId === undefined)
         ? '\n⚠ 本机未提供 mViewports 映射，logicalId 显示为 ? —— 用 sfId 指定屏（screen_image 接受）'
         : '';
+      const hint = detail ? '' : '\n（要面板能力细节——HDR 类型 / 亮度 / 色彩模式 / 物理尺寸——传 detail:true）';
       return {
-        text: `唤醒状态: ${info.wakefulness ?? '未知'}\n共 ${info.displays.length} 块屏:\n${lines}${warn}\n\n` +
+        text: `唤醒状态: ${info.wakefulness ?? '未知'}\n共 ${info.displays.length} 块屏:\n${lines}${warn}${hint}\n\n` +
           JSON.stringify(info, null, 2),
       };
     }
@@ -609,6 +693,45 @@ function toolResultToMcp(r) {
   return out;
 }
 
+/**
+ * 把任意抛出物描述成可读文本（R-3）。
+ *
+ * 背景：真机上一轮 `screen_targets` 返回过 `Error: [object Object]`（22 字符，无堆栈），
+ * 而当前代码里**没有任何一处**会生成那个字符串 —— 说明抛出的是一个**非 Error 对象**
+ * （`e.message` 为 undefined，于是走了 `String(e)`）。
+ *
+ * 那条路径是间歇性的（同一台设备，轮 7 挂、后面几次都正常），我没有能稳定复现的输入。
+ * 所以这里**不盲改逻辑**，而是两件事：
+ *   1. 把抛出物的真实形状（类型 / 自有键 / message / stack 前几行）打到 stderr，
+ *      下次它再犯时能一次定死根因；
+ *   2. 让返回给模型的文本不再退化成 `[object Object]` —— 至少说明"抛了个非 Error 对象"
+ *      并带上可用的字段，比一个无法诊断的占位符强。
+ */
+function describeThrown(e, toolName) {
+  let detail;
+  try {
+    const kind = Object.prototype.toString.call(e);           // [object Object] / [object Error]
+    const ctor = e && e.constructor ? e.constructor.name : typeof e;
+    let keys = [];
+    try { keys = e && typeof e === 'object' ? Object.keys(e) : []; } catch { /* ignore */ }
+    let json = '';
+    try { json = JSON.stringify(e); } catch { json = '(JSON.stringify 失败)'; }
+    const stack = e && e.stack ? String(e.stack).split('\n').slice(0, 4).join(' | ') : '(无 stack)';
+    const msg = e && e.message !== undefined ? String(e.message) : '(无 message 字段)';
+    detail = `类型=${kind} 构造器=${ctor} message=${msg} 自有键=[${keys.join(',')}] ` +
+      `JSON=${String(json).slice(0, 300)} stack=${stack}`;
+    // 关键：完整打到 stderr，供事后从 dsh.log 定位
+    log(`!! ${toolName} 抛出非标准错误 —— ${detail}`);
+  } catch (inner) {
+    detail = `(连描述都失败了: ${String(inner)})`;
+  }
+  const human = e instanceof Error
+    ? e.message
+    : `工具抛出了一个非 Error 对象（${Object.prototype.toString.call(e)}），` +
+      `没有 message 字段。诊断信息已写入服务日志（stderr）。`;
+  return { human, detail };
+}
+
 async function handle(msg) {
   const { id, method, params } = msg;
 
@@ -635,7 +758,7 @@ async function handle(msg) {
         rpcOut({ jsonrpc: '2.0', id, result: {} });
         return;
       case 'tools/list':
-        rpcOut({ jsonrpc: '2.0', id, result: { tools: TOOLS } });
+        rpcOut({ jsonrpc: '2.0', id, result: { tools: toolsWithHonestyNote() } });
         return;
       case 'tools/call': {
         const name = params?.name;
@@ -645,8 +768,13 @@ async function handle(msg) {
           const r = await toolsCall(name, args);
           rpcOut({ jsonrpc: '2.0', id, result: toolResultToMcp(r) });
         } catch (e) {
+          // R-3：不再退化成 "Error: [object Object]"。
+          // 非 Error 抛出物会被完整描述并写进日志（见 describeThrown）。
+          const { human, detail } = describeThrown(e, name);
           rpcOut({ jsonrpc: '2.0', id, result: {
-            content: [{ type: 'text', text: '工具执行失败: ' + (e.message || String(e)) }],
+            content: [{ type: 'text', text: `工具执行失败: ${human}` }],
+            // 把机械诊断一并给出（模型能读，也便于用户直接贴回来）
+            structuredContent: { toolError: { tool: name, summary: detail } },
             isError: true,
           } });
         }
