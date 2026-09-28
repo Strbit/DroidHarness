@@ -57,7 +57,20 @@ export SHELL="$PREFIX/bin/bash"
 export OPENSSL_CONF="$TMPDIR/openssl.cnf"
 export SSL_CERT_DIR=/system/etc/security/cacerts
 
-mkdir -p "$DSH_HOME_DIR/logs" "$WS" "$TMPDIR" 2>/dev/null
+# **umask 必须在任何 mkdir 之前** —— 后面那几个 `mkdir -p` 建的目录拿到的权限
+# 是「0777 & ~umask」, 放后面就只能靠再 chmod 一遍补救 (顺序错了不报错,
+# 只是那批目录一开始是宽的 —— 这类"兜住了所以看不见"的差别最容易退化)。
+#
+# ⚠️ 不要把这个 umask 挪进 customize.sh —— 那个脚本是被 installer.sh
+# **source** 的, umask 会留在安装器的 shell 里 (同文件第 6 节警告的 TMPDIR 坑)。
+#
+# 根因 (实测, 不是猜测):
+#   · Android 的 `init`(pid 1) **umask 是 0000**, service.sh 由它派生;
+#   · DSH 自己的代码**没有任何宽权限常量** —— 全是 0600 / 0700 (grep 0o777/0o666
+#     命中 0 次, 反过来 `mode: 384/448` 命中一片);
+#   · 所以旧版本那批 0777/0666 完全是「继承的 umask 0000 + mkdir 默认 0777」的产物,
+#     **修 umask 就是在修根因**, 而不是贴创可贴。
+umask 077
 
 # ── 权限: 数据目录只给 root ──────────────────────────────────
 #
@@ -65,18 +78,16 @@ mkdir -p "$DSH_HOME_DIR/logs" "$WS" "$TMPDIR" 2>/dev/null
 #
 #   profiles/          会话 / 账号凭据
 #   logs/dsh.log       含启动 token (明文)
+#   workspace/         agent 的工作区 (会话子目录)
 #
 # 旧版本建出来是 0777 / 0666 —— 也就是**任何 app 都能读**。日志里那个 token
 # 等同于一次性登录凭据, 读到就能拿到一个能跑 shell 的 agent 的入口。
 #
-# umask 077 放在这里(而不是只在 customize.sh 里显式 chmod)是因为:
-#   · DSH 运行期会**自己新建** profiles/ 下的文件, 只有 umask 能保证新文件也收紧;
-#   · 本文件被 service.sh(source 之外的子进程)和 bin/dsh 使用, umask 不会外泄。
-#     ⚠️ 不要把这个 umask 挪进 customize.sh —— 那个脚本是被 installer.sh
-#     **source** 的, umask 会留在安装器的 shell 里 (同文件第 6 节警告的 TMPDIR 坑)。
-umask 077
+# umask 只管得到**新建**的东西, 管不到已经存在的树 (旧版本装出来的那批),
+# 所以下面显式收紧。这里是**顶层几个路径**, 整树的递归放在 service.sh 的开机
+# 段做一次 (见那里) —— 递归不该每次 `dsh` 命令行调用都跑。
+mkdir -p "$DSH_HOME_DIR/logs" "$WS" "$TMPDIR" 2>/dev/null
 
-# 已经存在的旧权限一并收紧 (覆盖旧版本装的树)
 chmod 0700 "$DSH_HOME_DIR" "$DSH_HOME_DIR/logs" "$TMPDIR" "$WS" 2>/dev/null
 [ -d "$DSH_HOME_DIR/profiles" ] && chmod 0700 "$DSH_HOME_DIR/profiles" 2>/dev/null
 [ -f "$LOG" ] && chmod 0600 "$LOG" 2>/dev/null

@@ -136,12 +136,33 @@ mkdir -p "$DSH_HOME_DIR/logs" 2>/dev/null
 # 显式 chmod 没有这个副作用。
 #
 # 运行期新文件的权限由 bin/env.sh 里的 umask 077 保证 (DSH 会自己新建 profiles/)。
+#
+# 但 umask 只管得到**新建**的东西。旧版本在 umask 0000 下建出来的那批宽权限是
+# **存量**, 得递归清一遍。实测 (这台设备, 4031 个条目 / 96M):
+#
+#   · 整树 `chmod -R u+rwX,go-rwx` 耗时 **69ms** —— 安装路径上没代价。
+#     不用 `find -exec chmod`: 那是**每文件一次 fork**, 这里就是 4031 次。
+#   · 符号模式的大写 `X` 只对目录或**本来就有执行位**的文件加 x, 所以
+#     profiles/*/node_modules/.bin 里真需要执行位的脚本不会被抹掉。
+#   · toybox `chmod -R` **不跟符号链接** —— 实测放一个 -> /etc/hosts 的链接进树里,
+#     跑完 /etc/hosts 的权限没变, 不会顺着链接跑出去改系统文件。
+#   · 收紧后 pnpm 照常工作: store 文件变 600, 但 `dsh plugin --profile web list`
+#     仍 exit=0 (store 与 node_modules 是硬链接同 inode, 改权限不影响链接关系)。
 chmod 0700 "$DSH_HOME_DIR" "$DSH_HOME_DIR/logs" "$WS" 2>/dev/null
 [ -d "$DSH_HOME_DIR/tmp" ] && chmod 0700 "$DSH_HOME_DIR/tmp" 2>/dev/null
 [ -d "$DSH_HOME_DIR/profiles" ] && chmod 0700 "$DSH_HOME_DIR/profiles" 2>/dev/null
 # 日志可能已经存在 (从旧版本升上来的), 一并收紧
 [ -f "$DSH_HOME_DIR/logs/dsh.log" ] && chmod 0600 "$DSH_HOME_DIR/logs/dsh.log" 2>/dev/null
-ui_print "  数据目录 0700; 日志 0600 (旧版本是 0777 / 0666)"
+# 整树存量 (升级时会碰到; 全新安装时这棵树基本是空的)
+if [ -d "$DSH_HOME_DIR" ]; then
+	chmod -R u+rwX,go-rwx "$DSH_HOME_DIR" 2>/dev/null
+fi
+# 复核: 还剩几个组/其他可写的条目 (正常应为 0)。不静默, 让安装日志自己说话。
+_loose=$(find "$DSH_HOME_DIR" -perm -0022 2>/dev/null | wc -l | tr -d ' \n')
+ui_print "  数据目录 0700; 日志 0600; 整树已递归收紧 (旧版本是 0777 / 0666)"
+if [ "${_loose:-0}" != "0" ]; then
+	ui_print "  [WARN] 仍有 $_loose 个条目是组/其他可写"
+fi
 
 # ─────────────────────────────────────────────────────────────
 # 5. 权限
