@@ -187,6 +187,9 @@ chmod -R 0755 "$MODPATH/app" 2>/dev/null
 #   env.sh   —— 两者共用的环境变量 (只被 source, 但给执行位无害)
 set_perm_recursive "$MODPATH/bin" 0 0 0755 0755
 set_perm "$MODPATH/service.sh" 0 0 0755 2>/dev/null
+# action.sh 是 KernelSU「执行」按钮的入口: ksud 直接 exec_script 它.
+# 没有执行位时按钮只会静默失败, 而失败点离代码很远, 很难归因.
+set_perm "$MODPATH/action.sh" 0 0 0755 2>/dev/null
 set_perm "$MODPATH/module.prop" 0 0 0644 2>/dev/null
 ui_print "  usr/ 递归设置; app/ 用 chmod -R 一次搞定; bin/ 三个入口"
 
