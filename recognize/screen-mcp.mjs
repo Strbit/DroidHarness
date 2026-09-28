@@ -26,6 +26,7 @@ import path from 'node:path';
 import { FrameCache, truncateField, boundArray } from './lib/fields.mjs';
 import { runCommand } from './lib/spawn-env.mjs';
 import { parseDisplays } from './lib/displays.mjs';
+import { parseUiXml, labelOf, toTargets, isUsefulTree } from './lib/uitree.mjs';
 
 const PROTOCOL_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05', '2024-10-07'];
 const LATEST = PROTOCOL_VERSIONS[0];
@@ -192,124 +193,33 @@ async function uiTreeDump(logicalId = 0) {
   }
 }
 
-// ── 无障碍树解析 ──────────────────────────────────────────
+// ── 无障碍树解析（统一在 lib/uitree.mjs）─────────────────
+//
+// 为什么不再内联一份（PR #11 第三轮 B3）:
+// 之前本文件自带了 decodeEntities / parseBounds / parseUiXml / labelOf /
+// toTargets / usefulness 一整套，与 lib/uitree.mjs 约 200 行平行实现，
+// 而两边的**判据已经分叉** —— 同一个"可滚动但无文字的列表页":
+//   库 isUsefulTree  -> useful = true
+//   内联 usefulness  -> useful = false（它额外要求 labelled > 0）
+// 于是 82 项测试全在测**没被使用**的那份（库），而模型真正用的是内联这份。
+// 现在统一用库版本：它语义更丰富（viaAncestor 带 resourceId/bounds/label、
+// 以及 clickTarget 指出的"真正该点的框"），而且有测试覆盖。
 
-function decodeEntities(s) {
-  if (!s || s.indexOf('&') === -1) return s;
-  return s.replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&apos;/g, "'")
-    .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => String.fromCodePoint(parseInt(h, 16)))
-    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10)))
-    .replace(/&amp;/g, '&');
+/** 把 isUsefulTree 的产出适配成本文件原 usefulness 的字段名（reason 语义一致） */
+function usefulness(parsed) {
+  const u = isUsefulTree(parsed);
+  return {
+    useful: u.useful,
+    totalNodes: u.totalNodes,
+    labelledCount: u.labelledCount,
+    actionableCount: u.actionableCount,
+    reason: u.reason,
+  };
 }
 
-function parseBounds(s) {
-  if (!s) return null;
-  const m = s.match(/\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]/);
-  if (!m) return null;
-  const [x1, y1, x2, y2] = m.slice(1).map(Number);
-  return { left: x1, top: y1, right: x2, bottom: y2, width: x2 - x1, height: y2 - y1,
-    cx: Math.round((x1 + x2) / 2), cy: Math.round((y1 + y2) / 2) };
-}
+// ── 目标去重（库中没有，保留在此）──────────────────────────
+// 依赖 toTargets 产出的 center —— 那是去重契约，见 lib/uitree.mjs 的注释。
 
-const BOOL_ATTRS = ['checkable', 'checked', 'clickable', 'enabled', 'focusable',
-  'focused', 'scrollable', 'long-clickable', 'password', 'selected'];
-
-function parseUiXml(xml) {
-  const bodyMatch = xml.match(/<hierarchy\b[^>]*>([\s\S]*)<\/hierarchy>/);
-  const body = bodyMatch ? bodyMatch[1] : xml;
-  const rot = xml.match(/<hierarchy[^>]*\brotation="(-?\d+)"/);
-
-  const nodes = [];
-  const stack = [];
-  const tagRe = /<(\/?)(node|hierarchy)\b([^>]*?)(\/?)>/g;
-  let m;
-  while ((m = tagRe.exec(body)) !== null) {
-    const [, closing, tag, attrStr, selfClose] = m;
-    if (tag !== 'node') continue;
-    if (closing) { if (stack.length) stack.pop(); continue; }
-
-    const attrs = {};
-    const attrRe = /([\w-]+)="([^"]*)"/g;
-    let a;
-    while ((a = attrRe.exec(attrStr)) !== null) attrs[a[1]] = decodeEntities(a[2]);
-
-    const parent = stack.length ? stack[stack.length - 1] : null;
-    if (parent) parent.childCount += 1;
-
-    const ancestorIndices = parent ? parent.clickableAncestors.slice() : [];
-    if (parent && parent.node.clickable === true) ancestorIndices.push(parent.nodeIndex);
-
-    const node = {
-      index: nodes.length,
-      depth: stack.length,
-      text: attrs.text || '',
-      desc: attrs['content-desc'] || '',
-      resourceId: attrs['resource-id'] || '',
-      className: attrs.class || '',
-      package: attrs.package || '',
-      bounds: parseBounds(attrs.bounds),
-      childCount: 0,
-      childrenIndices: [],
-      clickableAncestorIndices: ancestorIndices,
-    };
-    for (const b of BOOL_ATTRS) {
-      node[b.replace(/-(\w)/g, (_, c) => c.toUpperCase())] = attrs[b] === 'true';
-    }
-    nodes.push(node);
-    if (parent) parent.node.childrenIndices.push(node.index);
-
-    if (m[4] !== '/') stack.push({ node, nodeIndex: node.index, childCount: 0, clickableAncestors: ancestorIndices });
-  }
-  return { rotation: rot ? Number(rot[1]) : null, nodes };
-}
-
-const labelOf = (n) => (n.text || '').trim() || (n.desc || '').trim() || '';
-
-/**
- * 可操作目标清单。
- * 关键: 真正的点击目标常常是父节点。TextView 自己 clickable=false,
- * 但父 FrameLayout clickable=true。只收 clickable=true 会漏掉大量目标。
- */
-function toTargets(parsed, { includeDisabled = false } = {}) {
-  const out = [];
-  for (const n of parsed.nodes) {
-    const ancIdx = n.clickableAncestorIndices;
-    const ancestor = ancIdx.length ? parsed.nodes[ancIdx[ancIdx.length - 1]] : null;
-    const selfActionable = n.clickable || n.longClickable;
-    const viaAncestor = !selfActionable && !!(ancestor && ancestor.clickable);
-    if (!selfActionable && !viaAncestor) continue;
-    if (!includeDisabled && n.enabled === false) continue;
-
-    const targetNode = selfActionable ? n : ancestor;
-    out.push({
-      label: labelOf(n) || (ancestor ? labelOf(ancestor) : ''),
-      text: n.text,
-      desc: n.desc,
-      resourceId: n.resourceId,
-      className: n.className,
-      package: n.package,
-      bounds: n.bounds,
-      center: n.bounds ? { x: n.bounds.cx, y: n.bounds.cy } : null,
-      clickable: n.clickable,
-      longClickable: n.longClickable,
-      scrollable: n.scrollable,
-      checkable: n.checkable,
-      checked: n.checked,
-      enabled: n.enabled,
-      clickTarget: targetNode === n ? null : {
-        center: targetNode.bounds ? { x: targetNode.bounds.cx, y: targetNode.bounds.cy } : null,
-        className: targetNode.className,
-        resourceId: targetNode.resourceId,
-        label: labelOf(targetNode),
-      },
-      confidence: labelOf(n) ? 0.95 : 0.6,
-    });
-  }
-  return out;
-}
-
-/** 合并同一目标的重叠条目(父容器+图标+文字通常三层指向同一处) */
 function dedupe(targets) {
   const kept = [];
   for (const t of targets) {
@@ -330,25 +240,6 @@ function dedupe(targets) {
   return kept;
 }
 
-/**
- * 树"有没有值得动手的节点"。
- * 引擎自绘界面不是空树, 而是只有一个全屏 SurfaceView 的"没用的树"。
- */
-function usefulness(parsed) {
-  const labelled = parsed.nodes.filter((n) => labelOf(n));
-  const actionable = parsed.nodes.filter((n) =>
-    n.clickable || n.longClickable || n.scrollable || n.checkable);
-  return {
-    useful: actionable.length > 0 && labelled.length > 0,
-    totalNodes: parsed.nodes.length,
-    labelledCount: labelled.length,
-    actionableCount: actionable.length,
-    reason: (actionable.length > 0 && labelled.length > 0) ? null
-      : parsed.nodes.length <= 2
-        ? `只有 ${parsed.nodes.length} 个节点, 疑似自绘界面或抓取失败`
-        : `${parsed.nodes.length} 个节点但缺可操作项或有标签项, 疑似自绘界面`,
-  };
-}
 
 // ── 工具定义 ──────────────────────────────────────────────
 

@@ -160,6 +160,15 @@ export function isUsefulTree(parsed) {
 }
 
 /** 扁平节点 → 可操作目标清单(含可点祖先解析) */
+/**
+ * 扁平节点 → 可操作目标清单(含可点祖先解析)
+ *
+ * `center` 必须产出 —— 它是**整条管道的去重契约**：
+ *   recognize.mjs 的 dedupeTargets 与 lib/observe.mjs 的 mergeObservations
+ *   都按 center 判"两个目标是不是指向同一处"。
+ * 缺了它不会报错，只会**静默不去重**（父容器 + 图标 + 文字三层都指向同一处时
+ * 三个目标全保留）。所以这里按 bounds 算出来，而不是留给调用方各自补。
+ */
 export function toTargets(parsed, { includeDisabled = false } = {}) {
   const out = [];
   for (const n of parsed.nodes) {
@@ -172,6 +181,8 @@ export function toTargets(parsed, { includeDisabled = false } = {}) {
     if (!selfActionable && !viaAncestor) continue;
     if (!includeDisabled && n.enabled === false) continue;
     const label = labelOf(n) || (clickableAncestor ? labelOf(clickableAncestor) : '');
+    // 真正该点哪个框: 自身可点就用自己, 否则用可点祖先
+    const targetNode = selfActionable ? n : clickableAncestor;
     out.push({
       text: n.text,
       desc: n.desc,
@@ -180,12 +191,22 @@ export function toTargets(parsed, { includeDisabled = false } = {}) {
       className: n.className,
       package: n.package,
       bounds: n.bounds,
+      // 去重契约(见函数注释): 有标签的按自身位置, 否则按真正可点的那个框
+      center: n.bounds ? { x: n.bounds.cx, y: n.bounds.cy } : null,
       clickable: n.clickable,
       longClickable: n.longClickable,
       scrollable: n.scrollable,
       enabled: n.enabled,
-      // 真正该点哪个框: 自身可点就用自己, 否则用可点祖先
+      // 有标签 => 可信度高; 只是容器/图标 => 低
+      confidence: labelOf(n) ? 0.95 : 0.6,
       targetNodeIndex: selfActionable ? n.index : clickableAncestor.index,
+      // 需要往上找可点祖先时, 把"真正该点的那个框"一并给出（比只有中心点更有用）
+      clickTarget: targetNode === n ? null : {
+        center: targetNode.bounds ? { x: targetNode.bounds.cx, y: targetNode.bounds.cy } : null,
+        className: targetNode.className,
+        resourceId: targetNode.resourceId,
+        label: labelOf(targetNode),
+      },
       viaAncestor: viaAncestor ? {
         nodeIndex: clickableAncestor.index,
         className: clickableAncestor.className,

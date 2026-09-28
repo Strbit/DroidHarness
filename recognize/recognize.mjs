@@ -67,10 +67,14 @@ const commands = {
     console.log('');
     console.log('屏:');
     for (const s of d.displays) {
+      // stack 只有 dumpsys 兜底路径才提供；走 cmd display 主路径时为 null，不显示
+      const stack = s.stack === null || s.stack === undefined ? '' : `stack=${s.stack}  `;
+      const src = d.source === 'dumpsys' ? '  [dumpsys 兜底]' : '';
       console.log(`  #${s.logicalId}  ${stateIcon(s.state)} (${s.state})  ` +
         `${s.width}x${s.height} @${s.density}dpi  ${s.renderFrameRate}fps  ` +
-        `stack=${s.stack}  sfId=${s.surfaceFlingerId}${s.isFirst ? '  [主屏]' : ''}`);
+        `${stack}sfId=${s.surfaceFlingerId}${s.isFirst ? '  [主屏]' : ''}${src}`);
     }
+    if (d.source) console.log(`\n  （屏信息来自 ${d.source}${d.source === 'cmd-display' ? '：机器可读，2 行' : '：人类可读转储，兜底路径'}）`);
   },
 
   async tree(dev, opts) {
@@ -78,7 +82,10 @@ const commands = {
     if (opts.json) {
       const out = { ...t };
       delete out.xml;
-      if (t.ok) out.targets = toTargets(t.nodes);
+      // uiTree 已经算好 targets（内部 toTargets(parsed)，传的是解析结果对象）。
+      // 这里**不要再调一次 toTargets** —— 旧代码写的是 `toTargets(t.nodes)`，
+      // 传进去的是节点数组而不是解析结果对象，于是 toTargets 里 `parsed.nodes`
+      // 为 undefined，`for...of undefined` 直接抛 TypeError（PR #11 第三轮 B2）。
       delete out.nodes;
       return jout(out);
     }

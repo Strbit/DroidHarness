@@ -18,45 +18,46 @@ import path from 'node:path';
 import { Device, DEVICE_TMP, pcTmpDir, shQuote } from './device.mjs';
 import { parseUiXml, isUsefulTree, toTargets, labelOf } from './uitree.mjs';
 import { FrameCache, truncateField, boundArray, boundValue } from './fields.mjs';
+import { parseDisplays } from './displays.mjs';
+import { parseDisplaysPreferred } from './cmd-display.mjs';
 
 export { FrameCache, truncateField, boundArray, boundValue };
 
 // ── 屏状态 ────────────────────────────────────────────────
-// 运行时发现, 不硬编码。解析 dumpsys display 里 DisplayDeviceInfo 的 state。
+//
+// 运行时发现, 不硬编码。**解析逻辑统一在 lib/cmd-display.mjs + lib/displays.mjs**,
+// 这里只负责取原始文本。
+//
+// 为什么不再自带一份正则（这条是 PR #11 第三轮的阻断项 B1）:
+// 跨设备修复只落在 lib/displays.mjs 上, 而本文件的 getDisplays() 是同一逻辑的
+// **旧副本**, 仍在用 OnePlus 专属的 `Display N [id=...,stack=...]` 形态和裸 `state=`。
+// 后果是 PC 侧 CLI 在非 OnePlus 设备上静默返回 0 块屏, 而设备侧 MCP 是好的 —— 
+// 同一个 PR 里两条路给出相反答案。
+//
+// 取数顺序: `cmd display get-displays`（2 行, 机器可读）为主,
+// `dumpsys display`（1000+ 行, 人类可读的转储）降为兜底。
 export async function getDisplays(device) {
-  const out = await device.shell('dumpsys display');
-  const displays = [];
+  // 主路径
+  let cmdDisplay = '';
+  try {
+    cmdDisplay = await device.shell('cmd display get-displays');
+  } catch { /* 老版本可能没有这个子命令, 走兜底 */ }
 
-  // 每个 "Display N [id=...,stack=...]" 段落里带 state=ON/OFF/DOZE
-  const sectionRe = /Display (\d+) \[id=([^,\]]+),stack=(-?\d+)\][\s\S]*?(?=\n\s*Display \d+ \[id=|$)/g;
-  let m;
-  while ((m = sectionRe.exec(out)) !== null) {
-    const [, logicalId, surfaceId, stack] = m;
-    const seg = m[0];
-    const stateMatch = seg.match(/\bstate=([A-Z_]+)/);
-    const isFirst = /isFirst=true/.test(seg);
-    const sizeMatch = seg.match(/(\d+) x (\d+), modeId/);
-    const densityMatch = seg.match(/\bdensity (\d+)/);
-    const fpsMatch = seg.match(/renderFrameRate ([\d.]+)/);
-    displays.push({
-      logicalId: Number(logicalId),
-      surfaceFlingerId: surfaceId,          // 无符号 64 位, 保持字符串
-      stack: Number(stack),
-      isFirst,
-      state: stateMatch ? stateMatch[1] : null,  // ON / OFF / DOZE / DOZE_SUSPEND
-      width: sizeMatch ? Number(sizeMatch[1]) : null,
-      height: sizeMatch ? Number(sizeMatch[2]) : null,
-      density: densityMatch ? Number(densityMatch[1]) : null,
-      renderFrameRate: fpsMatch ? Number(fpsMatch[1]) : null,
-    });
-  }
+  // 兜底路径的两份输入
+  let dumpsysDisplay = '';
+  let surfaceFlinger = '';
+  try {
+    dumpsysDisplay = await device.shell('dumpsys display');
+  } catch { /* 下面统一报错 */ }
+  try {
+    surfaceFlinger = await device.shell('dumpsys SurfaceFlinger --display-id');
+  } catch { /* sfId 可从 uniqueId 前缀推导, 不致命 */ }
 
-  // 唤醒状态作为佐证(两条来源不一致时是重要信号)
+  // 唤醒状态（只从 mWakefulness= 取, 锚定字段名）
   let wakefulness = null;
   try {
     const p = await device.shell('dumpsys power');
-    const wm = p.match(/mWakefulness=(\w+)/);
-    if (wm) wakefulness = wm[1];
+    wakefulness = p.match(/^\s*mWakefulness=(\w+)/m)?.[1] ?? null;
   } catch { /* 拿不到不致命 */ }
 
   // wm size / density 给的是逻辑尺寸(可能被 override)
@@ -67,15 +68,28 @@ export async function getDisplays(device) {
     const pm = wsz.match(/Physical size:\s*(\d+)x(\d+)/);
     wmOverride = om ? { width: Number(om[1]), height: Number(om[2]) } : null;
     wmSize = pm ? { width: Number(pm[1]), height: Number(pm[2]) } : null;
-  } catch { }
+  } catch { /* 忽略 */ }
   try {
     const wd = await device.shell('wm density');
     const od = wd.match(/Override density:\s*(\d+)/);
     const pd = wd.match(/Physical density:\s*(\d+)/);
     wmDensity = { physical: pd ? Number(pd[1]) : null, override: od ? Number(od[1]) : null };
-  } catch { }
+  } catch { /* 忽略 */ }
 
-  return { displays, wakefulness, wmSize, wmOverride, wmDensity };
+  const parsed = parseDisplaysPreferred(
+    { cmdDisplay, dumpsysDisplay, surfaceFlinger, power: '' },
+    parseDisplays,
+  );
+
+  return {
+    displays: parsed.displays,
+    source: parsed.source,
+    // 解析不出来时**如实报错**, 不返回空数组让调用方以为"设备没有屏"
+    error: parsed.error,
+    wakefulness: parsed.wakefulness ?? wakefulness,
+    defaultSurfaceFlingerId: parsed.defaultSurfaceFlingerId,
+    wmSize, wmOverride, wmDensity,
+  };
 }
 
 // ── 截屏 ──────────────────────────────────────────────────
@@ -334,11 +348,30 @@ export async function observe(device, {
     errors.push({ stage: 'displays', error: String(e.message || e) });
     return null;
   });
-  const display = disp?.displays.find((d) => d.logicalId === displayId) || disp?.displays[0] || null;
+
+  // ⚠️ 这里**不许兜底**（PR #11 第三轮 B1）:
+  // 旧代码是 `... || disp?.displays[0] || null` —— 找不到请求的屏就把第 0 块的状态
+  // 当成被请求屏上报。请求副屏时, 副屏的真实状态未知, 而上报的却是主屏的状态,
+  // 调用方据此判断"内容可不可信" → 正是设计约束 3 要防的静默错坐标。
+  const allDisplays = disp?.displays ?? [];
+  const display = allDisplays.find((d) => d.logicalId === displayId) ?? null;
   const screenOn = display ? display.state === 'ON' : null;
 
-  // 熄屏预警: screencap 会给最后一帧旧画面, 而且不报错
   const warnings = [];
+  if (disp?.error) {
+    warnings.push(`屏信息获取失败: ${disp.error}`);
+  } else if (!display) {
+    // 屏列表拿到了, 但里面没有请求的这块 —— 如实说, 不拿别的屏顶替
+    warnings.push(
+      `屏列表里没有 logicalId=${displayId} 这块屏` +
+      `（本机有 ${allDisplays.length} 块: ${allDisplays.map((d) => d.logicalId).join(', ')}）。` +
+      `该屏的 displayState 未知, 截图内容是否可信也就无法判断。`
+    );
+  } else if (screenOn === null) {
+    warnings.push(`屏状态未知（displayId=${displayId} 没解析出 state），无法判断截图内容是否可信。`);
+  }
+
+  // 熄屏预警: screencap 会给最后一帧旧画面, 而且不报错
   if (screenOn === false) {
     warnings.push(
       `displayState=${display.state}: 熄屏时 screencap 返回的是最后一帧旧画面且不报错, ` +
@@ -449,10 +482,14 @@ export async function observe(device, {
       if (!shot.isPng) {
         errors.push({ stage: 'screenshot', error: 'PNG 头校验失败, 数据可能损坏' });
         result.image = null;
-      } else if (!screenOn) {
+      } else if (screenOn === false) {
         // 尺寸虽对但内容是旧帧
         warnings.push('该截图对应的屏是熄灭状态, 内容不可信(见上)。');
       }
+      // 注意: `screenOn === null`（屏状态未知）**不在这里报"熄灭"**。
+      // 旧代码写的是 `!screenOn`, 把 null 和 false 混为一谈 ——
+      // 后果是亮屏时也告诉模型"内容不可信", 让它放弃一条本来正确的信息。
+      // 未知的情况在 :356 起那一段已经单独报过了。
       if (shot.fromCache && shot.cacheAgeMs > 0) {
         // 缓存帧不伪装成新帧: 明确告诉调用方它有多旧
         warnings.push(
