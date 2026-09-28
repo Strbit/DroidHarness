@@ -119,8 +119,20 @@ async function listDisplays() {
 /** 指定逻辑屏的屏状态(供各工具做新鲜度标注) */
 async function displayState(logicalId = 0) {
   const info = await listDisplays();
-  const d = info.displays.find((x) => x.logicalId === logicalId) || info.displays[0] || null;
-  return { ...(d || { logicalId, state: null }), wakefulness: info.wakefulness, all: info.displays };
+  // 与 observe.mjs 同一条纪律（第三轮 B1/B4）：**找不到请求的屏就如实说，不拿第 0 块顶替**。
+  // 旧代码是 `... || info.displays[0] || null` —— 请求副屏时会拿主屏的状态当副屏上报，
+  // 于是"这块屏的内容可不可信"这个判断建立在错误的屏上。
+  const d = info.displays.find((x) => x.logicalId === logicalId) ?? null;
+  // 也不再往每个 payload 里塞 `all: info.displays`：
+  // 那是把完整屏列表重复进每一次 screen_tree / screen_targets 的返回，
+  // 而需要屏列表的调用方本就有 list_displays 可用（第三轮 B4 指出的体积问题之一）。
+  return {
+    ...(d || { logicalId, state: null, missing: true }),
+    wakefulness: info.wakefulness,
+    displaySource: info.source ?? null,
+    requestedLogicalId: logicalId,
+    availableLogicalIds: info.displays.map((x) => x.logicalId),
+  };
 }
 
 // ── 帧缓存 ────────────────────────────────────────────────
@@ -180,17 +192,62 @@ async function uiTreeDump(logicalId = 0) {
     };
   }
   const remote = path.join(TMP, `sm-${process.pid}-${Date.now().toString(36)}.xml`);
+  const startedAt = Date.now();
   try {
     await run('/system/bin/uiautomator', ['dump', remote], { timeout: 25000 });
     if (!fs.existsSync(remote)) return { ok: false, error: 'dump-file-missing' };
     const xml = fs.readFileSync(remote, 'utf8');
     if (!xml.includes('<hierarchy')) return { ok: false, error: 'no-hierarchy', raw: xml.slice(0, 300) };
-    return { ok: true, xml };
+    // `at` = 树被取下来的时刻（不是返回的时刻）。
+    // 调用方据此判断"这个界面信息有多旧" —— uiautomator dump 实测约 2 秒，
+    // 而 MCP 是长驻进程，模型可能把几十秒前的树当作当前界面（第三轮 B4）。
+    return { ok: true, xml, at: Date.now(), dumpMs: Date.now() - startedAt };
   } catch (e) {
-    return { ok: false, error: 'dump-failed', detail: e.message };
+    return { ok: false, error: 'dump-failed', detail: e.message, at: Date.now() };
   } finally {
     try { fs.unlinkSync(remote); } catch { /* 清理失败不致命 */ }
   }
+}
+
+// ── payload 体积控制（第三轮 B4）───────────────────────────
+//
+// 背景：设备侧 import 了 truncateField / boundArray 但**全文 0 处调用**，
+// 于是 screen_tree 一次返回 49,932 字符（实测真机），其中：
+//   · `screen` 里嵌了一个 `all`（重复整份屏列表）—— 已随 displayState 修掉
+//   · 每个节点的 text/desc/resourceId 无界输出（content-desc 平台侧没有长度上限）
+//   · 356 个节点全给，其中 118 个既没文字又不能点，是纯噪声
+//
+// 这里做三件事：字符串有界、数组有界并报出省略量、给出默认摘要。
+// 注意**不隐藏事实**：省略了多少、跳过了多少，都明确写在返回里。
+
+/**
+ * 节点文本字段的截断预算。
+ * `content-desc` 在平台侧**没有长度上限** —— 一个聊天界面的 desc 可能上万字符，
+ * 所以保头 + 保尾（尾部的 URL 查询参数、订单号才是关键标识）。
+ */
+const NODE_FIELD = { headChars: 300, tailChars: 160 };
+
+/** 把一行节点/目标压成紧凑文本（省掉 JSON 的引号和重复键名） */
+function compactLine(o) {  const label = truncateField(o.label || o.text || o.desc || '', { headChars: 60, tailChars: 20 });
+  const c = o.center || (o.bounds ? { x: o.bounds.cx, y: o.bounds.cy } : null);
+  const pos = c && Number.isFinite(c.x) && Number.isFinite(c.y) ? `${c.x},${c.y}` : '?';
+  const flags = [
+    o.clickable ? 'C' : '',          // clickable
+    o.longClickable ? 'L' : '',      // long-clickable
+    o.scrollable ? 'S' : '',         // scrollable
+    o.checkable ? 'K' : '',          // checkable
+    o.enabled === false ? 'D' : '',  // disabled
+  ].filter(Boolean).join('') || '-';
+  const id = o.resourceId ? truncateField(o.resourceId, { headChars: 60, tailChars: 10 }) : '';
+  return `  ${String(label || '(无标签)').padEnd(44)} ${pos.padStart(11)}  ${flags.padEnd(4)} ${id}`;
+}
+
+/** 摘要模式：一行一个节点，带省略量说明。比 JSON 小一个数量级。 */
+function compactSummary(header, rows, { headLimit, tailLimit }) {
+  const b = boundArray(rows, { headLimit, tailLimit });
+  const lines = b.items.map(compactLine);
+  if (b.omitted > 0) lines.push(`  ... [省略 ${b.omitted} 项] ...`);
+  return `${header}\n${lines.join('\n')}`;
 }
 
 // ── 无障碍树解析（统一在 lib/uitree.mjs）─────────────────
@@ -348,47 +405,111 @@ async function toolsCall(name, args) {
     }
 
     case 'screen_tree': {
-      const disp = await displayState(args?.displayId ?? 0);
-      const dump = await uiTreeDump(args?.displayId ?? 0);
+      const logical = args?.displayId ?? 0;
+      const disp = await displayState(logical);
+      const dump = await uiTreeDump(logical);
       if (!dump.ok) return { isError: true, text: `无障碍树读取失败: ${dump.error}\n${dump.detail || ''}` };
       const parsed = parseUiXml(dump.xml);
       const u = usefulness(parsed);
+      // 采集时刻：uiautomator dump 实测约 2 秒，而 MCP 是长驻进程 ——
+      // 没有这个字段，模型会把几十秒前取到的树当作当前界面（第三轮 B4 的另一半）。
+      const capturedAt = dump.at ?? Date.now();
       const labelled = parsed.nodes.filter((n) => labelOf(n)).map((n) => ({
         text: n.text, desc: n.desc, resourceId: n.resourceId, className: n.className,
         package: n.package, bounds: n.bounds, clickable: n.clickable,
         enabled: n.enabled, depth: n.depth,
       }));
+
+      const head =
+        `无障碍树: ${parsed.nodes.length} 节点, ${u.labelledCount} 有文字, ${u.actionableCount} 可操作` +
+        (u.useful ? ' —— 可用' : ` —— 不可用: ${u.reason}`) + '\n' +
+        `采集时刻: ${new Date(capturedAt).toISOString()}（uiautomator dump 耗时约 2 秒，这是取树那一刻）\n`;
+
+      // 默认摘要：一行一个带标签的节点。JSON 只给有标签节点、且字段有界。
+      const summary = compactSummary(
+        head + `带标签节点 ${labelled.length} 个：`,
+        labelled, { headLimit: 120, tailLimit: 30 },
+      );
+
+      // 结构化输出：字段一律 head+tail 截断（content-desc 平台侧无长度上限）
+      const boundedLabelled = labelled.map((n) => ({
+        text: truncateField(n.text, NODE_FIELD),
+        desc: truncateField(n.desc, NODE_FIELD),
+        resourceId: truncateField(n.resourceId, NODE_FIELD),
+        className: n.className,
+        package: n.package,
+        bounds: n.bounds,
+        clickable: n.clickable,
+        enabled: n.enabled,
+        depth: n.depth,
+      }));
+      const boundedNodes = boundArray(boundedLabelled, { headLimit: 200, tailLimit: 50 });
       const payload = {
         displayState: disp.state, wakefulness: disp.wakefulness, screen: disp,
-        rotation: parsed.rotation, nodeCount: parsed.nodes.length,
-        usefulness: u, labelledNodes: labelled,
+        capturedAt, rotation: parsed.rotation, nodeCount: parsed.nodes.length,
+        usefulness: u, labelledTotal: labelled.length,
+        labelledNodes: boundedNodes.items,
+        labelledOmitted: boundedNodes.omitted,
       };
-      return {
-        text: (disp.state !== 'ON'
-          ? `⚠ 屏幕状态是 ${disp.state}，read 到的内容可能已过期。\n`
-          : '') +
-          `无障碍树: ${parsed.nodes.length} 节点, ${u.labelledCount} 有文字, ${u.actionableCount} 可操作` +
-          (u.useful ? ' —— 可用\n' : ` —— 不可用: ${u.reason}\n`) +
-          JSON.stringify(payload, null, 2),
-      };
+
+      const stateWarn = disp.state !== 'ON'
+        ? `⚠ 屏幕状态是 ${disp.state}，读到的内容可能已过期。\n`
+        : (disp.missing ? `⚠ 屏列表里没有 logicalId=${logical}（实际有 ${disp.availableLogicalIds.join(', ')}），屏状态未知。\n` : '');
+
+      return { text: stateWarn + summary + '\n\n' + JSON.stringify(payload, null, 2) };
     }
 
     case 'screen_targets': {
-      const disp = await displayState(args?.displayId ?? 0);
-      const dump = await uiTreeDump(args?.displayId ?? 0);
+      const logical = args?.displayId ?? 0;
+      const disp = await displayState(logical);
+      const dump = await uiTreeDump(logical);
       if (!dump.ok) return { isError: true, text: `无障碍树读取失败: ${dump.error}\n${dump.detail || ''}` };
       const parsed = parseUiXml(dump.xml);
       const u = usefulness(parsed);
       const targets = dedupe(toTargets(parsed, { includeDisabled: !!args?.includeDisabled }));
+      // 同 screen_tree：这棵树是什么时候取的。没有它会静默误导。
+      const capturedAt = dump.at ?? Date.now();
+
+      let text = '';
+      if (disp.state !== 'ON') {
+        text += disp.missing
+          ? `⚠ 屏列表里没有 logicalId=${logical}（实际有 ${disp.availableLogicalIds.join(', ')}），` +
+            `屏状态未知，坐标是否对应当前界面无法判断。\n`
+          : `⚠ 屏幕状态是 ${disp.state}，坐标可能对应已过期的界面。\n`;
+      }
+      if (!u.useful) text += `⚠ 无障碍树不可用: ${u.reason}。改用 screen_image 看图。\n`;
+
+      const head = text +
+        `可点击目标 ${targets.length} 个（采集于 ${new Date(capturedAt).toISOString()}）：`;
+      // 默认摘要：一行一个目标（坐标 + 标志位 + 资源 id）。比 JSON 小一个数量级。
+      const summary = compactSummary(head, targets, { headLimit: 80, tailLimit: 20 });
+
+      // 结构化输出：字段有界 + 数组有界，并报出省略量
+      const boundedTargets = targets.map((t) => ({
+        label: truncateField(t.label, NODE_FIELD),
+        text: truncateField(t.text, NODE_FIELD),
+        desc: truncateField(t.desc, NODE_FIELD),
+        resourceId: truncateField(t.resourceId, NODE_FIELD),
+        className: t.className,
+        package: t.package,
+        bounds: t.bounds,
+        center: t.center,
+        clickable: t.clickable,
+        longClickable: t.longClickable,
+        scrollable: t.scrollable,
+        enabled: t.enabled,
+        confidence: t.confidence,
+        clickTarget: t.clickTarget,
+      }));
+      const bt = boundArray(boundedTargets, { headLimit: 150, tailLimit: 40 });
       const payload = {
         displayState: disp.state, wakefulness: disp.wakefulness, screen: disp,
-        usefulness: u, targetCount: targets.length, targets,
+        capturedAt, usefulness: u,
+        targetCount: targets.length,
+        targets: bt.items,
+        targetsOmitted: bt.omitted,
       };
-      let text = '';
-      if (disp.state !== 'ON') text += `⚠ 屏幕状态是 ${disp.state}，坐标可能对应已过期的界面。\n`;
-      if (!u.useful) text += `⚠ 无障碍树不可用: ${u.reason}。改用 screen_image 看图。\n`;
-      text += `可点击目标 ${targets.length} 个:\n` + JSON.stringify(payload, null, 2);
-      return { text };
+      return { text: summary + '\n\n' + JSON.stringify(payload, null, 2) };
     }
 
     case 'screen_image': {
