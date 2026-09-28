@@ -22,7 +22,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { Device, AdbError } from './lib/device.mjs';
+import { Device, AdbError, pcTmpDir } from './lib/device.mjs';
 import { observe, getDisplays, uiTree, screenshot, ocrImage, mergeObservations } from './lib/observe.mjs';
 import { parseUiXml, toTargets, isUsefulTree, labelOf } from './lib/uitree.mjs';
 
@@ -56,6 +56,55 @@ function stateIcon(s) {
 }
 
 // ── 子命令 ────────────────────────────────────────────────
+// ── serve 的入参校验辅助（第三轮审阅 M5）─────────────────
+
+/**
+ * 把请求里的 displayId 解析成 screencap -d 要的 surfaceFlingerId（M5）。
+ *
+ * 两条硬要求：
+ *   · 找不到那块屏就**返回 null 交给平台判断默认屏**，但如果调用方明确要了
+ *     一个不存在的屏，那应该报错而不是静默给默认屏 —— 所以这里区分
+ *     "没指定"（undefined/null → null）与"指定了但不存在"（抛错）。
+ *   · sfId 必须按**字符串**比较。它是 19 位无符号数（如 4630946964337362323），
+ *     走 Number() 会变成 4630946964337362000，比对必然失配（M3 是同一个坑）。
+ */
+async function resolveSurfaceFlingerId(device, requested) {
+  if (requested === undefined || requested === null) return null;
+  const info = await getDisplays(device).catch(() => null);
+  if (!info || !info.displays?.length) {
+    throw new Error(`无法获取屏列表，不能按 displayId=${requested} 定向截图`);
+  }
+  const want = String(requested);
+  const d = info.displays.find((x) => String(x.logicalId) === want)
+    || info.displays.find((x) => String(x.surfaceFlingerId) === want);
+  if (!d) {
+    throw new Error(
+      `屏列表里没有 displayId=${requested}（实际有 ${info.displays.map((x) => x.logicalId).join(', ')}）`);
+  }
+  return d.surfaceFlingerId;
+}
+
+/**
+ * 约束 PC 侧写盘路径（M5）。
+ *
+ * 服务通过 stdio 接收外部请求，`savePath` 是请求方可控的。
+ * 不校验就等于给对端一个"覆盖本机任意可写文件"的原语。
+ * 允许的根目录：`--out` 指定的目录，或进程的临时目录（pcTmpDir）。
+ */
+function resolveSavePath(requested, outDir) {
+  if (!requested) return undefined;   // 交给 screenshot 用默认临时文件
+  const root = path.resolve(outDir || pcTmpDir());
+  const target = path.resolve(requested);
+  const rel = path.relative(root, target);
+  // rel 不含 ".." 且不是绝对路径 => 在 root 之内
+  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+    throw new Error(
+      `savePath 必须落在允许目录内。收到 ${target}，允许根目录 ${root}。` +
+      `（可用 --out 指定输出目录）`);
+  }
+  return target;
+}
+
 const commands = {
   async displays(dev, opts) {
     const d = await getDisplays(dev);
@@ -172,8 +221,8 @@ const commands = {
   //   {"id":5,"op":"observe","displayId":0,"tree":true,"image":true,"ocr":true}
   //   {"id":6,"op":"targets","displayId":0}
   //   {"id":7,"op":"shutdown"}
-  async serve(dev, opts) {
-    const readline = await import('node:readline');
+
+  async serve(dev, opts) {    const readline = await import('node:readline');
     const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
     const out = (obj) => process.stdout.write(JSON.stringify(obj) + '\n');
     const logErr = (s) => process.stderr.write(s + '\n');
@@ -225,10 +274,21 @@ const commands = {
             break;
           }
           case 'ocr': {
-            const shot = await screenshot(dev, { savePath: req.savePath });
+            // M5（第三轮审阅）: 这里原来写的是
+            //     screenshot(dev, { savePath: req.savePath })
+            // 两个问题：
+            //   1. `displayId` 被**静默忽略** —— 协议文档 :164 写了
+            //      {"op":"ocr","displayId":0}，但永远截默认屏。请求副屏时静默给主屏的图。
+            //   2. `savePath` 未经任何校验直入 observe.mjs 的 fs.writeFileSync ——
+            //      stdio 对端可以指定本机任意可写路径覆盖文件。
+            //      对照 lib/device.mjs 的 removeDeviceFile 做了 DEVICE_TMP 前缀校验：
+            //      **设备侧有约束，PC 侧反过来没有**。
+            const sfId = await resolveSurfaceFlingerId(dev, req.displayId);
+            const savePath = resolveSavePath(req.savePath, opts.out);
+            const shot = await screenshot(dev, { surfaceFlingerId: sfId, savePath });
             if (!shot.isPng) { result = { ok: false, error: 'png-invalid' }; break; }
             const ocr = await ocrImage(shot.file, { lang: req.lang });
-            result = { ok: ocr.ok, image: shot, ocr };
+            result = { ok: ocr.ok, image: shot, ocr, displayId: req.displayId ?? 0, surfaceFlingerId: sfId };
             break;
           }
           case 'observe': {

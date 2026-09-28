@@ -324,6 +324,11 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        // M4（同上）：实现读 `args?.displayId`，schema 必须声明它。
+        displayId: {
+          oneOf: [{ type: 'number' }, { type: 'string' }],
+          description: '逻辑 displayId。省略则用默认屏(0)。非 0 会明确报错（平台限制，见工具描述）。',
+        },
         includeDisabled: { type: 'boolean', description: '是否包含 enabled=false 的控件，默认 false' },
       },
       additionalProperties: false,
@@ -340,6 +345,14 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        // M4: 实现读 `args?.displayId`，但 schema 里原来没有它，且声明
+        // additionalProperties:false —— 任何做参数校验的客户端都会被拒。
+        // （test-screen-mcp 的 #6 是绕过 schema 直接发 JSON-RPC 才测到 tree-needs-app 的，
+        //  也就是说那条断言覆盖了一条**合规客户端走不到**的路径。）
+        displayId: {
+          oneOf: [{ type: 'number' }, { type: 'string' }],
+          description: '逻辑 displayId。省略则用默认屏(0)。',
+        },
         includeDisabled: { type: 'boolean', description: '是否包含不可用控件，默认 false' },
       },
       additionalProperties: false,
@@ -359,7 +372,18 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        displayId: { type: 'number', description: '逻辑 displayId 或 SurfaceFlinger id，省略则用默认屏' },
+        // M3: 必须是 string 或 number 二选一，**不能只写 number**。
+        // surfaceFlingerId 是 19 位无符号数（例如 4630946964337362323），
+        // 按 number 传必然精度丢失（实测 Number() 后往返无损 = false，末几位被抹成 0），
+        // 于是字符串比对失配、截断后的 id 被原样交给 screencap -d。
+        // 所以主推 string；number 仍然接受（逻辑 displayId 都是小整数）。
+        displayId: {
+          oneOf: [{ type: 'string' }, { type: 'number' }],
+          description:
+            '逻辑 displayId（小整数，可用 number）或 SurfaceFlinger id。' +
+            '**sfId 是 19 位大整数，必须按字符串传**，否则精度丢失（如 4630946964337362323 ' +
+            '变成 4630946964337362000）。省略则用默认屏。',
+        },
         maxFrameAgeMs: {
           type: 'number',
           description:
