@@ -224,14 +224,15 @@ recognize/
 │   ├── uitree.mjs                uiautomator XML 解析 + 可点祖先 + 有用性判定
 │   ├── observe.mjs               识别引擎（屏状态/截屏/树/OCR/合并）
 │   ├── fields.mjs                字段有界化（head+tail 截断）+ 帧缓存（新鲜度契约）
+│   ├── spawn-env.mjs             子进程环境分类（系统二进制剔除 LD_LIBRARY_PATH）
 │   └── ocr-windows.ps1           Windows OCR 后端（纯 ASCII）
-├── launcher.sh                   设备侧启动脚本（POSIX sh，运行时推导模块路径）
-├── install-screen-tools.sh       设备侧安装脚本（可重跑）
+├── launcher.sh                   设备侧启动脚本（POSIX sh，探测模块提供的 node 运行时）
 ├── cordis.patch.yml              接入 DSH 的 patch 配置（必须用 - insert: 包裹）
 ├── test-fields.mjs               单元测试：截断 / 有界化 / 缓存契约
+├── test-spawn-env.mjs            单元测试：子进程环境分类（拦住 LD_LIBRARY_PATH 污染）
 ├── test-screen-image-cache.mjs   单元测试：screen_image 缓存链路
 ├── test-serve.mjs                测试：PC 侧 CLI 的逐行 JSON 服务协议
-├── test-screen-mcp.mjs           测试：MCP 协议（可真机跑）
+├── test-screen-mcp.mjs           端到端：MCP 协议（带断言，可真机跑）
 ├── device-selftest.mjs           设备侧自检（原语可用性）
 ├── bench-frame-path.mjs          帧路径性能量化
 └── README.md
@@ -286,8 +287,14 @@ node recognize.mjs observe
 
 工具随即以 `mcp__screen__<name>` 出现。
 
-> 三层刻意分开：**识别层（本目录）不绑 harness**；MCP 是跨 harness 标准；
-> `cordis.patch.yml` 那一行是唯一的 harness 专属部分。换 harness 时只改最后一行。
+> **分层与中立性的准确说法**（先前这里写过"不出现任何 harness 名字"，过头了）：
+>
+> - **识别内核中立**：`screen-mcp.mjs`、`lib/uitree.mjs`、`lib/observe.mjs`、`lib/fields.mjs`、
+>   `lib/spawn-env.mjs`、`lib/device.mjs` 都不依赖任何 harness —— 它们只调 Android 平台原语。
+> - **部署适配器层明确绑定**：`launcher.sh` 要找 dsh_android 模块提供的 node 运行时，
+>   `cordis.patch.yml` 是 DSH 的配置格式。这一层就是用来绑的，不假装中立。
+>
+> 换 harness 时改的是适配器层，识别内核一行不动。
 
 ### 设备侧平台事实（实测于 Android 16 / arm64）
 
@@ -303,7 +310,9 @@ node recognize.mjs observe
 
 ## 已实测 / 未实测
 
-**已实测**（OnePlus PLK110 · Android 16 · KernelSU v3.3.0，`u:r:ksu:s0` + Enforcing）：
+**已实测 —— 两台设备**：
+
+**设备 A：OnePlus PLK110 · Android 16 · KernelSU v3.3.0**（`u:r:ksu:s0` + Enforcing）
 
 ```
 PC 形态
@@ -320,10 +329,22 @@ PC 形态
   MCP 协议        : initialize 2025-11-25 / tools/list 4 工具 / tools/call 全部正确
   多屏            : list_displays 正确报出主屏；非默认屏请求树 → 明确报错 tree-needs-app
   接入 DSH        : 日志确认「[screen-mcp] 客户端已初始化」，进程树显示 DSH 拉起 MCP 子进程
+```
+
+**设备 B：Xiaomi 25102RKBEC · Android 16**（由 @Strbit 端到端复跑，暴露了 `LD_LIBRARY_PATH` 那个坑）
+
+```
+带 DSH 服务的 LD_LIBRARY_PATH  -> uiautomator dump exit=1, 文件 0 B（树路线全灭）
+剔除该变量后                    -> uiautomator dump exit=0, 19774 B / xml 22585 B
+node 自身仍健康                 -> v26.4.0
+screencap 不受影响              -> 562471 / 563077 B（带与不带都能出图）
+```
 
 单元测试（本机，无需设备）
   test-fields             : 22/22 通过（head+tail 截断 / 数组有界化 / 缓存新鲜度契约）
+  test-spawn-env          : 15/15 通过（子进程环境分类 —— 拦住上面设备 B 那个坑）
   test-screen-image-cache : 6/6 通过（screen_image 缓存链路 / 主副屏不串味）
+  test-screen-mcp         : 端到端 MCP 协议，带断言（已实测"该失败时 exit=1"）
   bench-frame-path        : zlib 量化（level 1 = 21 ms, level 9 = 546 ms, 体积几乎一样）
 ```
 
@@ -336,6 +357,8 @@ PC 形态
 - OCR 对图标小字的准确率（PC 侧会误读成 `0@0`、`00` 之类噪声）
 - **帧缓存的真机收益**：设备上 `screencap -p` 的真实耗时（本机只有 zlib 量级，不是手机数字）
 - **JPEG 替代 PNG 的可行性**：需要先知道 `screencap` 无参数输出的原始格式 —— 没设备取不到
+- **设备 B 上修复后的完整端到端**：`run()` 的环境分类已在本机被 15 项断言覆盖，
+  但"在 Xiaomi 上装新模块并跑通四条工具"需要在设备上确认
 
 ---
 
@@ -352,6 +375,33 @@ PC 形态
 5. **`uiautomator dump` 只能写文件**，`/dev/tty`、`/proc/self/fd/1`、`-`、`/dev/stdout` 四种 stdout 方式
    全部拿不到内容。且 `uiautomator dump --help` 不支持 help，只会生成 `/sdcard/window_dump.xml`。
 6. **嵌套引号在 `adb shell` 里极脆弱**（`$VAR` 会被宿主 shell 吃掉，`|` 会被解析）。复杂操作写成脚本文件再推上去执行。
+7. **`LD_LIBRARY_PATH` 会按环境打死 `uiautomator` —— 但删不得，因为 node 自己需要它。**
+   这是本模块最隐蔽的一个坑，由 @Strbit 在第二台设备（Xiaomi / Android 16）上端到端测出来：
+
+   ```
+   DSH 服务导出 LD_LIBRARY_PATH=<模块>/usr/lib（模块自带 node 需要它找 libz 等库）
+   screen-mcp 由 harness 经 stdio spawn → 必然继承
+   同一台设备, 同一条命令:
+     带该变量   -> uiautomator dump  exit=1, 文件大小 0
+     不带该变量 -> uiautomator dump  exit=0, 19774 B
+   ```
+
+   报错是 `CANNOT LINK EXECUTABLE "app_process": cannot find "libz.so" from verneed[1]` ——
+   尽管 `libz.so -> libz.so.1.3.2` 符号链接**明明存在**（机制是 verneed 版本节点校验）。
+
+   **不能全局删**：删掉后 `/usr/bin/node` 报 `library "libz.so.1" not found`。
+   一个变量两向绑定 —— **唯一正确的修法是按子进程区分**：系统二进制剔除，node 保留。
+   见 `lib/spawn-env.mjs`，有 15 项断言盯着这件事（`test-spawn-env.mjs`）。
+
+   > 另一台设备才能暴露的坑：作者在 OnePlus 上测时该变量恰好不致命，所以没发现。
+   > 跨设备验证不是可选项。
+
+8. **测试没有断言 = 假绿**。`test-screen-mcp.mjs` 最初只打印期望值、不设 `process.exitCode`，
+   于是子进程压根没起来也报"通过" —— 而它恰好是唯一覆盖端到端路径、唯一能拦住上面第 7 条的测试。
+   现在它有真断言，且已实测过"该失败时确实 exit=1"。
+
+9. **测试 runner 必须支持 async**。最初的 runner 是 `try { fn() }`，对 async 测试抓不到 rejection，
+   7 个缓存测试的失败被静默吞掉（显示"22 通过"是假的）。现在是顺序 `await` 的 runner。
 
 ---
 

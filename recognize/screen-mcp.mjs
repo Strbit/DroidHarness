@@ -19,11 +19,12 @@
 //
 // 传输: stdio, JSON-RPC 2.0, 每行一个消息。
 
-import { execFile, execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { FrameCache, truncateField, boundArray } from './lib/fields.mjs';
+import { runCommand } from './lib/spawn-env.mjs';
 
 const PROTOCOL_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05', '2024-10-07'];
 const LATEST = PROTOCOL_VERSIONS[0];
@@ -37,18 +38,21 @@ const rpcOut = (obj) => process.stdout.write(JSON.stringify(obj) + '\n');
 
 // ── 平台原语 ──────────────────────────────────────────────
 
+/**
+ * 执行子进程。
+ *
+ * **环境按命令类别区分**(这是阻断级修复, 见 lib/spawn-env.mjs 的详细说明):
+ * 本进程由 harness 经 stdio spawn, 继承了 DSH 服务导出的
+ * `LD_LIBRARY_PATH=<模块>/usr/lib`。该路径下是 Termux 编译的库, 系统二进制
+ * (尤其 `uiautomator`, 它经 `app_process` 起 ART)加载它们会 fatal:
+ *   CANNOT LINK EXECUTABLE "app_process": cannot find "libz.so" from verneed[1]
+ * 而 node 自身又**需要**这个变量。一个变量两向绑定, 所以只能按子进程区分 ——
+ * 系统二进制剔除, node 保留。
+ *
+ * 参数始终走 argv 数组(不拼 shell 字符串), 这挡住了来自 tool call 参数的注入。
+ */
 function run(cmd, args, opts = {}) {
-  return new Promise((resolve, reject) => {
-    execFile(cmd, args, {
-      maxBuffer: 256 * 1024 * 1024,
-      timeout: opts.timeout || 20000,
-      encoding: opts.encoding === undefined ? 'utf8' : opts.encoding,
-      ...opts.execOpts,
-    }, (err, stdout, stderr) => {
-      if (err) reject(Object.assign(new Error(`${cmd} ${args.join(' ')}: ${err.message}`), { stderr }));
-      else resolve({ stdout, stderr });
-    });
-  });
+  return runCommand(cmd, args, { ...opts, spawnImpl: execFile });
 }
 
 /** 屏列表: 从 dumpsys display 解析, 运行时推导不硬编码 */
