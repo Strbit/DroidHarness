@@ -93,9 +93,16 @@ echo ""
 sh "$DSHCTL" status
 echo ""
 echo "──────────────────"
-echo "手机上直接开:  http://127.0.0.1:$PORT"
-echo "从 PC 开:      adb forward tcp:$PORT tcp:$PORT"
-echo "               然后浏览器访问 http://127.0.0.1:$PORT"
+if [ "$WAS_RUNNING" = 1 ]; then
+	# 关掉了就别再给链接: 那时候 3080 上没人听, 点了只得到一个"无法连接"。
+	echo "已关闭。想再用: 再按一次这个按钮。"
+else
+	echo "手机上直接开:  http://127.0.0.1:$PORT"
+	echo "  (要先取 token:  su -c 'dshctl url'  会打印一条带 token 的完整链接)"
+	echo "  日志里的 token 已掩码, 只有 dshctl url / dshctl token 给出真值。"
+	echo "从 PC 开:      adb forward tcp:$PORT tcp:$PORT"
+	echo "               然后浏览器访问上面那条链接"
+fi
 echo ""
 echo "开机仍会自动拉起 (service.sh). 想连开机一起停:"
 echo "  在 KernelSU 模块列表里禁用本模块即可."
