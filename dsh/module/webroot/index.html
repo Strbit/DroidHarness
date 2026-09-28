@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>DSH 控制台</title>
+<!--
+  DSH on Android — KernelSU 模块 WebUI（菜单）
+
+  ── 为什么是一个单文件、零外部依赖 ───────────────────────────────
+  手机可能完全离线。任何指向 CDN 的 link 标签或在线字体都会让页面在离线时
+  变成白屏或错版。所以 CSS/JS 全部内联，字体只用系统栈 —— 本文件里没有
+  任何一个指向外部主机的资源标签（可 grep 验证）。
+
+  ── 安全模型（这是本文件最重要的部分）────────────────────────────
+  `ksu.exec` 是**以 root 身份执行的 shell**，从页面 JS 直接可达。本页面因此
+  遵守三条硬规则：
+
+  1. 所有发出去的命令都是**静态字面量**，绝不拼接任何来自 DOM 的值。
+     唯一的"参数"是日志行数，它只能从固定档位（20/40/100）里选，
+     而且是内部常量数组的取值，不是输入框内容。
+
+  2. 不使用任何 `location` / `postMessage` / `localStorage` 里的值构造命令。
+     localStorage 还会随 Manager 卸载而丢失，所以状态一律不存它。
+
+  3. token 默认**掩码显示**，要显式点击才展开。
+
+  为什么"不拼接"这条必须这么死板 —— 见下面 ksu.spawn 那段：它的 args
+  根本没有 shell 转义。
+
+  ── KernelSU 侧协议（读源码得到，不是猜的）──────────────────────
+  证据: tiann/KernelSU @ main,
+        manager/app/src/main/java/me/weishu/kernelsu/ui/webui/WebViewInterface.kt
+
+  · 全局对象名是 `ksu`（不是 `kernelsu`；后者只是 npm 包名）。
+
+  · exec(cmd, optionsJson, callbackFuncName)
+    执行完调 `window[callbackFuncName](errno, stdout, stderr)`。
+    它是**同步执行**的（`withNewRootShell { ... .exec() }` 直接跑完才返回），
+    所以调用方 JS 线程会被阻塞到命令结束 —— 这就是下面的慢操作
+    一律走 spawn 的原因。
+
+  · spawn(command, argsJson, optionsJson, callbackFuncName)
+    异步 `enqueue()`, 通过 `loadUrl("javascript: ...")` 回调, 事件是:
+        window[cb].stdout.emit('data', 一行)
+        window[cb].stderr.emit('data', 一行)
+        window[cb].emit('exit', code)
+        window[cb].emit('error', err)      // 仅当 code != 0
+    注意 emitData 拼的是 `${callbackFunc}.${name}.emit(...)`, 所以回调必须
+    是**挂在 window 上的对象**, 且该对象带 stdout/stderr 两个子对象。
+
+  · ⚠️ spawn 的 args **不做任何 shell 转义**:
+        finalCommand.append(command).append(" ")
+        argsArray.forEach { finalCommand.append(it).append(" ") }
+    `JSONObject.quote` 在源码里只用于把数据安全嵌进 JS 字符串, 与 shell 无关。
+    所以"用 spawn 传数组就安全"是**错的** —— 参数里一个空格或分号照样
+    拼进 root shell。本文件因此连"安全参数"都不用: 只用静态命令。
+
+  · loadUrl("javascript:") 的回调是异步的, 且**没有返回值** —— 回调里只能
+    改 DOM, 不能同步返回结果。
+-->
+<style>
+:root{
+  --bg:#0e1116; --card:#161b22; --card2:#1c2230; --line:#26303d;
+  --fg:#e6edf3; --dim:#8b949e; --ok:#3fb950; --bad:#f85149;
+  --warn:#d29922; --accent:#4c8dff; --radius:14px;
+}
+@media (prefers-color-scheme:light){
+  :root{ --bg:#f2f4f7; --card:#fff; --card2:#f7f9fb; --line:#dde3ea;
+         --fg:#1f2328; --dim:#5b6572; --accent:#0a63d6;
+         --ok:#1a7f37; --bad:#cf222e; --warn:#9a6700; }
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  background:var(--bg); color:var(--fg);
+  font:15px/1.55 -apple-system,"Segoe UI",Roboto,"Noto Sans CJK SC",
+       "PingFang SC","Microsoft YaHei",sans-serif;
+  padding:calc(16px + env(safe-area-inset-top)) 14px
+          calc(28px + env(safe-area-inset-bottom));
+  -webkit-text-size-adjust:100%;
+  overflow-wrap:anywhere;
+}
+h1{font-size:19px;margin:0 0 2px;letter-spacing:.2px}
+.sub{color:var(--dim);font-size:12.5px;margin:0 0 14px}
+.card{
+  background:var(--card); border:1px solid var(--line);
+  border-radius:var(--radius); padding:14px; margin:0 0 12px;
+}
+.card h2{
+  font-size:13px; font-weight:600; color:var(--dim);
+  margin:0 0 10px; letter-spacing:.4px; text-transform:uppercase;
+}
+.row{display:flex;align-items:center;gap:9px}
+.dot{
+  width:10px;height:10px;border-radius:50%;background:var(--dim);
+  flex:0 0 auto;
+}
+.dot.on{background:var(--ok);box-shadow:0 0 0 4px rgba(63,185,80,.16)}
+.dot.off{background:var(--bad)}
+.dot.busy{background:var(--warn);animation:pulse 1s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.32}}
+#stateText{font-size:17px}
+dl{margin:11px 0 0;display:grid;grid-template-columns:auto 1fr;gap:5px 12px;font-size:13.5px}
+dt{color:var(--dim)}
+dd{margin:0;font-variant-numeric:tabular-nums}
+.btns{display:grid;grid-template-columns:1fr 1fr;gap:9px}
+button{
+  font:inherit;font-weight:600;font-size:14.5px;
+  padding:12px 10px;border-radius:11px;cursor:pointer;
+  border:1px solid var(--line);background:var(--card2);color:var(--fg);
+  transition:filter .12s,opacity .12s;
+  -webkit-tap-highlight-color:transparent;
+}
+button:active{filter:brightness(1.25)}
+button:disabled{opacity:.42;cursor:default}
+button.primary{background:var(--accent);border-color:transparent;color:#fff}
+button.danger{color:var(--bad)}
+button.armed{background:var(--bad);border-color:transparent;color:#fff}
+button.wide{grid-column:1/-1}
+.chips{display:flex;gap:7px;margin:0 0 10px;flex-wrap:wrap}
+.chip{
+  font-size:12.5px;padding:5px 12px;border-radius:999px;
+  border:1px solid var(--line);background:transparent;color:var(--dim);
+  cursor:pointer;font-weight:500;
+}
+.chip.sel{border-color:var(--accent);color:var(--accent);font-weight:600}
+pre{
+  margin:0;padding:11px;border-radius:10px;background:var(--card2);
+  border:1px solid var(--line);
+  font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  max-height:260px;overflow:auto;white-space:pre-wrap;word-break:break-all;
+}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px}
+.hint{color:var(--dim);font-size:12.5px;margin:9px 0 0}
+.link{
+  display:block;padding:11px;border-radius:10px;background:var(--card2);
+  border:1px solid var(--line);color:var(--accent);text-decoration:none;
+  font-size:12.5px;word-break:break-all;
+}
+.link.disabled{color:var(--dim);pointer-events:none;opacity:.6}
+.mask{letter-spacing:2px}
+.err{color:var(--bad);font-size:13px;margin:9px 0 0}
+.hidden{display:none}
+</style>
+</head>
+<body>
+
+<h1>DSH 控制台</h1>
+<p class="sub" id="modinfo">KernelSU 模块 · 正在读取…</p>
+
+<section class="card">
+  <div class="row">
+    <span class="dot" id="dot"></span>
+    <strong id="stateText">读取中…</strong>
+  </div>
+  <dl id="detail"></dl>
+  <p class="err hidden" id="err"></p>
+</section>
+
+<section class="card">
+  <h2>操作</h2>
+  <div class="btns">
+    <button id="bStart" class="primary">启动</button>
+    <button id="bStop" class="danger">停止</button>
+    <button id="bRestart" class="danger">重启</button>
+    <button id="bRefresh">刷新状态</button>
+  </div>
+  <p class="hint" id="opHint">启动约 10~15 秒（等 HTTP 能应答）；停止约 3 秒。</p>
+</section>
+
+<section class="card">
+  <h2>日志</h2>
+  <div class="chips" id="logChips"></div>
+  <pre id="logBody">点上面任意档位读日志。</pre>
+  <p class="hint">token 在日志里是掩码的；要真值用下面的入口。</p>
+</section>
+
+<section class="card">
+  <h2>访问入口</h2>
+  <p class="hint" style="margin:0 0 10px">手机上直接在浏览器打开下面这条。链里带 token，别外发。</p>
+  <a class="link disabled" id="urlBox" href="#">（未运行 / 未取到）</a>
+  <div class="btns" style="margin-top:10px">
+    <button id="bUrl">取链接</button>
+    <button id="bCopy">复制</button>
+  </div>
+</section>
+
+<section class="card">
+  <h2>token</h2>
+  <div class="mono mask" id="tokenBox">••••••••••••••••••••••••••</div>
+  <div class="btns" style="margin-top:10px">
+    <button id="bToken">取 token</button>
+    <button id="bReveal">显示</button>
+  </div>
+  <p class="hint">默认掩码，防止被人顺手截图带走。</p>
+</section>
+
+<script>
+'use strict';
+/* ── 常量: 全部是静态字面量 ─────────────────────────────────── */
+var DEFAULT_MODID = 'dsh_android';
+var CTL = '';                       // 见 init(): /data/adb/modules/<id>/bin/dshctl
+var LOG_LINES = [20, 40, 100];      // 日志档位白名单 —— 不自由输入
+var logLines = 40;                  // 当前档位
+var seq = 0;
+
+function $(id){ return document.getElementById(id); }
+function text(el, s){ el.textContent = s; }
+
+/* 桥可用性: 只有经 KernelSU Manager 打开这个页面时 window.ksu 才存在。
+   直接拿浏览器开这个文件 (file:// 或别的 http) 时它没有 —— 这时要给一句
+   人话, 而不是让每个按钮静默失败。 */
+var HAS_KSU = (typeof ksu !== 'undefined') && ksu && (typeof ksu.exec === 'function');
+
+function noBridge(){
+  $('dot').className = 'dot off';
+  text($('stateText'), '没有连接到 KernelSU');
+  text($('modinfo'), '这个页面要用 KernelSU Manager 的「WebUI」按钮打开');
+  ['bStart','bStop','bRestart','bRefresh','bUrl','bCopy','bToken','bReveal'].forEach(function(id){
+    $(id).disabled = true;
+  });
+  showErr('当前环境里没有 ksu 对象，所以无法执行任何命令。这不是 DSH 的问题。');
+}
+
+/* ── ksu 桥的封装 ──────────────────────────────────────────────
+   两条都要按 WebViewInterface.kt 的协议来, 差一点就静默不回调。 */
+
+// exec: 回调名是挂在 window 上的**函数名**。同步执行, 会阻塞 JS 线程,
+// 所以只给快命令用 (status / token / url / 短日志)。
+function ksuExec(cmd){
+  // 无桥时给一个"失败但形状正确"的结果, 免得调用方 .then 永远不执行、
+  // 页面卡在"读取中"。人话提示由 noBridge() 负责。
+  if (!HAS_KSU) return Promise.resolve({ errno: -1, stdout: '', stderr: '没有 ksu 桥' });
+  return new Promise(function(resolve, reject){
+    var name = '__dsh_exec_' + (seq++);
+    var done = false;
+    window[name] = function(errno, stdout, stderr){
+      done = true;
+      delete window[name];
+      resolve({ errno: errno, stdout: stdout, stderr: stderr });
+    };
+    try {
+      ksu.exec(cmd, '{}', name);
+    } catch (e) {
+      delete window[name];
+      reject(e);
+      return;
+    }
+    // 兜底: 万一某版本不回调, 8 秒后放行, 免得 UI 永远卡在"读取中"。
+    setTimeout(function(){
+      if (!done) { delete window[name]; resolve({ errno: -1, stdout: '', stderr: '执行超时（未收到回调）' }); }
+    }, 8000);
+  });
+}
+
+// spawn: 回调名是挂在 window 上的**对象**, 该对象要有 stdout/stderr 两个
+// 带 emit 的子对象 (KernelSU 拼的是 `${cb}.stdout.emit('data', ...)`)。
+//
+// 慢命令必须走这条: exec 会阻塞 JS 线程到命令结束, 用它跑 start 会让整个
+// 页面冻结十几秒 (点不动、转圈也不动)。spawn 是 enqueue 后立刻返回。
+function ksuSpawn(command, args, onLine, onExit){
+  if (!HAS_KSU) {
+    onLine('没有 ksu 桥, 无法执行命令', true);
+    if (onExit) onExit(-1);
+    return null;
+  }
+  var name = '__dsh_spawn_' + (seq++);
+
+  function pipe(){
+    return {
+      _fns: [],
+      on: function(ev, fn){ if (ev === 'data') this._fns.push(fn); },
+      emit: function(ev, data){ if (ev === 'data') this._fns.forEach(function(f){ f(data); }); }
+    };
+  }
+  var proc = {
+    stdout: pipe(),
+    stderr: pipe(),
+    _fns: [],
+    on: function(ev, fn){ this._fns.push({ ev: ev, fn: fn }); },
+    emit: function(ev, v){
+      this._fns.forEach(function(h){ if (h.ev === ev) h.fn(v); });
+      // exit 之后 KernelSU 还会补一个 error 事件 (code != 0 时), 所以这里
+      // 不能立刻 delete; 延迟清掉即可。
+      if (ev === 'exit' || ev === 'error') {
+        setTimeout(function(){ delete window[name]; }, 4000);
+      }
+    }
+  };
+  proc.stdout.on('data', function(d){ onLine(d, false); });
+  proc.stderr.on('data', function(d){ onLine(d, true); });
+  if (onExit) proc.on('exit', onExit);
+  proc.on('error', function(err){ onLine((err && err.message) || String(err), true); });
+
+  window[name] = proc;
+  try {
+    ksu.spawn(command, JSON.stringify(args), '{}', name);
+  } catch (e) {
+    delete window[name];
+    if (onExit) onExit(-1);
+  }
+  return proc;
+}
+
+/* ── 小工具 ─────────────────────────────────────────────────── */
+var busy = false;
+
+function setBusy(on, label){
+  busy = on;
+  ['bStart','bStop','bRestart'].forEach(function(id){ $(id).disabled = on; });
+  if (on) {
+    $('dot').className = 'dot busy';
+    text($('stateText'), label || '处理中…');
+  }
+}
+function showErr(msg){
+  var e = $('err');
+  if (!msg) { e.className = 'err hidden'; return; }
+  e.className = 'err';
+  text(e, msg);
+}
+
+/* ── 状态 ───────────────────────────────────────────────────── */
+function renderStatus(out){
+  var running = /状态[:：]\s*运行中/.test(out);
+  $('dot').className = 'dot ' + (running ? 'on' : 'off');
+  text($('stateText'), running ? '运行中' : '未运行');
+
+  var dl = $('detail');
+  while (dl.firstChild) dl.removeChild(dl.firstChild);
+  var keys = { 'pid':'进程', '监督进程 pid':'监督进程', '监听':'监听',
+               '端口':'端口', 'HTTP':'HTTP' };
+  out.split('\n').forEach(function(line){
+    line = line.trim();
+    if (!line) return;
+    var m = line.match(/^(pid|监督进程 pid|监听|端口|HTTP)[:：]?\s*(.*)$/);
+    if (!m) return;
+    var dt = document.createElement('dt');
+    text(dt, keys[m[1]] || m[1]);
+    var dd = document.createElement('dd');
+    text(dd, (m[2] || '').replace(/\s*\(401.*$/, ''));
+    dl.appendChild(dt); dl.appendChild(dd);
+  });
+  // HTTP 401 是"在跑且要鉴权", 属正常 —— 在下面补一句人话。
+  var httpLine = out.split('\n').filter(function(l){ return /HTTP[:：]/.test(l); })[0];
+  if (httpLine && /401/.test(httpLine)) {
+    var dt2 = document.createElement('dt'); text(dt2, '说明');
+    var dd2 = document.createElement('dd'); text(dd2, '401 = 在跑但要求 token，属正常');
+    dl.appendChild(dt2); dl.appendChild(dd2);
+  }
+  $('opHint').textContent = running
+    ? '改完状态记得刷新；重启会短暂中断服务。'
+    : '启动约 10~15 秒（等 HTTP 能应答）；停止约 3 秒。';
+}
+
+function refresh(){
+  return ksuExec(CTL + ' status').then(function(r){
+    var out = (r.stdout || '') + (r.stderr || '');
+    if (!out.trim()) {
+      $('dot').className = 'dot off';
+      text($('stateText'), '读不到状态');
+      showErr('dshctl 没有输出。它可能不在这台设备上，或退出码 ' + r.errno + '。');
+      return;
+    }
+    showErr('');
+    renderStatus(out);
+    if (/未运行/.test(out)) { setUrl('', false); }
+  });
+}
+
+/* ── 操作: 慢命令走 spawn, 输出流到日志区 ───────────────────── */
+function runOp(verb, label){
+  if (busy) return;
+  setBusy(true, label + '中…');
+  showErr('');
+  var box = $('logBody');
+  text(box, '$ dshctl ' + verb + '\n');
+  var failed = false;
+
+  ksuSpawn(CTL, [verb],
+    function(line, isErr){
+      if (isErr) failed = true;
+      box.textContent += (isErr ? '! ' : '') + line + '\n';
+      box.scrollTop = box.scrollHeight;
+    },
+    function(code){
+      setBusy(false);
+      box.textContent += '\n[退出码 ' + code + ']\n';
+      box.scrollTop = box.scrollHeight;
+      if (code !== 0 || failed) {
+        showErr('这次 ' + label + ' 没成功（退出码 ' + code + '）。上面日志里有原因。');
+      }
+      refresh();
+    }
+  );
+}
+
+/* ── 日志档位 ───────────────────────────────────────────────── */
+function buildChips(){
+  var wrap = $('logChips');
+  LOG_LINES.forEach(function(n){
+    var b = document.createElement('button');
+    b.className = 'chip' + (n === logLines ? ' sel' : '');
+    text(b, n + ' 行');
+    b.onclick = function(){
+      logLines = n;
+      Array.prototype.forEach.call(wrap.children, function(c){ c.className = 'chip'; });
+      b.className = 'chip sel';
+      loadLog();
+    };
+    wrap.appendChild(b);
+  });
+}
+
+// 用 spawn 而不是 exec: 即使日志只有几十行, 走 exec 也是同步阻塞;
+// 而且 spawn 天然把"逐行到达"显示成流式。命令是静态的, 行数来自白名单常量。
+function loadLog(){
+  var box = $('logBody');
+  text(box, '读取中…');
+  var any = false;
+  ksuSpawn(CTL, ['log', String(logLines)],
+    function(line){ any = true; box.textContent += line + '\n'; box.scrollTop = box.scrollHeight; },
+    function(code){
+      if (!any) text(box, '(没有日志)');
+      if (code !== 0) box.textContent += '\n[退出码 ' + code + ']\n';
+    }
+  );
+}
+
+/* ── token 与链接 ───────────────────────────────────────────── */
+var realToken = '';
+var realUrl = '';
+var revealed = false;
+
+function maskToken(t){
+  if (t.length <= 8) return '•'.repeat(t.length || 8);
+  return t.slice(0, 4) + '•'.repeat(Math.min(18, t.length - 8)) + t.slice(-4);
+}
+function paintToken(){
+  if (!realToken) { text($('tokenBox'), '••••••••••••••••••••••••••'); return; }
+  $('tokenBox').className = 'mono' + (revealed ? '' : ' mask');
+  text($('tokenBox'), revealed ? realToken : maskToken(realToken));
+  text($('bReveal'), revealed ? '隐藏' : '显示');
+}
+function setUrl(u, ok){
+  var a = $('urlBox');
+  realUrl = u || '';
+  if (ok && u) {
+    a.className = 'link'; a.href = u; text(a, u);
+  } else {
+    a.className = 'link disabled'; a.removeAttribute('href');
+    text(a, '（未运行 / 未取到）');
+  }
+}
+
+/* ── 事件绑定 ───────────────────────────────────────────────── */
+$('bRefresh').onclick = function(){ setBusy(true, '刷新中…'); refresh().then(function(){ setBusy(false); }); };
+$('bStart').onclick = function(){ runOp('start', '启动'); };
+$('bRestart').onclick = function(){ armConfirm($('bRestart'), '重启', function(){ runOp('restart', '重启'); }); };
+
+// 停止/重启需要二次确认, 但不依赖 window.confirm —— WebView 里它是否可用
+// 取决于 WebChromeClient 的实现, 不值得赌。做法: 第一次点把按钮变成
+// "再点一次确认", 3 秒没跟上就自动复原。
+function armConfirm(btn, label, act){
+  if (btn.dataset.armed === '1') {
+    btn.dataset.armed = '0';
+    btn.className = 'danger';
+    text(btn, label);
+    act();
+    return;
+  }
+  btn.dataset.armed = '1';
+  btn.className = 'armed';
+  text(btn, '再点一次确认');
+  setTimeout(function(){
+    if (btn.dataset.armed === '1') {
+      btn.dataset.armed = '0';
+      btn.className = 'danger';
+      text(btn, label);
+    }
+  }, 3000);
+}
+$('bStop').onclick = function(){ armConfirm($('bStop'), '停止', function(){ runOp('stop', '停止'); }); };
+
+$('bUrl').onclick = function(){
+  ksuExec(CTL + ' url').then(function(r){
+    var u = (r.stdout || '').trim();
+    if (!u) { setUrl('', false); showErr('取不到链接（退出码 ' + r.errno + '）。DSH 可能没起来。'); return; }
+    showErr('');
+    setUrl(u, true);
+    // 顺手把 token 也填上, 省一次点击
+    var m = u.match(/token=([^\s&]+)/);
+    if (m) { realToken = m[1]; paintToken(); }
+  });
+};
+$('bCopy').onclick = function(){
+  if (!realUrl) { showErr('先点"取链接"。'); return; }
+  var ok = false;
+  try {
+    var ta = document.createElement('textarea');
+    ta.value = realUrl;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed'; ta.style.left = '-9999px';
+    document.body.appendChild(ta);
+    ta.select();
+    ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+  } catch (e) { ok = false; }
+  if (ok) { try { ksu.toast('链接已复制'); } catch (e) {} }
+  else { showErr('复制失败，长按上面那条链接手动复制。'); }
+};
+$('bToken').onclick = function(){
+  ksuExec(CTL + ' token').then(function(r){
+    var t = (r.stdout || '').trim();
+    if (!t) { showErr('取不到 token（退出码 ' + r.errno + '）。'); return; }
+    showErr('');
+    realToken = t;
+    revealed = false;
+    paintToken();
+  });
+};
+$('bReveal').onclick = function(){
+  if (!realToken) { showErr('先点"取 token"。'); return; }
+  revealed = !revealed;
+  paintToken();
+};
+
+/* ── 启动 ───────────────────────────────────────────────────── */
+(function init(){
+  buildChips();
+  if (!HAS_KSU) { noBridge(); return; }
+
+  // 模块 id 优先问 KernelSU, 拿不到就用写死的默认值 (module.prop 里的 id)。
+  var id = DEFAULT_MODID;
+  try {
+    var mi = ksu.moduleInfo();
+    if (mi) {
+      var o = (typeof mi === 'string') ? JSON.parse(mi) : mi;
+      // 白名单校验: id 会被拼进每条 root 命令的路径里, 所以只接受
+      // 模块 id 合法字符集。虽然它理论上来自 KernelSU 自己, 但"上游可信"
+      // 不该是唯一防线 —— 校验一次的成本是零。
+      if (o && typeof o.id === 'string' && /^[A-Za-z0-9_]+$/.test(o.id)) id = o.id;
+    }
+  } catch (e) { /* 用默认值 */ }
+  CTL = '/data/adb/modules/' + id + '/bin/dshctl';
+  text($('modinfo'), '模块 ' + id + ' · 控制入口 ' + CTL);
+
+  setBusy(true, '读取中…');
+  refresh().then(function(){ setBusy(false); loadLog(); })
+           .catch(function(e){ setBusy(false); showErr('读取状态失败: ' + ((e && e.message) || e)); });
+})();
+</script>
+</body>
+</html>

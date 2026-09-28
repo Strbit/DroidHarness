@@ -147,6 +147,15 @@ else
 	ui_print "         检查 dsh/tools/build-dsh-tree.mjs 是否跑过"
 fi
 
+# KernelSU 的 WebUI 入口. 官方要求: webroot/ 下**必须**有 index.html, 否则
+# Manager 根本不显示「WebUI」按钮 —— 也就是说缺文件的表现不是报错, 而是
+# "按钮压根没出现", 很容易让人以为模块坏了。装机时就报出来。
+if [ -f "$MODPATH/webroot/index.html" ]; then
+	ui_print "  [ OK ] WebUI 在位 (webroot/index.html)"
+else
+	ui_print "  [WARN] 没有 webroot/index.html —— Manager 不会显示「WebUI」入口"
+fi
+
 # ─────────────────────────────────────────────────────────────
 # 4. 目录
 # ─────────────────────────────────────────────────────────────
@@ -224,7 +233,13 @@ set_perm "$MODPATH/service.sh" 0 0 0755 2>/dev/null
 # 没有执行位时按钮只会静默失败, 而失败点离代码很远, 很难归因.
 set_perm "$MODPATH/action.sh" 0 0 0755 2>/dev/null
 set_perm "$MODPATH/module.prop" 0 0 0644 2>/dev/null
+# ── webroot/ 故意**不在这里出现** ────────────────────────────
+# 官方文档明说: 安装模块时 KernelSU 自己会给 webroot/ 设权限和 SELinux 上下文,
+# "如果你不知道自己在做什么, 不要自己设置这个目录的权限"。
+# WebView 读不到文件时症状会是"WebUI 打开是白屏", 而归因会跑到"页面写错了"上,
+# 所以这里留字说明: webroot 的权限**不属于本脚本的职责**, 别顺手加 chmod -R。
 ui_print "  usr/ 递归设置; app/ 用 chmod -R 一次搞定; bin/ 三个入口"
+ui_print "  webroot/ 不动 (权限与 SELinux 上下文由 KernelSU 安装时设置)"
 
 # 复核一次. 如果 node 仍不可执行, 后面必然失败, 不如在这里就说清楚.
 if [ -x "$PREFIX/bin/node" ]; then
