@@ -1,0 +1,238 @@
+// uitree -- uiautomator dump 的 XML 解析
+//
+// 为什么不用一个 XML 库: uiautomator 的输出格式极其固定(单一层级 + 属性),
+// 而设备侧 Node 环境里少一个依赖就少一份风险。这个解析器只认它自己的方言。
+//
+// 关键能力: 给每个节点找"可点祖先"。
+// 依据: 无障碍树里真正的点击目标常常是父节点 —— 一个 TextView 本身
+// clickable=false, 但它的父 LinearLayout clickable=true。只收集
+// clickable=true 的节点会漏掉大量可点目标, 这是 R5(加固应用树为空)
+// 之外最常见的一类误判。
+
+/** 解析 HTML 实体(只需处理 uiautomator 会产出的那几个) */
+function decodeEntities(s) {
+  if (!s || s.indexOf('&') === -1) return s;
+  return s
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10)))
+    .replace(/&amp;/g, '&');
+}
+
+/** 解析 bounds="[x1,y1][x2,y2]" */
+export function parseBounds(s) {
+  if (!s) return null;
+  const m = s.match(/\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]/);
+  if (!m) return null;
+  const [x1, y1, x2, y2] = m.slice(1).map(Number);
+  return {
+    left: x1, top: y1, right: x2, bottom: y2,
+    width: x2 - x1, height: y2 - y1,
+    cx: Math.round((x1 + x2) / 2),
+    cy: Math.round((y1 + y2) / 2),
+  };
+}
+
+const BOOL_ATTRS = ['checkable', 'checked', 'clickable', 'enabled', 'focusable',
+  'focused', 'scrollable', 'long-clickable', 'password', 'selected'];
+
+/**
+ * 解析 uiautomator dump 的 XML。
+ * 返回一个"扁平但有结构"的节点数组, 每个节点带:
+ *   path / depth / index / text / desc / resourceId / class / package /
+ *   bounds / 各布尔属性 / childrenIndices / clickableAncestorIndices
+ */
+export function parseUiXml(xml) {
+  const hierarchyMatch = xml.match(/<hierarchy\b[^>]*>([\s\S]*)<\/hierarchy>/);
+  const body = hierarchyMatch ? hierarchyMatch[1] : xml;
+  const rotationMatch = xml.match(/<hierarchy[^>]*\brotation="(-?\d+)"/);
+  const rotation = rotationMatch ? Number(rotationMatch[1]) : null;
+
+  const nodes = [];
+  // 解析栈: 每项是 { nodeIndex, childCounter }
+  const stack = [];
+
+  const tagRe = /<(\/?)(node|hierarchy)\b([^>]*?)(\/?)>/g;
+  let m;
+  while ((m = tagRe.exec(body)) !== null) {
+    const [, closing, tag, attrStr] = m;
+    if (tag !== 'node') continue;
+
+    if (closing) {
+      if (stack.length) stack.pop();
+      continue;
+    }
+
+    const attrs = {};
+    const attrRe = /([\w-]+)="([^"]*)"/g;
+    let a;
+    while ((a = attrRe.exec(attrStr)) !== null) {
+      attrs[a[1]] = decodeEntities(a[2]);
+    }
+
+    const parent = stack.length ? stack[stack.length - 1] : null;
+    if (parent) {
+      parent.childCount += 1;
+    }
+
+    // 可点祖先链 = 父节点的可点祖先链, 若父节点本身可点则再加上父节点
+    const ancestorIndices = parent ? parent.clickableAncestors.slice() : [];
+    if (parent && parent.node.clickable === true) {
+      ancestorIndices.push(parent.nodeIndex);
+    }
+
+    const nodeIndex = nodes.length;
+    const node = {
+      index: nodeIndex,
+      path: parent ? `${parent.node.path}/${parent.childCount - 1}` : '0',
+      depth: stack.length,
+      text: attrs.text || '',
+      desc: attrs['content-desc'] || '',
+      resourceId: attrs['resource-id'] || '',
+      className: attrs.class || '',
+      package: attrs.package || '',
+      hint: attrs.hint || '',
+      bounds: parseBounds(attrs.bounds),
+      boundsRaw: attrs.bounds || null,
+      childCount: 0,
+      childrenIndices: [],
+      clickableAncestorIndices: ancestorIndices,
+      drawOrder: attrs['drawing-order'] !== undefined ? Number(attrs['drawing-order']) : null,
+    };
+    for (const b of BOOL_ATTRS) {
+      node[camel(b)] = attrs[b] === 'true';
+    }
+    // 短横线属性名在 camel() 里被处理成 longClickable
+    node.longClickable = attrs['long-clickable'] === 'true';
+
+    nodes.push(node);
+    if (parent) parent.node.childrenIndices.push(nodeIndex);
+
+    const selfClosing = attrStr.trimEnd().endsWith('/') || m[4] === '/';
+    if (!selfClosing) {
+      stack.push({ node, nodeIndex, childCount: 0, clickableAncestors: ancestorIndices });
+    }
+  }
+
+  return { rotation, nodes };
+}
+
+function camel(s) {
+  return s.replace(/-(\w)/g, (_, c) => c.toUpperCase());
+}
+
+/** 节点可读标签: text 优先, 其次 content-desc */
+export function labelOf(node) {
+  const t = (node.text || '').trim();
+  if (t) return t;
+  const d = (node.desc || '').trim();
+  if (d) return d;
+  return '';
+}
+
+/**
+ * 判断树"有没有值得动手的节点"。
+ *
+ * 依据 docs/android-agent-harness-plan.md §5.2:
+ *   引擎自绘的界面不是空树而是"没用的树"(可能只有一个全屏 SurfaceView)。
+ *   判据应该是"有没有值得动手的节点", 不是"树是否为空"。
+ */
+export function isUsefulTree(parsed) {
+  // 同 toTargets：入口先校验，避免深处抛 TypeError（R-3 加固）
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.nodes)) {
+    throw new TypeError(
+      `isUsefulTree 需要一个带 .nodes 数组的解析结果对象，收到的是 ` +
+      `${parsed === null ? 'null' : Array.isArray(parsed) ? '数组' : typeof parsed}`);
+  }
+  const actionable = parsed.nodes.filter((n) =>
+    (n.clickable || n.longClickable || n.scrollable || n.checkable) ||
+    (labelOf(n) && n.depth > 0));
+  const withLabel = parsed.nodes.filter((n) => labelOf(n).length > 0);
+  return {
+    useful: actionable.length > 0,
+    totalNodes: parsed.nodes.length,
+    actionableCount: actionable.length,
+    labelledCount: withLabel.length,
+    reason: actionable.length === 0
+      ? (parsed.nodes.length <= 2
+          ? 'tree-empty: 只有 ' + parsed.nodes.length + ' 个节点, 疑似自绘界面或抓取失败'
+          : 'tree-useless: ' + parsed.nodes.length + ' 个节点但无可操作项, 疑似自绘界面')
+      : null,
+  };
+}
+
+/** 扁平节点 → 可操作目标清单(含可点祖先解析) */
+/**
+ * 扁平节点 → 可操作目标清单(含可点祖先解析)
+ *
+ * `center` 必须产出 —— 它是**整条管道的去重契约**：
+ *   recognize.mjs 的 dedupeTargets 与 lib/observe.mjs 的 mergeObservations
+ *   都按 center 判"两个目标是不是指向同一处"。
+ * 缺了它不会报错，只会**静默不去重**（父容器 + 图标 + 文字三层都指向同一处时
+ * 三个目标全保留）。所以这里按 bounds 算出来，而不是留给调用方各自补。
+ */
+export function toTargets(parsed, { includeDisabled = false } = {}) {
+  // R-3 加固：这里曾经因为调用方传了**节点数组**而不是解析结果对象而崩
+  // （recognize.mjs:81 的 `toTargets(t.nodes)` -> `for...of undefined`）。
+  // 与其让它在深处抛 TypeError，不如在入口给出说得清的错 —— 含实际收到的类型与键。
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.nodes)) {
+    const got = parsed === null ? 'null'
+      : Array.isArray(parsed) ? `数组(长度 ${parsed.length})`
+        : typeof parsed === 'object' ? `对象(键: ${Object.keys(parsed).slice(0, 8).join(', ') || '无'})`
+          : typeof parsed;
+    throw new TypeError(
+      `toTargets 需要一个带 .nodes 数组的解析结果对象，收到的是 ${got}。` +
+      `（常见误用：把 parsed.nodes 数组本身传了进来 —— 传 parsed 即可）`);
+  }
+  const out = [];
+  for (const n of parsed.nodes) {
+    const clickableAncestor = n.clickableAncestorIndices.length
+      ? parsed.nodes[n.clickableAncestorIndices[n.clickableAncestorIndices.length - 1]]
+      : null;
+    // 自身可点, 或存在可点祖先, 才算候选目标
+    const selfActionable = n.clickable || n.longClickable;
+    const viaAncestor = !selfActionable && !!(clickableAncestor && clickableAncestor.clickable);
+    if (!selfActionable && !viaAncestor) continue;
+    if (!includeDisabled && n.enabled === false) continue;
+    const label = labelOf(n) || (clickableAncestor ? labelOf(clickableAncestor) : '');
+    // 真正该点哪个框: 自身可点就用自己, 否则用可点祖先
+    const targetNode = selfActionable ? n : clickableAncestor;
+    out.push({
+      text: n.text,
+      desc: n.desc,
+      label,
+      resourceId: n.resourceId,
+      className: n.className,
+      package: n.package,
+      bounds: n.bounds,
+      // 去重契约(见函数注释): 有标签的按自身位置, 否则按真正可点的那个框
+      center: n.bounds ? { x: n.bounds.cx, y: n.bounds.cy } : null,
+      clickable: n.clickable,
+      longClickable: n.longClickable,
+      scrollable: n.scrollable,
+      enabled: n.enabled,
+      // 有标签 => 可信度高; 只是容器/图标 => 低
+      confidence: labelOf(n) ? 0.95 : 0.6,
+      targetNodeIndex: selfActionable ? n.index : clickableAncestor.index,
+      // 需要往上找可点祖先时, 把"真正该点的那个框"一并给出（比只有中心点更有用）
+      clickTarget: targetNode === n ? null : {
+        center: targetNode.bounds ? { x: targetNode.bounds.cx, y: targetNode.bounds.cy } : null,
+        className: targetNode.className,
+        resourceId: targetNode.resourceId,
+        label: labelOf(targetNode),
+      },
+      viaAncestor: viaAncestor ? {
+        nodeIndex: clickableAncestor.index,
+        className: clickableAncestor.className,
+        resourceId: clickableAncestor.resourceId,
+        bounds: clickableAncestor.bounds,
+        label: labelOf(clickableAncestor),
+      } : null,
+    });
+  }
+  return out;
+}
