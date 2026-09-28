@@ -36,6 +36,32 @@ sleep 5
 #   · TMPDIR 为什么不用 /data/local/tmp
 . "$MODDIR/bin/env.sh"
 
+# ── 权限: 收紧整棵树 (开机一次) ─────────────────────────────
+#
+# env.sh 的 umask 只保证**以后新建**的东西是 root-only; 旧版本在 umask 0000 下
+# 留下的那批 0777/0666 得显式清一遍 —— 否则「含启动 token 的文件任何 app 可读」
+# 这件事会一直挂着, 而且新装的模块**看不见**(顶层我 chmod 过了)。
+#
+# 为什么放 service.sh 而不是 env.sh: 整树递归不该每次 `dsh` 命令行调用都跑,
+# 而 service.sh 只在开机 / `dshctl start` 时执行。
+#
+# 为什么是一条 chmod -R 而不是 find -exec chmod: 后者**每个文件起一个进程**,
+# 这棵树 4031 个条目就是 4031 次 fork; chmod -R 在单个进程里走目录树。
+# 实测整树 **69ms**, 放在开机路径上没有代价。
+#
+# 用符号模式而不是 0700/0600: 大写 `X` 只对**目录或本来就有执行位的文件**加 x,
+# 所以 profiles/*/node_modules/.bin 里那些真需要执行位的脚本不会被抹掉,
+# 普通数据文件也不会被误加执行位。
+#
+# 两个安全前提都是在这台设备上实测过的, 不是假设:
+#   · toybox `chmod -R` **不跟符号链接** —— 造一个 -> /etc/hosts 的链接放进去,
+#     跑完 /etc/hosts 权限没变。不会顺着链接跑出去改系统文件。
+#   · 收紧后 pnpm 照常工作 —— store 文件变 600 但 `dsh plugin --profile web list`
+#     仍然 exit=0; store 与 node_modules 之间是硬链接(同 inode, links=3),
+#     改权限不影响链接关系。
+chmod -R u+rwX,go-rwx "$DSH_HOME_DIR" 2>/dev/null ||
+	echo "[$(date)] chmod -R $DSH_HOME_DIR 非 0, 权限可能没全部收紧" >>"$LOG"
+
 {
 	echo ""
 	echo "=========================================="
