@@ -15,7 +15,13 @@
 
   ── 安全模型（这是本文件最重要的部分）────────────────────────────
   `ksu.exec` 是**以 root 身份执行的 shell**，从页面 JS 直接可达。本页面因此
-  遵守三条硬规则：
+  遵守四条硬规则：
+
+  0. **本页只读**：没有启动/停止/重启。开关是 KernelSU 的「执行」按钮，
+     两个入口做同一件事必然各自漂移，而更要紧的是 —— 页面能发的命令一旦
+     只剩 `status` / `url` / `log`，将来这里出任何逻辑漏洞或被注入，
+     最坏结果也只是"看到日志和当前 token"，而不是"以 root 停掉服务"。
+     缩小可达命令集比给危险命令加确认框更值钱。
 
   1. 所有发出去的命令都是**静态字面量**，绝不拼接任何来自 DOM 的值。
      唯一的"参数"是日志行数，它只能从固定档位（20/40/100）里选，
@@ -24,7 +30,9 @@
   2. 不使用任何 `location` / `postMessage` / `localStorage` 里的值构造命令。
      localStorage 还会随 Manager 卸载而丢失，所以状态一律不存它。
 
-  3. token 默认**掩码显示**，要显式点击才展开。
+  3. token 全页面只出现在**一处**: 「访问入口」那条链接里, 而且要显式点
+     「取链接」才去取。以前另有一个 token 卡展示同一个值, 那是把截图泄露面
+     翻倍, 已删。日志里的 token 由 dshctl 掩码, 页面不还原它。
 
   为什么"不拼接"这条必须这么死板 —— 见下面 ksu.spawn 那段：它的 args
   根本没有 shell 转义。
@@ -38,8 +46,8 @@
   · exec(cmd, optionsJson, callbackFuncName)
     执行完调 `window[callbackFuncName](errno, stdout, stderr)`。
     它是**同步执行**的（`withNewRootShell { ... .exec() }` 直接跑完才返回），
-    所以调用方 JS 线程会被阻塞到命令结束 —— 这就是下面的慢操作
-    一律走 spawn 的原因。
+    所以调用方 JS 线程会被阻塞到命令结束 —— 这就是读日志一律走 spawn
+    的原因（它 enqueue 后立刻返回，还能流式出字）。
 
   · spawn(command, argsJson, optionsJson, callbackFuncName)
     异步 `enqueue()`, 通过 `loadUrl("javascript: ...")` 回调, 事件是:
@@ -115,10 +123,6 @@ button{
 }
 button:active{filter:brightness(1.25)}
 button:disabled{opacity:.42;cursor:default}
-button.primary{background:var(--accent);border-color:transparent;color:#fff}
-button.danger{color:var(--bad)}
-button.armed{background:var(--bad);border-color:transparent;color:#fff}
-button.wide{grid-column:1/-1}
 .chips{display:flex;gap:7px;margin:0 0 10px;flex-wrap:wrap}
 .chip{
   font-size:12.5px;padding:5px 12px;border-radius:999px;
@@ -126,13 +130,13 @@ button.wide{grid-column:1/-1}
   cursor:pointer;font-weight:500;
 }
 .chip.sel{border-color:var(--accent);color:var(--accent);font-weight:600}
+.chip.right{margin-left:auto}
 pre{
   margin:0;padding:11px;border-radius:10px;background:var(--card2);
   border:1px solid var(--line);
   font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
   max-height:260px;overflow:auto;white-space:pre-wrap;word-break:break-all;
 }
-.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px}
 .hint{color:var(--dim);font-size:12.5px;margin:9px 0 0}
 .link{
   display:block;padding:11px;border-radius:10px;background:var(--card2);
@@ -140,7 +144,6 @@ pre{
   font-size:12.5px;word-break:break-all;
 }
 .link.disabled{color:var(--dim);pointer-events:none;opacity:.6}
-.mask{letter-spacing:2px}
 .err{color:var(--bad);font-size:13px;margin:9px 0 0}
 .hidden{display:none}
 </style>
@@ -154,47 +157,31 @@ pre{
   <div class="row">
     <span class="dot" id="dot"></span>
     <strong id="stateText">读取中…</strong>
+    <button id="bRefresh" class="chip right">刷新</button>
   </div>
   <dl id="detail"></dl>
   <p class="err hidden" id="err"></p>
-</section>
-
-<section class="card">
-  <h2>操作</h2>
-  <div class="btns">
-    <button id="bStart" class="primary">启动</button>
-    <button id="bStop" class="danger">停止</button>
-    <button id="bRestart" class="danger">重启</button>
-    <button id="bRefresh">刷新状态</button>
-  </div>
-  <p class="hint" id="opHint">启动约 10~15 秒（等 HTTP 能应答）；停止约 3 秒。</p>
+  <!-- 启停不在这里: 「执行」按钮已经是开关 (按一下关、再按一下开),
+       这里再放三个按钮就是同一件事两个入口, 而且会各自漂移。 -->
+  <p class="hint">开关不在本页 —— 用 KernelSU 模块里的「执行」按钮，或它的桌面快捷方式。</p>
 </section>
 
 <section class="card">
   <h2>日志</h2>
   <div class="chips" id="logChips"></div>
   <pre id="logBody">点上面任意档位读日志。</pre>
-  <p class="hint">token 在日志里是掩码的；要真值用下面的入口。</p>
+  <p class="hint">日志里的 token 是掩码的；真值只在下面的访问入口里出现。</p>
 </section>
 
 <section class="card">
   <h2>访问入口</h2>
   <p class="hint" style="margin:0 0 10px">手机上直接在浏览器打开下面这条。链里带 token，别外发。</p>
-  <a class="link disabled" id="urlBox" href="#">（未运行 / 未取到）</a>
+  <a class="link disabled" id="urlBox" href="#">（还没取, 点下面「取链接」）</a>
   <div class="btns" style="margin-top:10px">
     <button id="bUrl">取链接</button>
     <button id="bCopy">复制</button>
   </div>
-</section>
-
-<section class="card">
-  <h2>token</h2>
-  <div class="mono mask" id="tokenBox">••••••••••••••••••••••••••</div>
-  <div class="btns" style="margin-top:10px">
-    <button id="bToken">取 token</button>
-    <button id="bReveal">显示</button>
-  </div>
-  <p class="hint">默认掩码，防止被人顺手截图带走。</p>
+  <p class="hint">点「取链接」才取真值 —— 全页面只有这一处带 token，不再单开一个 token 区。</p>
 </section>
 
 <script>
@@ -218,7 +205,7 @@ function noBridge(){
   $('dot').className = 'dot off';
   text($('stateText'), '没有连接到 KernelSU');
   text($('modinfo'), '这个页面要用 KernelSU Manager 的「WebUI」按钮打开');
-  ['bStart','bStop','bRestart','bRefresh','bUrl','bCopy','bToken','bReveal'].forEach(function(id){
+  ['bRefresh','bUrl','bCopy'].forEach(function(id){
     $(id).disabled = true;
   });
   showErr('当前环境里没有 ksu 对象，所以无法执行任何命令。这不是 DSH 的问题。');
@@ -228,7 +215,8 @@ function noBridge(){
    两条都要按 WebViewInterface.kt 的协议来, 差一点就静默不回调。 */
 
 // exec: 回调名是挂在 window 上的**函数名**。同步执行, 会阻塞 JS 线程,
-// 所以只给快命令用 (status / token / url / 短日志)。
+// 所以只给快命令用 (status / url)。命令行侧另有 dshctl token, 页面不再用它 ——
+// 同一个值展示两处只会多一个泄露点。
 function ksuExec(cmd){
   // 无桥时给一个"失败但形状正确"的结果, 免得调用方 .then 永远不执行、
   // 页面卡在"读取中"。人话提示由 noBridge() 负责。
@@ -258,8 +246,9 @@ function ksuExec(cmd){
 // spawn: 回调名是挂在 window 上的**对象**, 该对象要有 stdout/stderr 两个
 // 带 emit 的子对象 (KernelSU 拼的是 `${cb}.stdout.emit('data', ...)`)。
 //
-// 慢命令必须走这条: exec 会阻塞 JS 线程到命令结束, 用它跑 start 会让整个
-// 页面冻结十几秒 (点不动、转圈也不动)。spawn 是 enqueue 后立刻返回。
+// 读日志走这条而不是 exec: exec 会阻塞 JS 线程到命令结束, 而 spawn 是
+// enqueue 后立刻返回 —— 于是它天然把"逐行到达"显示成流式, 页面也不会卡。
+// (本页没有启停, 所以这里不再需要为"十几秒的慢命令"辩护。)
 function ksuSpawn(command, args, onLine, onExit){
   if (!HAS_KSU) {
     onLine('没有 ksu 桥, 无法执行命令', true);
@@ -305,14 +294,12 @@ function ksuSpawn(command, args, onLine, onExit){
 }
 
 /* ── 小工具 ─────────────────────────────────────────────────── */
-var busy = false;
-
-function setBusy(on, label){
-  busy = on;
-  ['bStart','bStop','bRestart'].forEach(function(id){ $(id).disabled = on; });
+// 本页没有写操作 (启停在「执行」按钮上), 所以"忙"只用于刷新时给个反馈,
+// 不再需要禁用按钮或防并发。
+function setLoading(on, label){
   if (on) {
     $('dot').className = 'dot busy';
-    text($('stateText'), label || '处理中…');
+    text($('stateText'), label || '读取中…');
   }
 }
 function showErr(msg){
@@ -350,9 +337,6 @@ function renderStatus(out){
     var dd2 = document.createElement('dd'); text(dd2, '401 = 在跑但要求 token，属正常');
     dl.appendChild(dt2); dl.appendChild(dd2);
   }
-  $('opHint').textContent = running
-    ? '改完状态记得刷新；重启会短暂中断服务。'
-    : '启动约 10~15 秒（等 HTTP 能应答）；停止约 3 秒。';
 }
 
 function refresh(){
@@ -366,35 +350,11 @@ function refresh(){
     }
     showErr('');
     renderStatus(out);
-    if (/未运行/.test(out)) { setUrl('', false); }
+    // 未运行时清掉链接; 恢复运行后必须把占位符从"未运行"改回中性,
+    // 否则从停止切回来会一直挂着那句已经过时的话。
+    if (/未运行/.test(out)) { setUrl('', 'down'); }
+    else if (!realUrl) { setUrl('', ''); }
   });
-}
-
-/* ── 操作: 慢命令走 spawn, 输出流到日志区 ───────────────────── */
-function runOp(verb, label){
-  if (busy) return;
-  setBusy(true, label + '中…');
-  showErr('');
-  var box = $('logBody');
-  text(box, '$ dshctl ' + verb + '\n');
-  var failed = false;
-
-  ksuSpawn(CTL, [verb],
-    function(line, isErr){
-      if (isErr) failed = true;
-      box.textContent += (isErr ? '! ' : '') + line + '\n';
-      box.scrollTop = box.scrollHeight;
-    },
-    function(code){
-      setBusy(false);
-      box.textContent += '\n[退出码 ' + code + ']\n';
-      box.scrollTop = box.scrollHeight;
-      if (code !== 0 || failed) {
-        showErr('这次 ' + label + ' 没成功（退出码 ' + code + '）。上面日志里有原因。');
-      }
-      refresh();
-    }
-  );
 }
 
 /* ── 日志档位 ───────────────────────────────────────────────── */
@@ -421,7 +381,13 @@ function loadLog(){
   text(box, '读取中…');
   var any = false;
   ksuSpawn(CTL, ['log', String(logLines)],
-    function(line){ any = true; box.textContent += line + '\n'; box.scrollTop = box.scrollHeight; },
+    function(line){
+      // 占位符要**整行换掉**, 不能让它和第一行日志拼在同一行
+      // (真机上出现过 "读取中…  HOME=/data/adb/dsh/workspace")。
+      if (!any) { box.textContent = ''; any = true; }
+      box.textContent += line + '\n';
+      box.scrollTop = box.scrollHeight;
+    },
     function(code){
       if (!any) text(box, '(没有日志)');
       if (code !== 0) box.textContent += '\n[退出码 ' + code + ']\n';
@@ -430,69 +396,33 @@ function loadLog(){
 }
 
 /* ── token 与链接 ───────────────────────────────────────────── */
-var realToken = '';
+/* ── 访问链接 ──────────────────────────────────────────────────
+   token 不再单独展示: 链接本身就带 token, 放两处只会让"截图带走"的暴露面翻倍。
+   真值只在这一个 urlBox 里出现, 且要显式点「取链接」。 */
 var realUrl = '';
-var revealed = false;
 
-function maskToken(t){
-  if (t.length <= 8) return '•'.repeat(t.length || 8);
-  return t.slice(0, 4) + '•'.repeat(Math.min(18, t.length - 8)) + t.slice(-4);
-}
-function paintToken(){
-  if (!realToken) { text($('tokenBox'), '••••••••••••••••••••••••••'); return; }
-  $('tokenBox').className = 'mono' + (revealed ? '' : ' mask');
-  text($('tokenBox'), revealed ? realToken : maskToken(realToken));
-  text($('bReveal'), revealed ? '隐藏' : '显示');
-}
-function setUrl(u, ok){
+function setUrl(u, why){
   var a = $('urlBox');
   realUrl = u || '';
-  if (ok && u) {
-    a.className = 'link'; a.href = u; text(a, u);
-  } else {
-    a.className = 'link disabled'; a.removeAttribute('href');
-    text(a, '（未运行 / 未取到）');
-  }
+  if (u) { a.className = 'link'; a.href = u; text(a, u); return; }
+  a.className = 'link disabled'; a.removeAttribute('href');
+  // 占位文案必须区分"还没取"和"取不到": 以前统一写"未运行 / 未取到", 于是在
+  // 服务明明在跑、只是用户还没点过的情况下, 它会说"未运行" —— 那是误导。
+  // why: 'down' = 确认没在跑; 'fail' = 在跑但取失败了; 其它 = 还没点过
+  text(a, why === 'down' ? '（DSH 未运行, 起起来再取）'
+       : why === 'fail' ? '（取失败了, 原因见上面的红字）'
+       : '（还没取, 点下面「取链接」）');
 }
 
 /* ── 事件绑定 ───────────────────────────────────────────────── */
-$('bRefresh').onclick = function(){ setBusy(true, '刷新中…'); refresh().then(function(){ setBusy(false); }); };
-$('bStart').onclick = function(){ runOp('start', '启动'); };
-$('bRestart').onclick = function(){ armConfirm($('bRestart'), '重启', function(){ runOp('restart', '重启'); }); };
-
-// 停止/重启需要二次确认, 但不依赖 window.confirm —— WebView 里它是否可用
-// 取决于 WebChromeClient 的实现, 不值得赌。做法: 第一次点把按钮变成
-// "再点一次确认", 3 秒没跟上就自动复原。
-function armConfirm(btn, label, act){
-  if (btn.dataset.armed === '1') {
-    btn.dataset.armed = '0';
-    btn.className = 'danger';
-    text(btn, label);
-    act();
-    return;
-  }
-  btn.dataset.armed = '1';
-  btn.className = 'armed';
-  text(btn, '再点一次确认');
-  setTimeout(function(){
-    if (btn.dataset.armed === '1') {
-      btn.dataset.armed = '0';
-      btn.className = 'danger';
-      text(btn, label);
-    }
-  }, 3000);
-}
-$('bStop').onclick = function(){ armConfirm($('bStop'), '停止', function(){ runOp('stop', '停止'); }); };
+$('bRefresh').onclick = function(){ setLoading(true, '刷新中…'); refresh(); };
 
 $('bUrl').onclick = function(){
   ksuExec(CTL + ' url').then(function(r){
     var u = (r.stdout || '').trim();
-    if (!u) { setUrl('', false); showErr('取不到链接（退出码 ' + r.errno + '）。DSH 可能没起来。'); return; }
+    if (!u) { setUrl('', 'fail'); showErr('取不到链接（退出码 ' + r.errno + '）。DSH 可能没起来。'); return; }
     showErr('');
-    setUrl(u, true);
-    // 顺手把 token 也填上, 省一次点击
-    var m = u.match(/token=([^\s&]+)/);
-    if (m) { realToken = m[1]; paintToken(); }
+    setUrl(u);
   });
 };
 $('bCopy').onclick = function(){
@@ -510,21 +440,6 @@ $('bCopy').onclick = function(){
   } catch (e) { ok = false; }
   if (ok) { try { ksu.toast('链接已复制'); } catch (e) {} }
   else { showErr('复制失败，长按上面那条链接手动复制。'); }
-};
-$('bToken').onclick = function(){
-  ksuExec(CTL + ' token').then(function(r){
-    var t = (r.stdout || '').trim();
-    if (!t) { showErr('取不到 token（退出码 ' + r.errno + '）。'); return; }
-    showErr('');
-    realToken = t;
-    revealed = false;
-    paintToken();
-  });
-};
-$('bReveal').onclick = function(){
-  if (!realToken) { showErr('先点"取 token"。'); return; }
-  revealed = !revealed;
-  paintToken();
 };
 
 /* ── 启动 ───────────────────────────────────────────────────── */
@@ -547,9 +462,14 @@ $('bReveal').onclick = function(){
   CTL = '/data/adb/modules/' + id + '/bin/dshctl';
   text($('modinfo'), '模块 ' + id + ' · 控制入口 ' + CTL);
 
-  setBusy(true, '读取中…');
-  refresh().then(function(){ setBusy(false); loadLog(); })
-           .catch(function(e){ setBusy(false); showErr('读取状态失败: ' + ((e && e.message) || e)); });
+  setLoading(true, '读取中…');
+  // 成功后 renderStatus 会覆写 dot 与文案, 所以这里不用再 setLoading(false)。
+  refresh().then(loadLog)
+           .catch(function(e){
+             $('dot').className = 'dot off';
+             text($('stateText'), '读不到状态');
+             showErr('读取状态失败: ' + ((e && e.message) || e));
+           });
 })();
 </script>
 </body>

@@ -63,6 +63,22 @@ for (const [re, label] of dangerPatterns) {
 }
 console.log(danger === 0 ? '  未发现危险模式' : '  发现 ' + danger + ' 处');
 
+console.log('\n==== 只读性: 页面不得包含任何写命令 ----');
+// 启停交给「执行」按钮后, 这是本页最重要的安全性质: 可达命令集里没有写操作。
+const writeVerbs = js.match(/['"( ](start|stop|restart|toggle)['"\s\),]/g) || [];
+console.log(writeVerbs.length === 0 ? '  无 start/stop/restart/toggle 字样' : '  出现写命令字样: ' + writeVerbs.join(' '));
+
+console.log('\n==== CSS 死规则 (定义了但页面里没人用) ====');
+// 上次删 token 卡时 .mask 就是随手留下的死样式; 靠人眼盯不如让脚本列出来。
+// 只提示不判失败: 动态拼接的类名 ('dot ' + 'on') 也算被用到, 需人工过目。
+const style = (html.match(/<style>([\s\S]*?)<\/style>/) || [, ''])[1];
+const rest = html.replace(/<style>[\s\S]*?<\/style>/g, '');
+const dead = new Set();
+for (const m of style.matchAll(/\.([a-zA-Z][\w-]*)/g)) {
+  if (!new RegExp('\\b' + m[1] + '\\b').test(rest)) dead.add('.' + m[1]);
+}
+console.log(dead.size === 0 ? '  无' : '  疑似未使用: ' + [...dead].join(' '));
+
 console.log('\n==== 协议实现核对 (对照 WebViewInterface.kt) ====');
 const checks = [
   [/ksu\.exec\(\s*cmd\s*,\s*'\{[^}]*\}'\s*,\s*name\s*\)/, 'exec 传了 options JSON + 回调名'],

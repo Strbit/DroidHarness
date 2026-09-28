@@ -115,38 +115,47 @@ await tick(); await tick();
 check('stateText = 未运行', el('stateText').textContent === '未运行', el('stateText').textContent);
 check('dot 带 off 类', el('dot').className === 'dot off', el('dot').className);
 
-console.log('\n==== 4) token: 默认掩码, 显式点击才展开 ====');
-el('bToken').onclick();
-await tick(); await tick();
-const masked = el('tokenBox').textContent;
-check('取到 token 后默认是掩码 (不含完整值)', !masked.includes(TOKEN), masked);
-check('掩码保留了首尾各 4 位', masked.startsWith(TOKEN.slice(0, 4)) && masked.endsWith(TOKEN.slice(-4)), masked);
-check('掩码带 mask 类', el('tokenBox').className.includes('mask'), el('tokenBox').className);
-el('bReveal').onclick();
-check('点显示后是完整 token', el('tokenBox').textContent === TOKEN, el('tokenBox').textContent);
-check('去掉 mask 类', !el('tokenBox').className.includes('mask'), el('tokenBox').className);
-el('bReveal').onclick();
-check('再点一次回到掩码', !el('tokenBox').textContent.includes(TOKEN));
+console.log('\n==== 4) token 不再单独展示 (同一个值放两处 = 泄露面翻倍) ====');
+// 断言写在 HTML 源上, 而不是"mock 里元素不存在" —— 我的 el() 是按需创建的,
+// 查元素存在性会给出假阴性。
+check('HTML 里没有 tokenBox 节点', !/id="tokenBox"/.test(html));
+check('HTML 里没有 取 token / 显示 按钮', !/id="bToken"|id="bReveal"/.test(html));
+check('JS 里没有 maskToken/paintToken/realToken 残留',
+  !/maskToken|paintToken|realToken|revealed/.test(js));
+check('.mask 样式已随之下线', !/\.mask\s*\{/.test(html));
 
-console.log('\n==== 5) 取链接 ====');
+console.log('\n==== 5) 取链接: token 只在这一个地方出现 ====');
 el('bUrl').onclick();
 await tick(); await tick();
 check('urlBox 文本是完整链接', el('urlBox').textContent === URL_FULL, el('urlBox').textContent);
 check('urlBox href 已设置', el('urlBox').href === URL_FULL, el('urlBox').href);
 check('去掉 disabled 类', !el('urlBox').className.includes('disabled'), el('urlBox').className);
+// 复制走的是 realUrl, 不依赖已删除的 token 变量
+el('bCopy').onclick();
+await tick();
+check('复制未走失败分支', !/复制失败/.test(el('err').textContent), el('err').textContent);
 
 console.log('\n==== 6) 静态命令检查: 没有任何用户输入进入命令 ====');
 const CTL_PATH = '/data/adb/modules/dsh_android/bin/dshctl';
 // 两条通路的形状本来就不同, 断言必须分开写:
 //   exec  → 整条命令是 `CTL + ' 子命令'` (字符串)
 //   spawn → command 就是裸 CTL, 子命令在 args 数组里 (KernelSU 侧再拼回去)
-const ALLOWED = ['status', 'url', 'token'];
-check('exec 命令都是 CTL + 固定子命令 (三种之一)',
+const ALLOWED = ['status', 'url'];
+check('exec 命令都是 CTL + 固定子命令 (status/url)',
   execLog.every(c => ALLOWED.some(s => c === CTL_PATH + ' ' + s)), execLog);
+// 点完所有按钮之后再确认一次: 页面从不取裸 token (真值只随 url 来)
+check('页面从不执行 dshctl token',
+  !execLog.some(c => / token$/.test(c)), execLog);
+// 启停已交给「执行」按钮: 本页必须发不出任何写命令。
+// 这条是安全不变量, 不是样式偏好 —— 它保证将来页面被注入时最坏只是读到日志。
+check('HTML 里没有启停按钮 (操作卡已下线)',
+  !/id="bStart"|id="bStop"|id="bRestart"|<h2>操作<\/h2>/.test(html));
+check('JS 里没有 runOp/armConfirm 残留', !/runOp|armConfirm/.test(js));
+check('页面从不执行写命令 (start/stop/restart/toggle)',
+  !execLog.concat(spawnLog.map(s => s.args.join(' '))).some(c => /\b(start|stop|restart|toggle)\b/.test(c)),
+  { execLog, spawnLog: spawnLog.map(s => s.args) });
 check('spawn 的 command 恰为裸 CTL (子命令走 args)',
   spawnLog.every(s => s.command === CTL_PATH), spawnLog.map(s => s.command));
-check('exec 命令种类只有 status/token/url',
-  execLog.every(c => / (status|token|url)$/.test(c)), execLog);
 check('spawn 只出现 log, 且行数来自白名单常量',
   spawnLog.every(s => s.args.length === 2 && s.args[0] === 'log' && [20, 40, 100].includes(Number(s.args[1]))),
   spawnLog);
@@ -163,6 +172,10 @@ check('档位值 = 20/40/100',
 await tick(); await tick(); await tick();
 const logText = el('logBody').textContent;
 check('spawn 的 stdout 逐行进了日志区', /已掩码: dshctl token/.test(logText), JSON.stringify(logText));
+// 真机上出现过 "读取中…  HOME=/data/adb/dsh/workspace" —— 占位符没整行换掉,
+// 和第一行拼在了一起。用正则查内容是查不出这种前缀污染的。
+check('占位符"读取中…"已被换掉 (不与日志同行)', !/读取中/.test(logText), JSON.stringify(logText));
+check('首行就是日志内容', logText.split('\n')[0].includes('dsh web'), JSON.stringify(logText.split('\n')[0]));
 check('多行都渲染了 (不是只留最后一行)', /状态: 运行中/.test(logText), JSON.stringify(logText));
 check('日志里没有明文 token', !logText.includes(TOKEN), JSON.stringify(logText));
 el('logChips').children[0].onclick();
