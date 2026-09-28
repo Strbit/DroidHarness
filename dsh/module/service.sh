@@ -73,7 +73,12 @@ chmod -R u+rwX,go-rwx "$DSH_HOME_DIR" 2>/dev/null ||
 } >>"$LOG" 2>&1
 
 # ── 已经在跑就别重复起 ──────────────────────────────────────
-if pgrep -f '@deepseek-ai/dsh/lib/bin.js' >/dev/null 2>&1; then
+# 判据问 dshctl, 不在这里再抄一份识别串:
+#   · MATCH 只存在 bin/dshctl 一处, 不会出现两边漂移;
+#   · dshctl running 用的是括号类 '[@]deepseek-...', 不会把承载本次调用的
+#     shell 自己算成一个 DSH 进程 (B8). 这里以前是裸 '@deepseek-...',
+#     在 `su -c 'pgrep -af ...'` 这类调用下会自我匹配.
+if sh "$MODDIR/bin/dshctl" running; then
 	echo "[$(date)] 已在运行, 跳过" >>"$LOG"
 	exit 0
 fi
@@ -124,8 +129,20 @@ fi
 echo $! >"$DSH_HOME_DIR/supervisor.pid"
 
 sleep 3
-if pgrep -f '@deepseek-ai/dsh/lib/bin.js' >/dev/null 2>&1; then
-	echo "[$(date)] 已拉起, 监听 $HOST:$PORT" >>"$LOG"
+# 判据同样问 dshctl, 不在这里再抄一份串 (识别串全模块只存在于 bin/dshctl).
+# 这条日志只声明"端口在监听" —— 措辞和判据必须对齐: 实测冷启动 +11s 端口已开
+# 但路由还没注册完, 那一刻 HTTP 返回 404. "能不能应答"由 dshctl status 用
+# curl 单独报, 不在这里冒充.
+_i=0
+while [ $_i -lt 15 ] && ! netstat -tln 2>/dev/null | grep -q ":$PORT "; do
+	sleep 1
+	_i=$((_i + 1))
+done
+if netstat -tln 2>/dev/null | grep -q ":$PORT "; then
+	# 给人抄的命令一律绝对路径: su -c 的 PATH 是空的, 裸 "dshctl status" 抄进去跑不通.
+	echo "[$(date)] 端口已监听 $HOST:$PORT (等端口 ${_i}s); HTTP 就绪时刻见 $MODDIR/bin/dshctl status" >>"$LOG"
+elif sh "$MODDIR/bin/dshctl" running; then
+	echo "[$(date)] 进程在, 但端口 $PORT 15 秒内没打开, 看上面日志" >>"$LOG"
 else
-	echo "[$(date)] 拉起后 3 秒内没看到进程, 看上面日志" >>"$LOG"
+	echo "[$(date)] 拉起后没看到进程, 看上面日志" >>"$LOG"
 fi

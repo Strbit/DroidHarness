@@ -54,6 +54,19 @@ done
 #
 # Termux 的 .so 是 libfoo.so -> libfoo.so.78.3 三连. 构建期在 PC 上不建链接
 # (建不了, 而且物化成副本会塞进几十 MB 重复内容), 只记了一份清单, 这里真正建出来.
+#
+# 为什么要**两趟 + 建完复核**: 清单里的目标可能是**另一条链接** (链式:
+#   libncursesw.so -> libncursesw.so.6 -> libncursesw.so.6.5), 单趟顺序建,
+# 建到中间那条时它还是悬空的. 而 `ln -sfn` 对不存在的目标**照样返回成功**,
+# 所以"建链失败"计数抓不到任何问题 —— 真正的症状要到后面 chown -R 撞上来才
+# 暴露. 这次真实装机日志里就是这么一句:
+#
+#   chown: /data/adb/modules_update/dsh_android/usr/libexec/git-core/git-cvsserver:
+#          No such file or directory
+#
+# chown 默认**跟随**符号链接, 目标不在就是 ENOENT. 那条 chown 报错本身无害
+# (下面第 1 趟会先删掉断链), 但它是"清单里有一条永远不可能成立的链接"的信号,
+# 不报出来的话就永远没人去查. 所以这里显式分三类统计并打出来.
 # ─────────────────────────────────────────────────────────────
 ui_print " "
 ui_print "--- 重建符号链接 ---"
@@ -61,21 +74,41 @@ relink() {
 	_p="$1"
 	_m="$_p/.dsh-symlinks"
 	[ -f "$_m" ] || return 0
-	_ok=0
-	_bad=0
+
+	# 第 1 趟: 全部建出来, 并记下每条的路径, 供第 2 趟判定
+	_n=0
 	while IFS="$TAB" read -r _rel _target; do
 		[ -z "$_rel" ] && continue
 		case "$_rel" in \#*) continue ;; esac
 		_dst="$_p/$_rel"
 		mkdir -p "${_dst%/*}" 2>/dev/null
+		# 先 rm 再 ln: 不用 ln -sf 是因为目标已存在且是**目录**时, -f 会把链接
+		# 建到目录**里面**去, 那就静默建错位置了.
 		rm -f "$_dst" 2>/dev/null
-		if ln -sfn "$_target" "$_dst" 2>/dev/null; then
-			_ok=$((_ok + 1))
-		else
-			_bad=$((_bad + 1))
+		ln -sfn "$_target" "$_dst" 2>/dev/null
+		_n=$((_n + 1))
+	done <"$_m"
+
+	# 第 2 趟: 逐条核 `ln -sfn` 会不会骗人 —— 它不要求目标存在.
+	# 判据是 `[ -e ]` (跟随链接), 不是 `[ -L ]` (只看是不是链接): 只有前者能区分
+	# "建出来了"和"建出来了但指向空处".
+	_dead=0
+	while IFS="$TAB" read -r _rel _target; do
+		[ -z "$_rel" ] && continue
+		case "$_rel" in \#*) continue ;; esac
+		if [ ! -e "$_p/$_rel" ]; then
+			if [ "$_dead" -eq 0 ]; then
+				ui_print "  [WARN] 以下链接的目标不存在 (断链, 已删除):"
+			fi
+			_dead=$((_dead + 1))
+			# 断链留着只会让 chown/chmod 每次装机都报一行 ENOENT, 把真正该看的
+			# 警告淹掉; 而且它本来就用不了. 删掉, 并把名字报出来让人去查清单.
+			ui_print "         $_rel -> $_target"
+			rm -f "$_p/$_rel" 2>/dev/null
 		fi
 	done <"$_m"
-	ui_print "  建了 $_ok 条, 失败 $_bad 条"
+
+	ui_print "  清单 $_n 条; 建链后仍断的 $_dead 条已删除 (链式的在第 1 趟末尾即已闭合)"
 	return 0
 }
 relink "$PREFIX"
@@ -187,6 +220,9 @@ chmod -R 0755 "$MODPATH/app" 2>/dev/null
 #   env.sh   —— 两者共用的环境变量 (只被 source, 但给执行位无害)
 set_perm_recursive "$MODPATH/bin" 0 0 0755 0755
 set_perm "$MODPATH/service.sh" 0 0 0755 2>/dev/null
+# action.sh 是 KernelSU「执行」按钮的入口: ksud 直接 exec_script 它.
+# 没有执行位时按钮只会静默失败, 而失败点离代码很远, 很难归因.
+set_perm "$MODPATH/action.sh" 0 0 0755 2>/dev/null
 set_perm "$MODPATH/module.prop" 0 0 0644 2>/dev/null
 ui_print "  usr/ 递归设置; app/ 用 chmod -R 一次搞定; bin/ 三个入口"
 
@@ -256,13 +292,25 @@ esac
 # 收尾: 确认没有污染安装器的 TMPDIR (那会害安装器删错目录)
 ui_print "  (安装器 TMPDIR = ${TMPDIR:-未设} —— 不应是 /data/local/tmp)"
 
+# ── 结尾提示: 这里印的每一条命令都必须是**能直接抄着跑**的 ──────────
+#
+# 为什么全用绝对路径: 实测 `su -c` 起来的 shell **PATH 是空的**
+# (adb shell 里 `su -c 'echo $PATH'` -> 空串), 而本模块没有 system/ 目录,
+# 也就不会被 magic mount 挂进 /system/bin。所以之前那句"dsh 已在 PATH 上"
+# 是假的 —— `su -c 'command -v dsh'` 直接报找不到。同理裸写 `dshctl url`
+# 也抄不通。激活后的固定路径就是 /data/adb/modules/<id>/bin/。
+# MODID 由安装器注入; 万一没有, 兜底用 module.prop 里那个固定的 id。
+CTL="/data/adb/modules/${MODID:-dsh_android}/bin/dshctl"
+DSHBIN="/data/adb/modules/${MODID:-dsh_android}/bin/dsh"
 ui_print " "
 ui_print "*********************************************"
 ui_print " 安装完成. 重启后 service.sh 会拉起 DSH."
 ui_print " 日志: $DSH_HOME_DIR/logs/dsh.log"
-ui_print " 控制: dshctl start|stop|status|log"
-ui_print " 命令行: dsh plugin --profile web list   (dsh 已在 PATH 上)"
-ui_print " 访问: PC 上 adb forward tcp:3080 tcp:3080"
-ui_print "       然后浏览器开 http://127.0.0.1:3080"
+ui_print " 控制: su -c '$CTL start|stop|status|log|token|url'"
+ui_print " 命令行: su -c '$DSHBIN plugin --profile web list'"
+# 别写"浏览器开 http://127.0.0.1:3080" 就完事: 不带 token 直接开只会得到一个 401,
+# 然后人就以为没装好。入口给成 url —— 它打出的就是能直接用的整条链接。
+ui_print " 访问: 手机上 su -c '$CTL url'  取带 token 的完整链接"
+ui_print "       PC 上再加一步 adb forward tcp:3080 tcp:3080"
 ui_print "*********************************************"
 ui_print " "

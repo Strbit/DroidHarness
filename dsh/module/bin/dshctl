@@ -1,42 +1,166 @@
 #!/system/bin/sh
 # dshctl — 控制 DSH 的启停
 #
-# 用法:
-#   dshctl start      拉起 (后台)
-#   dshctl stop       停掉 (含监督进程)
-#   dshctl restart
-#   dshctl status     是否在跑, 监听哪里
-#   dshctl log [n]    看日志 (默认 40 行)
-#   dshctl forward    打印在 PC 上该敲的 adb forward 命令
+# 用法 (以激活后的绝对路径写; 实测 `su -c` 起来的 shell **PATH 是空的**,
+# 且本模块没有 system/ 目录 → 裸 `dshctl` 抄进去跑不通):
+#   /data/adb/modules/dsh_android/bin/dshctl <命令>
 #
-# 在手机上 (adb shell su -c 'dshctl status') 或经 Termux 都能用.
+# 命令:
+#   toggle     反向切换 (KernelSU「执行」按钮走这条)
+#   start      拉起 (后台)
+#   stop       停掉 (含监督进程)
+#   restart
+#   status     是否在跑, 监听哪里
+#   running    只用退出码表态 (给脚本用, 不打印)
+#   log [n]    看日志 (默认 40 行; token 已掩码)
+#   token      打印当前有效 token (显式动作)
+#   url        打印可直接打开的完整链接 (含 token)
+#   forward    打印在 PC 上该敲的 adb forward 命令
+#
+# 启停逻辑只有这一份: action.sh (KernelSU 的「执行」按钮) 和 service.sh
+# 都调本脚本, 免得按钮、开机脚本、命令行三套实现各自漂移.
 
 MODDIR=$(cd "${0%/*}/.." && pwd)
 DSH_HOME_DIR=/data/adb/dsh
 LOG="$DSH_HOME_DIR/logs/dsh.log"
 PIDFILE="$DSH_HOME_DIR/supervisor.pid"
-MATCH='@deepseek-ai/dsh/lib/bin.js'
 PORT=3080
+# 面向人的提示里用绝对路径: su -c 起的 shell PATH 是空的, 裸 "dshctl" 抄不通.
+ME="$MODDIR/bin/dshctl"
+
+# ── 识别串: 全模块唯一一份 ──────────────────────────────────
+# 写成 '[@]deepseek-...' 而不是 '@deepseek-...'. 作为 ERE 两者都匹配目标
+# 进程 cmdline 里的字面量 '@deepseek-ai/dsh/lib/bin.js', 但**只有前者不自我匹配**.
+#
+# 这就是 B8. 实测证据 (这台设备, 同一时刻):
+#
+#     sh -c 'pgrep -f @deepseek-ai/dsh/lib/bin.js | cat'   → 2 个命中
+#     sh -c 'pgrep -f [@]deepseek-ai/dsh/lib/bin.js | cat' → 1 个命中 (真 node)
+#
+#   多出来那个就是**承载这次调用的 shell 自己** —— 它的 argv 里含模式串.
+#   触发条件要说准: 单纯 `sh -c 'pgrep -f ...'` 看不到差异, 因为 shell 会
+#   exec 替换自身, argv 变成 pgrep 自己 → 被 pgrep 排除. 一旦命令里有管道
+#   或多条语句, shell 不能 exec, 它的 argv 活着并含模式串 → 自我匹配.
+#   当初看到的 `16847 /system/bin/sh -c su -c 'pgrep -af lib/bin.js'` 正是这种.
+#
+#   pgrep 多报只是脏数据; pkill 多报是事故 —— 旧 `stop` 用的是 `pkill -f`,
+#   会连执行它的 shell 一起杀掉: "杀监督进程"做了、"杀 node"没做完, 留下半死
+#   状态, 而且脚本的输出永远传不回调用方.
+#   所以 stop 现在改成"先取 pid 列表, 再按 pid 逐个杀", 双保险.
+#
+#   括号类包住首字符后, 我们这侧 argv 里是字面量 `[@]d...`, 正则要求 `@` 紧跟
+#   `d`, 而这里是 `@` 紧跟 `]` —— 不匹配, 自伤链路断开.
+#   (改 dshctl 时别"顺手"把 [@] 改回 @, 那会静默恢复 B8.)
+MATCH='[@]deepseek-ai/dsh/lib/bin.js'
+
+dsh_pids() {
+	pgrep -f "$MATCH" 2>/dev/null
+}
 
 running() {
-	pgrep -f "$MATCH" >/dev/null 2>&1
+	[ -n "$(dsh_pids)" ]
+}
+
+listening() {
+	netstat -tln 2>/dev/null | grep -q ":$PORT "
+}
+
+# ── 打印日志时的 token 掩码 (B6 的收尾) ──────────────────────
+# dsh web 每次启动会把**当前有效**的 token 明文写一行到日志里。日志文件本身
+# 0600, 真正的泄漏发生在"把日志打到屏幕上给人看 / 截图求助"这一步:
+#   · dshctl log  (用户主动看日志)
+#   · start 失败分支的 tail -n 20  (状态卡里就带着)
+# 实测 (这台设备): 旧 token 已失效 (HTTP 401), 只有最后那次启动的是活的
+# (HTTP 303) —— 所以掩码要防的是**当前**那一个, 不是历史凭证.
+#
+# 只掩码"展示"这一层, 不改日志文件: 上游 dsh web 没有 quiet 参数, 而在
+# service.sh 里给 node 套管道会破坏它靠 $? 做的熔断 (上一轮实测确认过).
+mask_token() {
+	sed -E 's#(token=)[A-Za-z0-9_-]+#\1<已掩码: dshctl token>#g'
+}
+
+# 取当前有效 token (从日志最后一条取). 单独一个 verb, 是为了让"看 token"
+# 成为一次**显式**动作 —— 它不该在随便看看日志时就滚到屏幕上.
+current_token() {
+	grep -o 'token=[A-Za-z0-9_-]*' "$LOG" 2>/dev/null | tail -1 | cut -d= -f2
+}
+
+# HTTP 层就绪判据。实测证据 (冷启动逐 0.5s 采样, 同一台设备):
+#
+#     +10s listen=0  HTTP=000
+#     +11s listen=1  HTTP=404     ← 端口已经在了!
+#     +11s listen=1  HTTP=401     ← 半秒后路由才注册完
+#
+#   也就是说"端口在监听"**早于**"能正常应答"。如果 start 用端口当就绪判据,
+#   按钮就会在用户第一下请求吃到 404 的时候宣布"已启动" —— 这是上一版
+#   dshctl 的真实缺陷, 404 那个样本就是这么来的。
+#   所以这里等到 HTTP 给出**确定答案**为止: 000(连不上) 和 404(路由没建完)
+#   都算没就绪; 401 / 200 / 任何别的码都算就绪 —— 服务器已经在按路由表答话了。
+#   正常配置下 `/` 不会持续返回 404, 持续 404 就是异常, 交给上层报出来。
+#
+#   curl 只在能拿到时才用它: /system/bin/curl 在本机存在, 但这是设备特性,
+#   拿不到就退回端口判据, 不能因为缺 curl 就把一次正常启动报成失败。
+serving() {
+	if ! command -v curl >/dev/null 2>&1; then
+		listening
+		return
+	fi
+	code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:$PORT/" 2>/dev/null)
+	case "$code" in
+	000 | 404) return 1 ;;
+	'') return 1 ;;
+	*) return 0 ;;
+	esac
 }
 
 case "$1" in
+toggle)
+	# KernelSU「执行」按钮走这条. 刻意不写任何"意图"状态文件:
+	# service.sh 每次开机都会拉起, 本按钮只管运行时的这一世.
+	# 输出不捕获 —— 让调用方流式看到过程, 等端口的那十秒里页面不是空白.
+	if running; then
+		echo "当前在运行, 执行 stop"
+		sh "$0" stop
+	else
+		echo "当前未运行, 执行 start"
+		sh "$0" start
+	fi
+	;;
+
+running)
+	# 给别的脚本 (action.sh / service.sh) 用的机器可读判据: 只用退出码表态,
+	# 不打印. 有了它, MATCH 这个串整个模块就只存在上面那一份.
+	running
+	;;
+
 start)
 	if running; then
-		echo "已在运行 (pid $(pgrep -f "$MATCH" | tr '\n' ' '))"
+		echo "已在运行 (pid $(dsh_pids | tr '\n' ' '))"
 		exit 0
 	fi
 	echo "拉起中..."
 	sh "$MODDIR/service.sh" >/dev/null 2>&1 &
-	sleep 6
-	if running; then
-		echo "已启动. 日志: $LOG"
+	# 轮询到"HTTP 能应答"为止, 不猜秒数, 也不用端口当就绪信号 (见 serving() 那段实测).
+	# 这里原本是固定 sleep 6, 实测后果是状态卡自相矛盾: 上面刚说"已启动",
+	# 下面的 netstat 却报"没看到 3080 在监听" —— 而 1 秒后它就在听了.
+	i=0
+	while [ $i -lt 25 ] && ! serving; do
+		sleep 1
+		i=$((i + 1))
+	done
+	LAST_CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:$PORT/" 2>/dev/null)
+	if serving; then
+		echo "已启动 (等就绪 ${i}s, HTTP $LAST_CODE). 日志: $LOG"
+		echo "手机上直接开:  http://127.0.0.1:$PORT"
 		echo "PC 侧: adb forward tcp:$PORT tcp:$PORT  然后开 http://127.0.0.1:$PORT"
+	elif running; then
+		# 进程活着但 25 秒没听到端口: 这是另一种故障, 别和"没起来"混成一条文案.
+		echo "进程在, 但 $PORT 端口 25 秒内没就绪 (最后一次 HTTP=$LAST_CODE) —— 可能在等什么, 看日志:"
+		tail -n 20 "$LOG" 2>/dev/null | mask_token
+		exit 1
 	else
 		echo "启动后没看到进程, 看日志:"
-		tail -n 20 "$LOG" 2>/dev/null
+		tail -n 20 "$LOG" 2>/dev/null | mask_token
 		exit 1
 	fi
 	;;
@@ -48,55 +172,82 @@ stop)
 		kill "$(cat "$PIDFILE")" 2>/dev/null
 		rm -f "$PIDFILE"
 	fi
-	pkill -f "$MATCH" 2>/dev/null
+	# 用 pid 逐个杀, 不用 `pkill -f`: 后者会把正在执行本脚本的 shell 也匹配上
+	# (见文件头 MATCH 那段). 这是 B8 的正解 —— 先取 pid 列表, 再按 pid 杀.
+	for p in $(dsh_pids); do
+		kill "$p" 2>/dev/null
+	done
 	sleep 2
+	for p in $(dsh_pids); do
+		kill -9 "$p" 2>/dev/null
+	done
+	sleep 1
 	if running; then
-		echo "还有残留, 强制杀..."
-		pkill -9 -f "$MATCH" 2>/dev/null
-		sleep 1
-	fi
-	if running; then
-		echo "仍有进程存活, 请手动检查: pgrep -f '$MATCH'"
+		echo "仍有进程存活, 请手动检查: $ME status"
 		exit 1
 	fi
 	echo "已停止"
 	;;
 
 restart)
-	"$0" stop
+	sh "$0" stop
 	sleep 1
-	"$0" start
+	sh "$0" start
 	;;
 
 status)
 	if running; then
 		echo "状态: 运行中"
-		for p in $(pgrep -f "$MATCH"); do
+		for p in $(dsh_pids); do
 			echo "  pid $p"
 		done
 		if [ -f "$PIDFILE" ]; then
 			echo "  监督进程 pid $(cat "$PIDFILE")"
 		fi
 		echo "监听: 127.0.0.1:$PORT (仅本机)"
-		# 顺手确认端口真的在听
-		if netstat -tln 2>/dev/null | grep -q ":$PORT "; then
+		if listening; then
+			# 端口在听不代表能用, 所以两件事分开报: 端口 + HTTP 实答.
 			echo "端口: $PORT 已在监听"
 		else
 			echo "端口: 没看到 $PORT 在监听 (可能刚起还没就绪)"
 		fi
+		if command -v curl >/dev/null 2>&1; then
+			echo "HTTP: $(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:$PORT/" 2>/dev/null) (401 = 在跑但要求鉴权, 属正常)"
+		fi
 	else
 		echo "状态: 未运行"
-		echo "用 dshctl start 拉起, 或重启手机让 service.sh 自动拉起"
+		echo "用 $ME start 拉起, 或重启手机让 service.sh 自动拉起"
 	fi
 	;;
 
 log)
 	n=${2:-40}
 	if [ -f "$LOG" ]; then
-		tail -n "$n" "$LOG"
+		tail -n "$n" "$LOG" | mask_token
 	else
 		echo "还没有日志: $LOG"
 	fi
+	;;
+
+token)
+	# 显式取当前有效 token. 这是**唯一**会把它打到屏幕上的入口 ——
+	# log / status / 失败分支一律走 mask_token, 免得"随手看一眼"就把它带出去.
+	T=$(current_token)
+	if [ -z "$T" ]; then
+		echo "日志里还没有 token ($LOG): DSH 大概没起来过, 试 $ME log 20"
+		exit 1
+	fi
+	echo "$T"
+	;;
+
+url)
+	# 整条可直接打开的链接 (含 token). 和 token 一样是显式动作.
+	T=$(current_token)
+	if [ -z "$T" ]; then
+		echo "日志里还没有 token ($LOG)"
+		exit 1
+	fi
+	echo "http://127.0.0.1:$PORT/?token=$T"
 	;;
 
 forward)
@@ -110,15 +261,19 @@ forward)
 	;;
 
 *)
-	echo "dshctl — 控制 DSH 的启停"
+	echo "$ME — 控制 DSH 的启停"
 	echo ""
-	echo "用法: dshctl <命令>"
+	echo "用法: $ME <命令>"
 	echo ""
+	echo "  toggle     反向切换 (KernelSU「执行」按钮用这条)"
 	echo "  start      拉起 (后台)"
 	echo "  stop       停掉 (含监督进程)"
 	echo "  restart    重启"
 	echo "  status     是否在跑, 监听哪里"
-	echo "  log [n]    看日志 (默认 40 行)"
+	echo "  running    只用退出码表态 (给脚本用, 不打印)"
+	echo "  log [n]    看日志 (默认 40 行; token 已掩码)"
+	echo "  token      打印当前有效 token (显式动作)"
+	echo "  url        打印可直接打开的完整链接 (含 token)"
 	echo "  forward    打印 PC 侧该敲的 adb forward 命令"
 	;;
 esac
