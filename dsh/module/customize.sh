@@ -156,6 +156,21 @@ else
 	ui_print "  [WARN] 没有 webroot/index.html —— Manager 不会显示「WebUI」入口"
 fi
 
+# 屏幕识别 MCP (设备的"眼睛")。这里用 -f 而不是 -x: 此刻 KernelSU 还没保留
+# zip 里的权限位, -x 必然为假, 会把一份完好的包报成缺文件。
+# 缺了不 abort —— 它不是 DSH 跑起来的必要条件, 报出来让人决定。
+SM_TOOLS_SRC="$MODPATH/tools"
+SM_TOOLS_DST="$DSH_HOME_DIR/tools"
+HAS_SCREEN_MCP=0
+if [ -f "$SM_TOOLS_SRC/screen-mcp" ] && [ -f "$SM_TOOLS_SRC/screen-mcp.mjs" ]; then
+	HAS_SCREEN_MCP=1
+	SM_N=$(find "$SM_TOOLS_SRC" -type f 2>/dev/null | wc -l | tr -d ' \n')
+	ui_print "  [ OK ] 屏幕识别在位 (tools/, ${SM_N:-?} 个文件)"
+else
+	ui_print "  [WARN] 没有 tools/screen-mcp —— 模型看不见屏幕 (4 个 mcp__screen__* 不可用)"
+	ui_print "         先跑: node dsh/tools/stage-tools.mjs"
+fi
+
 # ─────────────────────────────────────────────────────────────
 # 4. 目录
 # ─────────────────────────────────────────────────────────────
@@ -233,6 +248,99 @@ set_perm "$MODPATH/service.sh" 0 0 0755 2>/dev/null
 # 没有执行位时按钮只会静默失败, 而失败点离代码很远, 很难归因.
 set_perm "$MODPATH/action.sh" 0 0 0755 2>/dev/null
 set_perm "$MODPATH/module.prop" 0 0 0644 2>/dev/null
+
+# ─────────────────────────────────────────────────────────────
+# 5.5 布署屏幕识别到 $DSH_HOME_DIR/tools
+#
+# 为什么要拷出去，不直接跑模块目录里的那份
+# ------------------------------------------
+# launcher.sh 用 `SERVER_DIR=${0%/*}` 推导服务本体的位置，要求启动器和
+# screen-mcp.mjs **同目录**；而 cordis.patch.yml 里的 `command:` 是一个写死的
+# 绝对路径。两边都指向 /data/adb/dsh/tools/，所以文件必须在那儿。
+# 放在模块目录之外还有一层好处：那是 DSH_HOME，升级模块不会覆盖用户
+# 在这套识别链路上的任何改动。
+#
+# 为什么先 rm -rf 再逐文件 cp，而不是直接覆盖
+# --------------------------------------------
+# 只覆盖会留下**上一版已删除的模块**：比如 lib/foo.mjs 在新版里被移除，
+# 旧副本还躺在设备上是惰性的（没人 import 它），但会让人以为设备上还有它，
+# 排查时按着那份不存在于新包的文件找 —— 白绕一圈。全清重建让设备侧和
+# 模块侧严格一致。
+# 这里 rm -rf 一个变量拼出来的路径，风险是真实存在的（本文件第 6 节就记着
+# 一次 `rm -rf $TMPDIR` 删掉整个 /data/local/tmp 的事故），所以上面加了
+# **路径前缀断言**：DSH_HOME_DIR 必须还是那个硬编码值，才允许动手。
+if [ "$HAS_SCREEN_MCP" = "1" ]; then
+	case "$SM_TOOLS_DST" in
+	/data/adb/dsh/tools) ;;
+	*)
+		ui_print "  [FAIL] tools 目标路径异常: $SM_TOOLS_DST (期望 /data/adb/dsh/tools)"
+		ui_print "         跳过布署 —— 不在一个没把握的路径上执行 rm -rf"
+		HAS_SCREEN_MCP=0
+		;;
+	esac
+fi
+if [ "$HAS_SCREEN_MCP" = "1" ]; then
+	ui_print " "
+	ui_print "--- 屏幕识别 ---"
+	# 只 rm 不先 mkdir: 上一版这里 mkdir -p 紧跟 rm -rf, 等于先建再拆, 白做一次,
+	# 而且读起来像"有意保留目录" —— 会让人以为 rm 之后目录还在。
+	rm -rf "$SM_TOOLS_DST" 2>/dev/null
+	mkdir -p "$SM_TOOLS_DST" 2>/dev/null
+	# 为什么是 find 驱动逐文件 cp，而不是 `cp -a "$SM_TOOLS_SRC/." "$SM_TOOLS_DST/"`
+	# ---------------------------------------------------------------------------
+	# `dir/.` 这种"只拷内容、不拷目录本身"的写法 GNU cp 有保证，Android 的
+	# toybox cp **不保证**。一旦它把 tools/ 当成一个目录整个放进去，结果就是
+	# $DST/tools/screen-mcp，而 patch 里写死的是 $DST/screen-mcp —— 症状又变回
+	# "MCP 子进程起不来，主服务照常健康"那种最难归因的失败。
+	# 逐文件 cp 只用最朴素的 `cp 源 目标`，各实现行为一致。
+	#
+	# 顺带保持**自动**: stage-tools 以后多加一个 lib 不必回来改这里
+	# (写死文件名清单的话，漏一条 = 设备上静默缺那个文件)。
+	#
+	# 每个文件一次 mkdir + cp: 这里总共 8 个文件。第 5 节那条 `find -exec chmod`
+	# 4031 次 fork 的教训是针对两万条目的 app/，个位数条目无所谓。
+	find "$SM_TOOLS_SRC" -type f 2>/dev/null | while read -r _sf; do
+		_rel=${_sf#"$SM_TOOLS_SRC/"}
+		[ -n "$_rel" ] && [ "$_rel" != "$_sf" ] || continue
+		case "$_rel" in
+		*/*) mkdir -p "$SM_TOOLS_DST/${_rel%/*}" 2>/dev/null ;;
+		esac
+		cp -f "$_sf" "$SM_TOOLS_DST/$_rel" 2>/dev/null
+	done
+	# 权限: 启动器是被 exec 的，必须自己带执行位 —— KernelSU 解压时不保留 zip 里的
+	# 模式位，这里的 cp 也没带 -p，所以必须显式设。
+	# 沿用第 5 节对 app/ 的同一条取舍: 单条 chmod -R 0755，一个进程搞定；给 .mjs
+	# 多一个执行位无害，因为父目录 $DSH_HOME_DIR 是 0700、只有 root 进得来。
+	# (不写 `find -exec chmod`: 那才是本文件反复告诫的每文件一次 fork。)
+	chmod -R 0755 "$SM_TOOLS_DST" 2>/dev/null
+
+	# 复核。这里用 -x 是有意义的 —— 权限刚设完，和第 1 节存在性检查用 -f 不矛盾。
+	#
+	# 数量比对而不是写死文件名清单: 写死的话，stage-tools 新增一个 lib 而这里
+	# 没跟上时，装机日志会是一片 [ OK ] 而设备上真缺那个文件 —— 又是"绿灯掩盖"。
+	# 比对 源文件数 vs 落地文件数 才守得住"源里每个文件都装上了"这条不变式。
+	SM_DST_N=$(find "$SM_TOOLS_DST" -type f 2>/dev/null | wc -l | tr -d ' \n')
+	SM_OK=1
+	if [ "${SM_DST_N:-0}" != "${SM_N:-0}" ]; then
+		ui_print "  [FAIL] 布署后只有 ${SM_DST_N:-0} 个文件，模块里是 ${SM_N:-0} 个 —— cp 有失败"
+		SM_OK=0
+	fi
+	[ -f "$SM_TOOLS_DST/screen-mcp.mjs" ] || { ui_print "  [FAIL] 缺 screen-mcp.mjs"; SM_OK=0; }
+	if [ -x "$SM_TOOLS_DST/screen-mcp" ]; then
+		ui_print "  [ OK ] $SM_TOOLS_DST/screen-mcp 可执行"
+	else
+		ui_print "  [FAIL] screen-mcp 没有执行位 —— MCP 子进程起不来"
+		SM_OK=0
+	fi
+	if [ "$SM_OK" = "1" ]; then
+		ui_print "  [ OK ] 屏幕识别已布署 ($SM_DST_N 个文件 -> $SM_TOOLS_DST)"
+		ui_print "  接入: 把 tools/cordis.patch.example.yml 的 insert 条目并进"
+		ui_print "        $DSH_HOME_DIR/profiles/<profile>/cordis.patch.yml"
+		ui_print "        (本脚本不自动改 profile —— 那是用户数据，装机覆盖它是破坏性的)"
+	else
+		ui_print "  [WARN] 屏幕识别布署不完整 —— 上面的 mcp__screen__* 工具会缺失"
+	fi
+fi
 # ── webroot/ 故意**不在这里出现** ────────────────────────────
 # 官方文档明说: 安装模块时 KernelSU 自己会给 webroot/ 设权限和 SELinux 上下文,
 # "如果你不知道自己在做什么, 不要自己设置这个目录的权限"。
