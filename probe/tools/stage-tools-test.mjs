@@ -135,9 +135,9 @@ console.log('');
 console.log('=== 7. 清单与仓库同步：源文件缺失要报错 ===');
 // 不真删 recognize/, 而是检查 FILES 清单里每个源都真实存在（漏一个就报）
 restage();
-const need = ['launcher.sh', 'screen-mcp.mjs', 'lib/uitree.mjs', 'lib/fields.mjs', 'lib/spawn-env.mjs', 'lib/displays.mjs', 'lib/cmd-display.mjs', 'cordis.patch.yml'];
+const need = ['launcher.sh', 'screen-mcp.mjs', 'lib/uitree.mjs', 'lib/fields.mjs', 'lib/spawn-env.mjs', 'lib/ui-lock.mjs', 'lib/displays.mjs', 'lib/cmd-display.mjs', 'cordis.patch.yml'];
 const missSrc = need.filter((f) => !fs.existsSync(path.join(ROOT, 'recognize', f)));
-check('recognize/ 里 8 个源文件都在', missSrc.length === 0, `缺: ${missSrc.join(', ')}`);
+check(`recognize/ 里 ${need.length} 个源文件都在`, missSrc.length === 0, `缺: ${missSrc.join(', ')}`);
 
 console.log('');
 console.log('=== 8. 内容一致性：tools/ 与 recognize/ 只差行尾 ===');
@@ -148,6 +148,7 @@ const pairs = [
   ['lib/uitree.mjs', 'lib/uitree.mjs'],
   ['lib/fields.mjs', 'lib/fields.mjs'],
   ['lib/spawn-env.mjs', 'lib/spawn-env.mjs'],
+  ['lib/ui-lock.mjs', 'lib/ui-lock.mjs'],
   ['lib/displays.mjs', 'lib/displays.mjs'],
   ['lib/cmd-display.mjs', 'lib/cmd-display.mjs'],
   ['cordis.patch.yml', 'cordis.patch.example.yml'],

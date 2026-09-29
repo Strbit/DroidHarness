@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     把 module/ 打成可刷入 KernelSU 的模块 zip.
 
