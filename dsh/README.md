@@ -51,11 +51,56 @@ node probe\tools\fetch-runtime.mjs --out dsh\module
 # 2. 装 DSH 应用树并打补丁 (两个 shim 都会实测校验)
 node dsh\tools\build-dsh-tree.mjs
 
-# 3. 打包
+# 3. 暂存设备侧屏幕识别 (recognize/ → dsh\module\tools\)
+node dsh\tools\stage-tools.mjs
+
+# 4. 打包
 node probe\tools\pack-module.mjs --module dsh\module
 ```
 
 产物在 `dsh\dist\`。
+
+### 第 3 步不能跳
+
+`dsh\module\tools\` 是**生成物**（已在 `.gitignore` 里，源码在 `recognize/`）。跳过这一步，
+`pack-module.mjs` 会直接 **die** 并点名缺哪两个文件，而不是默默产出一个"能装但没屏幕识别"的包 ——
+之前就是这样：PR 合了，包里从来没有这批文件，症状是 `mcp__screen__*` 工具凭空消失，
+而归因很容易跑到"设备侧没配好"上。
+
+而且 `pack-module.mjs` 现在会**自己跑一次 `stage-tools --check`**（打包目标为 `dsh/module` 时），
+所以"暂存过但源后来改了"这种陈旧状态也会在打包时被拦住。它是**调用**而不是复制规则 ——
+复制一份校验逻辑迟早和原作漂移，而漂移之后两边都会绿灯。
+
+`--check` 只校验不写盘，适合单独当门禁用：
+
+```powershell
+node dsh\tools\stage-tools.mjs --check   # 5 道门，含"与 recognize/ 源是否一致"
+node probe\tools\stage-tools-test.mjs    # 28 项负例：证明每道门真的会拦
+node probe\tools\customize-deploy-test.mjs  # 22 项：在 sh 里实测装机布署段
+```
+
+门都在拦真事：
+
+- **闭包可达** —— 防把 PC 侧的 `lib/device.mjs`、`lib/observe.mjs` 当设备侧文件扫进来。
+- **强制 LF** —— Android `sh` 把 `\r` 当命令内容，而 **`node --check` 对 CRLF 是看不见的**（实测 `exit=0`），所以必须自己查字节。
+- **shebang 必须是 `#!/system/bin/sh`** —— Android 没有 `/bin/bash`。
+- **patch 模板的 `command:` 必须等于 `/data/adb/dsh/tools/screen-mcp`** —— 漂移的表现是 MCP 子进程起不来而 DSH 主服务照常健康，极难归因。
+- **`tools/` 必须逐字节等于 `recognize/` 的归一化结果** —— 只验 `tools/` 自洽不够：改了源忘了重新暂存，陈旧那份照样 LF、照样语法通过，前四道门全绿而装进包的是旧代码（实测注入过，加这道门之前 `--check` 仍 `exit 0`）。
+
+最后这道排在内容门**之后**是刻意的：若源本身内容就错，先报"陈旧，去重新暂存"会把人带到
+错误方向 —— 照做之后错还在。内容门的结论更靠近根因。
+
+装机时 `customize.sh` §5.5 把 `$MODPATH/tools` 布署到 `/data/adb/dsh/tools/`（不是模块目录：
+`launcher.sh` 要求启动器与 `screen-mcp.mjs` 同目录，而 patch 里的路径是写死的绝对路径；
+放在 `DSH_HOME` 里升级模块也不会覆盖用户改动）。
+布署用 **find 驱动逐文件 `cp`**，不用 `cp -a "$SRC/."`：`dir/.` 那种"只拷内容"的写法 GNU cp 有保证，
+Android 的 toybox 不保证，一旦它把 `tools/` 整个放进去就成了 `<dst>/tools/screen-mcp`，
+又回到"子进程起不来但主服务很健康"。
+
+**这个包目前是代码级验证过的，设备级没验过** —— 手机 adb 一整个会话都离线。真正要验的是：
+launcher 能否找到 node、DSH 里是否出现 4 个 `mcp__screen__*` 工具、`tap`/`tree`/截图是否闭环。
+另外 `profiles/<p>/cordis.patch.yml` 仍需**手工**并入 `tools/cordis.patch.example.yml` 的 `insert` 条目
+（刷入不会自动改 profile：那是用户数据，覆盖它是破坏性的）。
 
 ### 为什么打包脚本是 Node 而不是 PowerShell
 

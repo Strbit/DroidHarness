@@ -27,6 +27,9 @@ Desktop.ini
 # DSH ģ��Ĺ������� (�� dsh/tools ����)
 dsh/module/app/
 dsh/module/usr/
+#   dsh/module/tools/  由 dsh/tools/stage-tools.mjs 从 recognize/ 拷出来的一份副本:
+#                     源码已在仓库里, 这里只是打包用的中间产物
+dsh/module/tools/
 
 
 # android-probe 的构建产物（dex 由 tools/build-probe.mjs 生成）

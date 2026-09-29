@@ -38,6 +38,8 @@ import fs from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import zlib from 'node:zlib';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 // ─────────────────────────── 参数 ───────────────────────────
 const argv = process.argv.slice(2);
@@ -48,6 +50,7 @@ const argValue = (name, dflt) => {
 const MODULE_DIR = path.resolve(argValue('--module', 'probe/module'));
 const SKIP_RUNTIME = argv.includes('--skip-runtime');
 const NO_ZIP = argv.includes('--no-zip');
+const NO_SCREEN_MCP = argv.includes('--no-screen-mcp');
 const LEVEL = Number(argValue('--level', '9'));
 const OUT_DIR = argValue('--out', null) ? path.resolve(argValue('--out', '')) : path.join(path.dirname(MODULE_DIR), 'dist');
 
@@ -147,6 +150,60 @@ log(`  ${files.length} 个文件`);
 // module.prop 必须在根部
 if (!files.some((f) => f.rel === 'module.prop')) die('module.prop 不在模块目录根部');
 
+// 屏幕识别 (recognize/ → tools/) 是否在包里。
+// 这一条不是洁癖: PR #11 把 screen-mcp 合进 main 之后, 打包流水线里没有任何
+// 一步带上它, 于是**刷了模块也看不见屏幕** —— 而 DSH 一切正常、日志干净,
+// 症状只是工具列表少 4 项, 极易被当成"功能还没做"。装机的模块应当包含
+// 仓库里声称已具备的能力。
+// 这里 die 而不是 warn: 忘跑 stage-tools 是个必然被漏掉的失误, 打包时拦住
+// 比装机后排查便宜得多。真要出无识别链路的包, 显式 --no-screen-mcp。
+const SCREEN_TOOLS = ['tools/screen-mcp', 'tools/screen-mcp.mjs'];
+const haveScreen = SCREEN_TOOLS.every((r) => files.some((f) => f.rel === r));
+if (!haveScreen && !NO_SCREEN_MCP) {
+	die(
+		`模块里没有屏幕识别 (${SCREEN_TOOLS.filter((r) => !files.some((f) => f.rel === r)).join(', ')})\n` +
+			'  先跑: node dsh/tools/stage-tools.mjs\n' +
+			'  确实要出无识别链路的包: 加 --no-screen-mcp'
+	);
+}
+if (haveScreen) {
+	// 存在 ≠ 新鲜。上面那道只拦住"压根没暂存"；暂存过但源后来改了
+	// （改了 recognize/ 忘了重跑 stage-tools）会带着旧代码打包成功。
+	// 所以这里调用 stage-tools --check —— **复用而不是复制**: 五道门的规则
+	// 只有 stage-tools 一份实现；复制过来的那份迟早和原作漂移，而漂移之后
+	// 两边都会"绿灯"。代价约 1 秒，相对 13 秒打包可忽略。
+	//
+	// 只在打包目标正是 stage-tools 的写入点时跑：stage-tools 的 SRC/DEST 是
+	// 按它自己文件位置硬推的，拿它校验别的 MODULE_DIR 会误报"陈旧"。
+	const here = path.dirname(fileURLToPath(import.meta.url));
+	const repoRoot = path.resolve(here, '..', '..');
+	const stager = path.join(repoRoot, 'dsh', 'tools', 'stage-tools.mjs');
+	const stagedDest = path.join(repoRoot, 'dsh', 'module', 'tools');
+	const n = files.filter((f) => f.rel.startsWith('tools/')).length;
+	if (NO_SCREEN_MCP) {
+		log(`屏幕识别:     在包里 (tools/, ${n} 个文件) —— 但已按 --no-screen-mcp 跳过校验`);
+	} else if (!fs.existsSync(stager)) {
+		die(`找不到 stage-tools.mjs (试的是 ${stager})\n  打包门禁依赖它，不能静默放行`);
+	} else if (MODULE_DIR !== path.dirname(stagedDest)) {
+		log(`屏幕识别:     在包里 (tools/, ${n} 个文件)`);
+		log('新鲜度检查: -- 跳过（--module 不是 dsh/module，stage-tools 校验的是后者）');
+	} else {
+		const chk = spawnSync(process.execPath, [stager, '--check'], { encoding: 'utf8' });
+		if (chk.status !== 0) {
+			// die() 写 stderr、逐项 ✓ 写 stdout。优先取 stderr, 才能让人第一眼
+			// 看到"到底哪道门没过"；上一版把两路拼起来再 slice(-6)，结果是
+			// 5 行 ✓ 顶着 1 行 [致命] —— 拒绝打包的理由被自己的进度输出埋掉。
+			const errLines = (chk.stderr ?? '').split('\n').map((l) => l.trim()).filter(Boolean);
+			const outLines = (chk.stdout ?? '').split('\n').map((l) => l.trim()).filter((l) => l.startsWith('[致命]'));
+			const why = (errLines.length ? errLines : outLines).slice(0, 6).map((l) => '  ' + l).join('\n');
+			die(`tools/ 未通过 stage-tools --check，拒绝打包:\n${why || '  (stage-tools 没有输出原因，直接跑一次看)'}`);
+		}
+		log(`屏幕识别:     在包里 (tools/, ${n} 个文件) 且与 recognize/ 逐字节一致`);
+	}
+} else {
+	log('屏幕识别:     -- 已按 --no-screen-mcp 排除');
+}
+
 if (NO_ZIP) {
 	log('');
 	log('--no-zip 指定, 只做检查, 没有产出 zip。');
@@ -241,21 +298,24 @@ for (let i = 0; i < files.length; i++) {
 			// (KernelSU/Magisk 解压时并不保留 zip 里的模式位 —— customize.sh 会 chmod。
 			//  写进去只是为了别的解压工具看到合理值。)
 			//
-			// 但有两条**必须**自己就是可执行的例外 —— 它们不满足上面那两条规则,
+			// 但有几条**必须**自己就是可执行的例外 —— 它们不满足上面那两条规则,
 			// 却真的会被 exec / spawn:
 			//
 			//   bin/                             模块的命令行入口 (dsh / dshctl)
 			//                                    —— 没有 .sh 后缀
 			//   app/.../ripgrep-android-arm64/   rg 垫片: bin/rg 是 wrapper,
 			//                                    libexec/rg.real 是被 exec 的二进制
+			//   tools/screen-mcp                 屏幕识别 MCP 的启动器, 同样无后缀
+			//                                    (cordis.patch.yml 里 command 直接指它)
 			//
-			// 这两处不可执行的后果不是"权限不整洁", 而是 DSH 的 grep / glob
-			// 在 spawn 时直接 EACCES —— 而报错会伪装成 "ripgrep launch failed"。
+			// 这三处不可执行的后果不是"权限不整洁", 而是功能在 spawn 时直接 EACCES
+			// —— 而 rg 那处的报错会伪装成 "ripgrep launch failed"。
 			// 虽然 customize.sh 会兜底 chmod, 但不该把正确性押在安装器上。
 			const isExec =
 				file.rel.startsWith('usr/') ||
 				file.rel.endsWith('.sh') ||
 				file.rel.startsWith('bin/') ||
+				file.rel === 'tools/screen-mcp' ||
 				file.rel.startsWith('app/node_modules/@vscode/ripgrep-android-arm64/');
 			const mode = isExec ? 0o100755 : 0o100644;
 			const nameBuf = Buffer.from(file.rel, 'utf8');
