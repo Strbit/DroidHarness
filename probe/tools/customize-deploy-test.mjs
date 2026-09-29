@@ -79,6 +79,14 @@ const show = (out) => {
 const DST = j(SANDBOX, 'tools');
 const cleanDst = () => fs.rmSync(DST, { recursive: true, force: true });
 
+// SM_N / "8 个" 不能写死: 那是**手动数出来的常量**，tools/ 每加一个 lib 文件
+// 这里就集体过期（ui-lock.mjs 加入时 7 条断言一起红过一轮）。改成从真实源
+// 现场数出来; 数错的话 T2 正例自己就会暴露（报的数量 != 落地文件数）。
+const REAL_MOD = j(SANDBOX, 'real-mod');
+fs.cpSync(j(ROOT, 'dsh', 'module', 'tools'), REAL_MOD, { recursive: true });
+const walkSrc = (d) => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => e.isDirectory() ? walkSrc(j(d, e.name)) : [j(d, e.name)]);
+const N_FILES = walkSrc(REAL_MOD).length;
+
 // ── T1: 用**未经修改的原始段**测路径断言 ──
 // 不改模式、不改代码，只是把 SM_TOOLS_DST 指到沙箱 —— 真实的那条
 // `case ... in /data/adb/dsh/tools)` 必然不匹配，于是应当拒绝布署。
@@ -91,7 +99,7 @@ const t1 = deployRun('t1', {
   HAS_SCREEN_MCP: '1',
   SM_TOOLS_SRC: `${SANDBOX}/real-mod`,
   SM_TOOLS_DST: `${SANDBOX}/evil/tools`,
-  SM_N: '8',
+  SM_N: String(N_FILES),
 }, block); // ← 原始段
 show(t1.out);
 check('异常路径 → 报 FAIL 并跳过布署', /tools 目标路径异常/.test(t1.out), t1.out);
@@ -101,25 +109,23 @@ check('  没有真的建出布署目录', !fs.existsSync(j(evil, 'screen-mcp.mjs
 // ── T2: 正常布署（源 = 模块里那份真实 tools/） ──
 console.log('');
 console.log('=== T2 正常布署 ===');
-const realMod = j(SANDBOX, 'real-mod');
-fs.cpSync(j(ROOT, 'dsh', 'module', 'tools'), realMod, { recursive: true });
 cleanDst();
 const t2 = deployRun('t2', {
   HAS_SCREEN_MCP: '1',
   SM_TOOLS_SRC: `${SANDBOX}/real-mod`,
   SM_TOOLS_DST: `${DST}`,
-  SM_N: '8',
+  SM_N: String(N_FILES),
 });
 show(t2.out);
 const walkF = (d) => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => e.isDirectory() ? walkF(j(d, e.name)) : [j(d, e.name)]);
-check('布署报 OK 且数量对', /屏幕识别已布署 \(8 个文件/.test(t2.out), t2.out);
+check('布署报 OK 且数量对', new RegExp('屏幕识别已布署 \\(' + N_FILES + ' 个文件').test(t2.out), t2.out);
 check('启动器落在 <dst>/screen-mcp，不是 <dst>/tools/screen-mcp', fs.existsSync(j(DST, 'screen-mcp')));
 check('  没有多出一层 tools/（这正是 dir/. 写法的风险）', !fs.existsSync(j(DST, 'tools')));
 check('lib/ 下 5 个 mjs 全部落地', ['uitree', 'fields', 'spawn-env', 'displays', 'cmd-display'].every((n) => fs.existsSync(j(DST, 'lib', `${n}.mjs`))));
 check('patch 模板也在', fs.existsSync(j(DST, 'cordis.patch.example.yml')));
-check('screen-mcp.mjs 内容与源逐字节一致', fs.readFileSync(j(DST, 'screen-mcp.mjs')).equals(fs.readFileSync(j(realMod, 'screen-mcp.mjs'))));
+check('screen-mcp.mjs 内容与源逐字节一致', fs.readFileSync(j(DST, 'screen-mcp.mjs')).equals(fs.readFileSync(j(REAL_MOD, 'screen-mcp.mjs'))));
 check('落地文件一个 CR 都没有', walkF(DST).every((f) => !fs.readFileSync(f).includes(0x0d)));
-check('落地文件数 = 8（cp 没漏）', walkF(DST).length === 8, `实际 ${walkF(DST).length}`);
+check('落地文件数 = N_FILES（cp 没漏）', walkF(DST).length === N_FILES, `实际 ${walkF(DST).length}`);
 // 布署段自己的复核有没有说"可执行" —— 测的是**脚本的判断**，不是 NTFS 的位。
 check('布署段的 -x 复核判定可执行', /screen-mcp 可执行/.test(t2.out), t2.out);
 // ⚠ 不在这条路径上断言 Unix 执行位: NTFS 没有 x 位，Git 的 chmod 把它丢弃
@@ -130,8 +136,8 @@ console.log('  [SKIP] Unix 执行位 —— NTFS 表达不了；由 zip 核验 +
 
 // ── T3: 复核分支必须会报 FAIL（不是摆设） ──
 console.log('');
-console.log('=== T3 声称 8 个 / 只落地 7 个：数量复核必须报 FAIL ===');
-// 说明: 这是**直接触发复核分支**（SM_N 传 8、源里只放 7 个文件），
+console.log('=== T3 少落地一个：数量复核必须报 FAIL ===');
+// 说明: 这是**直接触发复核分支**（SM_N 传 N_FILES、源里故意少放一个文件），
 // 真实机型上对应"某个 cp 失败"(权限/满盘)。customize.sh 里 SM_N 是从源
 // find 出来的，所以端到端要构造出这个不一致需要让 cp 本身失败，本机做不到。
 const halfMod = j(SANDBOX, 'half-mod');
@@ -142,10 +148,10 @@ const t3 = deployRun('t3', {
   HAS_SCREEN_MCP: '1',
   SM_TOOLS_SRC: `${SANDBOX}/half-mod`,
   SM_TOOLS_DST: `${DST}`,
-  SM_N: '8',
+  SM_N: String(N_FILES),
 });
 show(t3.out);
-check('数量不符 → 报 FAIL', /布署后只有 7 个文件，模块里是 8 个/.test(t3.out), t3.out);
+check('数量不符 → 报 FAIL', new RegExp(`布署后只有 ${N_FILES - 1} 个文件，模块里是 ${N_FILES} 个`).test(t3.out), t3.out);
 check('  并明确警告工具缺失', /mcp__screen__\* 工具会缺失/.test(t3.out));
 check('  不许出现"已布署"这种成功字样', !/屏幕识别已布署/.test(t3.out));
 
@@ -159,13 +165,13 @@ const t4 = deployRun('t4', {
   HAS_SCREEN_MCP: '1',
   SM_TOOLS_SRC: `${SANDBOX}/real-mod`,
   SM_TOOLS_DST: `${DST}`,
-  SM_N: '8',
+  SM_N: String(N_FILES),
 });
 show(t4.out);
 check('陈旧文件被清除', !fs.existsSync(j(DST, 'lib', 'gone-in-new-version.mjs')));
 check('陈旧 screen-mcp 被新版覆盖', fs.readFileSync(j(DST, 'screen-mcp'), 'utf8').includes('find_node'));
-check('  新文件齐全（8 个）', walkF(DST).length === 8, `实际 ${walkF(DST).length}`);
-check('  重跑仍然报 OK（幂等）', /屏幕识别已布署 \(8 个文件/.test(t4.out));
+check(`  新文件齐全（${N_FILES} 个）`, walkF(DST).length === N_FILES, `实际 ${walkF(DST).length}`);
+check('  重跑仍然报 OK（幂等）', new RegExp('屏幕识别已布署 \\(' + N_FILES + ' 个文件').test(t4.out));
 
 // ── T5: 模块里没有 tools/ 时这段应当完全不执行 ──
 console.log('');

@@ -121,6 +121,9 @@ const REQUIRED = [
   'webroot/index.html', 'usr/bin/node',
   'tools/screen-mcp', 'tools/screen-mcp.mjs',
   'tools/lib/uitree.mjs', 'tools/lib/fields.mjs', 'tools/lib/spawn-env.mjs',
+  // uiautomator 单飞锁。少它 = MCP 子进程 ERR_MODULE_NOT_FOUND 起不来，
+  // 而 DSH 主服务照常健康 —— 本项目最熟的那类"静默缺能力"。
+  'tools/lib/ui-lock.mjs',
   'tools/lib/displays.mjs', 'tools/lib/cmd-display.mjs',
   // 托管块的真源。缺它 = 脚本推导不出条目 = 不会接入。
   'tools/cordis.patch.example.yml',
@@ -156,6 +159,9 @@ const CR_BANNED = [
   'bin/dsh', 'bin/dshctl', 'bin/env.sh', 'bin/register-screen-mcp.mjs',
   'tools/screen-mcp', 'tools/cordis.patch.example.yml', 'tools/screen-mcp.mjs',
   'tools/lib/uitree.mjs', 'tools/lib/fields.mjs', 'tools/lib/spawn-env.mjs',
+  // uiautomator 单飞锁。少它 = MCP 子进程 ERR_MODULE_NOT_FOUND 起不来，
+  // 而 DSH 主服务照常健康 —— 本项目最熟的那类"静默缺能力"。
+  'tools/lib/ui-lock.mjs',
   'tools/lib/displays.mjs', 'tools/lib/cmd-display.mjs',
 ];
 for (const name of CR_BANNED) {

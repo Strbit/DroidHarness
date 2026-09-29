@@ -28,6 +28,7 @@ import { runCommand } from './lib/spawn-env.mjs';
 import { parseDisplays } from './lib/displays.mjs';
 import { parseDisplaysPreferred } from './lib/cmd-display.mjs';
 import { parseUiXml, labelOf, toTargets, isUsefulTree } from './lib/uitree.mjs';
+import { uiLock } from './lib/ui-lock.mjs';
 
 const PROTOCOL_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05', '2024-10-07'];
 const LATEST = PROTOCOL_VERSIONS[0];
@@ -209,22 +210,69 @@ async function uiTreeDump(logicalId = 0) {
         `该屏仍可用 screen_image 截图。`,
     };
   }
-  const remote = path.join(TMP, `sm-${process.pid}-${Date.now().toString(36)}.xml`);
+  // 串行化后再进 dump。为什么必须串行: 见 lib/ui-lock.mjs 顶部那三条真机实测
+  // —— 并发的第二个 uiautomator 不是拿到错误码, 而是被框架 **SIGKILL**，
+  // 且不生成文件；而"一轮里多个 tool call 并发"正是 MCP 客户端的默认形状。
+  return uiLock.run(dumpUiTree);
+}
+
+const DUMP_TRIES = 3;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+/** 把多行/超长的一段输出压成一行可放进错误信息的文本。 */
+const oneLine = (s) => String(s ?? '').replace(/\s+/g, ' ').trim().slice(0, 200);
+
+/**
+ * 真的跑一次 uiautomator dump (已在 uiLock 里, 进程内不会并发)。
+ *
+ * 重试的理由: 锁只能保证**本进程**不并发。设备上还可能有别人占着 UiAutomation —
+ * PC 侧一条 adb 上的 `uiautomator`、另一个 screen-mcp 实例(比如命令行和 web
+ * 各起过一个)、或某个无障碍/自动化 App。那些情况是**暂时**的, 退避重试能过
+ * (实测: 占用中被 Kill, 释放后立刻成功)。
+ *
+ * 每次尝试都把退出码/信号/stderr 记进 notes。旧版丢掉这些信息, 只剩
+ * `dump-file-missing` 一个词, 排查只能靠猜 —— 这一轮就猜错了三次。
+ */
+async function dumpUiTree() {
   const startedAt = Date.now();
-  try {
-    await run('/system/bin/uiautomator', ['dump', remote], { timeout: 25000 });
-    if (!fs.existsSync(remote)) return { ok: false, error: 'dump-file-missing' };
-    const xml = fs.readFileSync(remote, 'utf8');
-    if (!xml.includes('<hierarchy')) return { ok: false, error: 'no-hierarchy', raw: xml.slice(0, 300) };
-    // `at` = 树被取下来的时刻（不是返回的时刻）。
-    // 调用方据此判断"这个界面信息有多旧" —— uiautomator dump 实测约 2 秒，
-    // 而 MCP 是长驻进程，模型可能把几十秒前的树当作当前界面（第三轮 B4）。
-    return { ok: true, xml, at: Date.now(), dumpMs: Date.now() - startedAt };
-  } catch (e) {
-    return { ok: false, error: 'dump-failed', detail: e.message, at: Date.now() };
-  } finally {
-    try { fs.unlinkSync(remote); } catch { /* 清理失败不致命 */ }
+  const notes = [];
+  for (let attempt = 1; attempt <= DUMP_TRIES; attempt++) {
+    const remote = path.join(TMP, `sm-${process.pid}-${Date.now().toString(36)}-${attempt}.xml`);
+    try {
+      const { stderr } = await run('/system/bin/uiautomator', ['dump', remote], { timeout: 25000 });
+      if (fs.existsSync(remote)) {
+        const xml = fs.readFileSync(remote, 'utf8');
+        if (xml.includes('<hierarchy')) {
+          // `at` = 树被取下来的时刻（不是返回的时刻）。
+          // 调用方据此判断"这个界面信息有多旧" —— uiautomator dump 实测约 2 秒，
+          // 而 MCP 是长驻进程，模型可能把几十秒前的树当作当前界面（第三轮 B4）。
+          return { ok: true, xml, at: Date.now(), dumpMs: Date.now() - startedAt, tries: attempt };
+        }
+        notes.push(`#${attempt} 文件在但没有 <hierarchy> (${xml.length} B): ${oneLine(xml)}`);
+      } else {
+        // 命令"正常结束"却没有文件 —— 实测这是被 SIGKILL 之后留下的形状。
+        notes.push(`#${attempt} 退出正常但没生成文件${stderr ? `; stderr: ${oneLine(stderr)}` : ''}`);
+      }
+    } catch (e) {
+      notes.push(
+        `#${attempt} exit=${e.code ?? '无'}${e.signal ? ` 信号=${e.signal}` : ''}${e.killed ? '(被杀)' : ''}` +
+        `: ${oneLine(e.message)}${e.stderr ? `; stderr: ${oneLine(e.stderr)}` : ''}`,
+      );
+    } finally {
+      try { fs.unlinkSync(remote); } catch { /* 清理失败不致命 */ }
+    }
+    if (attempt < DUMP_TRIES) await sleep(300 * attempt);
   }
+  return {
+    ok: false,
+    error: 'dump-failed',
+    detail:
+      `${DUMP_TRIES} 次都没能读到无障碍树:\n    ` + notes.join('\n    ') +
+      `\n  uiautomator 是**单会话**资源: 并发调用、或别的 UiAutomation 在场时, ` +
+      `输的那个会被 SIGKILL(不报错、不生成文件)。本服务内已串行化, 所以剩下的冲突来自进程外` +
+      ` —— 另一个 screen-mcp 实例(命令行与 web 各起过一个?)、PC 侧 adb 上的 uiautomator、` +
+      `或设备上的无障碍/自动化 App。`,
+    at: Date.now(),
+  };
 }
 
 // ── payload 体积控制（第三轮 B4）───────────────────────────

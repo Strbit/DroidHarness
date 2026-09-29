@@ -100,6 +100,9 @@ const FILES = [
   ['lib/uitree.mjs', 'lib/uitree.mjs'],
   ['lib/fields.mjs', 'lib/fields.mjs'],
   ['lib/spawn-env.mjs', 'lib/spawn-env.mjs'],
+  // uiautomator 单飞锁: screen-mcp 直接 import 它。漏拷的后果是 MCP 子进程
+  // ERR_MODULE_NOT_FOUND 起不来，而 DSH 主服务照常健康 —— 本项目最熟的那类失败。
+  ['lib/ui-lock.mjs', 'lib/ui-lock.mjs'],
   ['lib/displays.mjs', 'lib/displays.mjs'],
   ['lib/cmd-display.mjs', 'lib/cmd-display.mjs'],
   // 接入条目的**唯一真源**。装机时 register-screen-mcp.mjs 从它推导出写进 home 层
