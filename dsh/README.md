@@ -123,8 +123,41 @@ home 层对 **web 和命令行两个入口都生效**（`service.sh` 与 `bin/ds
 块的内容**不在脚本里留副本**，装机时从 `tools/cordis.patch.example.yml` 现场推导 ——
 留副本就必然漂移，而漂移的症状恰好是上面那种"日志 [ OK ]、设备上 spawn 一个不存在的程序"。
 
-**这个包目前是代码级验证过的，设备级没验过** —— 手机 adb 一整个会话都离线。真正要验的是：
-launcher 能否找到 node、DSH 里是否出现 4 个 `mcp__screen__*` 工具、`tap`/`tree`/截图是否闭环。
+### 真机已验（2026-09-29，Redmi / Android 16 / KernelSU，数据线）
+
+上面那些「实测」原来都只在 PC 上跑真 DSH。现在连上手机跑了一遍，结果是同一套：
+
+```
+--- 接入 DSH (屏幕识别) ---
+  [ OK ] 已登记到 /data/adb/dsh/cordis.patch.yml      ← 装机前那个文件根本不存在
+/data/adb/dsh/cordis.patch.yml: 269 B, CR=0, begin/end 各 1
+dsh --profile web --dump-config → exit=0，第 1292 行 - id: mcp-screen
+                                 前面一行锚点就是 # == /data/adb/dsh/cordis.patch.yml
+                                 而且没有被 disabled 盖住
+DSH 自己的日志: [screen-mcp] 已就绪 (协议 2025-11-25, 4 个工具, node v26.4.0)
+直接 spawn /data/adb/dsh/tools/screen-mcp 走 MCP:
+  tools/list → list_displays / screen_tree / screen_targets / screen_image
+  list_displays → 内置屏幕 1200x2608 @480dpi 状态=ON
+  screen_tree   → 29 节点 / 9 有文字 / 10 可操作（前台 App 的真实控件与坐标）
+```
+
+也验了 **KernelSU 的暂存语义**，这条会误导排查，值得写下来：
+
+- `ksud module install` 把解好的树放进 `modules_update/<id>` 并留一个 `update` 标记，
+  **真正生效是下次开机**。所以刷完模块后 `modules/<id>/bin/dshctl` 可能还是上一版
+  （或者压根不存在）。
+- `ksud module uninstall` 也**不立刻删**，只在模块目录里写 `remove` 标记
+  （`ksud module undo-uninstall` 能撤销）；`uninstall.sh` 同样是下次开机才被跑。
+  所以"卸载完 `cordis.patch.yml` 没变"不是 bug。实测打完标记重启后：模块目录消失、
+  `cordis.patch.yml` 变成 `[]`、`.credentials.yaml` 与 `profiles/` 完好。
+- 推论：§7 是**装机那一刻**跑的，而运行时树要重启才换 —— 装机日志的 `[ OK ]` 描述的是
+  下次开机的状态。`/data/adb/dsh/tools/` 是立即生效的（它在模块目录之外）。
+
+因此 `uninstall.sh` 里不能用 `env VAR=… 命令` 那种写法：开机早期那个 shell 的 PATH
+可能是空的，而 `env` 本身要靠 PATH 才找得到。改成子 shell 里显式赋值 + export。
+
+**仍未在真机排除的**：`cp`/`find`/`chmod` 的 toybox 与 GNU 差异（PC 上测的是 GNU），
+以及真机 SELinux 上下文对 `webroot/` 的影响。
 
 ### 为什么打包脚本是 Node 而不是 PowerShell
 
