@@ -16,21 +16,39 @@
  * 之外（customize.sh 第 9 行就是为此选的：重装不丢配置），所以服务文件放那儿。
  * 模块 zip 里带 tools/，装机时由 customize.sh 拷过去。
  *
- * 这里刻意不直接写 profiles/web/cordis.patch.yml
- * ----------------------------------------------
+ * 为什么不直接写 profiles/web/cordis.patch.yml
+ * --------------------------------------------
  * profile 是用户数据：手动改过的 patch 会被每次装机覆盖掉，而那种覆盖没有任何
- * 提示。所以接入配置由 customize.sh 打印出可抄的命令，人决定何时应用。
+ * 提示。
  *
- * 三道校验，都必须失败时报错而不是静默出包
+ * 接入由 module/bin/register-screen-mcp.mjs 在装机时自动完成，写的是 **home 层**
+ * `/data/adb/dsh/cordis.patch.yml` —— DSH 的 patch 分层里唯一"既被每次启动读取、
+ * 又没有任何 DSH 代码会重写"的一层（bundle → profiles/<p>/cordis.patch.yml →
+ * home cordis.patch.yml → --patch → telemetry；profiles/<p>/cordis.yml 反而是机器
+ * 会在加载时改写的，绝不能碰）。所以自动登记不覆盖任何用户数据。
+ *
+ * 那份 cordis.patch.example.yml 因此不是"给人抄的模板"，而是**条目正文的唯一真源**:
+ * register-screen-mcp.mjs 装机时从它现场推导出要写入的托管块（见下面第 4 道门）。
+ * 脚本里不留副本 —— 留了就会漂移，而漂移的症状是装机日志 [ OK ] 但设备上 spawn
+ * 一个不存在的程序，MCP 失败、DSH 主服务照常健康，极难归因。
+ *
+ * 五道校验，都必须失败时报错而不是静默出包
  * -----------------------------------------
- *  1. 闭包：每个 .mjs 的相对 import 都要在目标集合里有对应文件。
+ *  1. 清单：FILES 里每个源都要在 recognize/ 里存在。
+ *  2. 闭包：每个 .mjs 的相对 import 都要在目标集合里有对应文件。
  *     漏拷一个 lib 的后果是 MCP 子进程起不来，而 DSH 主服务照常健康、日志干净，
  *     症状只在模型调用那个工具时出现 —— 和 rg 垫片那次一模一样的"错得很难归因"。
- *  2. 行尾：Android 的 sh 会把 `\r` 当命令内容，`#!/system/bin/sh\r` 不是合法
- *     shebang。`core.autocrlf=true` 在这个仓库里是开着的，靠 .gitattributes 的
- *     eol=lf 才没出事；这里再独立核一遍 —— 实测 `node --check` **抓不到 CRLF**
- *     （语法上完全合法），所以必须显式查字节。
- *  3. 语法：每个 .mjs 过一遍 node --check。抓不到行尾但抓得到写坏的内容。
+ *  3. 行尾 / shebang / 语法：Android 的 sh 会把 `\r` 当命令内容，
+ *     `#!/system/bin/sh\r` 不是合法 shebang。`core.autocrlf=true` 在这个仓库里是
+ *     开着的，靠 .gitattributes 的 eol=lf 才没出事；这里再独立核一遍 —— 实测
+ *     `node --check` **抓不到 CRLF**（语法上完全合法），所以必须显式查字节。
+ *     内容本身另过一遍 node --check。
+ *  4. 托管块：真跑一遍 register-screen-mcp.mjs（--print-block），确认它能从暂存的
+ *     模板推出一条 screen 条目，且条目里的 command 等于本文件算出来的落点。
+ *     这一道是"打包时验装配"：装机第 7 节拿 node 跑它，脚本坏了 / 模板改名了都
+ *     只会得到一行 [WARN]，模型静静少 4 个工具。
+ *  5. 陈旧：tools/ 必须逐字节等于 recognize/ 的 LF 归一化结果（改了源忘了重新
+ *     暂存时，前四道门可以全绿而装进包的是旧代码 —— 实测注入过）。
  *
  * 用法
  * ----
@@ -84,9 +102,10 @@ const FILES = [
   ['lib/spawn-env.mjs', 'lib/spawn-env.mjs'],
   ['lib/displays.mjs', 'lib/displays.mjs'],
   ['lib/cmd-display.mjs', 'lib/cmd-display.mjs'],
-  // 接入模板。装到 tools/ 下给人抄，**不**自动写进 profiles/：
-  // profile 是用户数据，每次装机覆盖他的 patch 是破坏性的。
-  // 名字带 .example 且不用真文件名，是为了避免任何人以为它是活配置。
+  // 接入条目的**唯一真源**。装机时 register-screen-mcp.mjs 从它推导出写进 home 层
+  // 的托管块（见第 4 道门）—— 所以它不是"给人抄的模板"，而是装配的输入。
+  // 仍放在 tools/ 且名字带 .example：一是它在设备上可读，二是避免任何人以为
+  // 它是 DSH 会自己去读的活配置（活配置是 home 层那份，由脚本维护）。
   ['cordis.patch.yml', 'cordis.patch.example.yml'],
 ];
 
@@ -172,8 +191,8 @@ while (queue.length) {
 const missing = [...reachable].filter((r) => !fs.existsSync(path.join(DEST, r)));
 // "多拷"只对 **.mjs** 有意义: 闭包是 import 图，而 tools/ 里本来就有两类
 // 不参与 import 的文件 —— 启动器 screen-mcp（被 exec，不被 import）和
-// cordis.patch.example.yml（配置模板）。把它们算成多余，每次正常打包都会
-// 报两条假警告；假警告多了，真漏拷就没人看了。
+// cordis.patch.example.yml（接入条目的真源，被 register-screen-mcp.mjs 读文本）。
+// 把它们算成多余，每次正常打包都会报两条假警告；假警告多了，真漏拷就没人看了。
 const nonModuleExempt = new Set(['screen-mcp', 'cordis.patch.example.yml']);
 const extra = [...destSet].filter((d) => /\.mjs$/.test(d) && !reachable.has(d) && !nonModuleExempt.has(d));
 
@@ -212,26 +231,71 @@ for (const f of staged) {
 }
 if (bad > 0) die(`${bad} 个文件校验失败`);
 
-// ───────────────────── 4. patch 与落点必须一致 ─────────────────────
+// ───────────────────── 4. patch 条目: 由**真脚本**推导，并核对落点 ─────────────────────
 // 这一条查的是"注释/配置承诺了一个不存在的机制"那一类缺陷 ——
 // launcher.sh 前一版就死在这上面（注释说运行时推导，case 模式永不命中）。
-// 具体风险: cordis.patch.example.yml 里写 `command: /data/adb/dsh/tools/screen-mcp`，
-// 而真实落点是这里算出来的。两边一旦漂移，症状是 MCP 子进程根本起不来，
-// DSH 主服务照常健康 —— 一个非常难归因的失败。
+//
+// 装机时写进 home 层的托管块**不是**脚本里抄的一份文本，而是运行
+// register-screen-mcp.mjs 从 tools/cordis.patch.example.yml 现场推导出来的
+// （见那个脚本的 deriveEntry）。所以这里不能"我以为块长什么样"地再实现一遍
+// 推导逻辑来比对 —— 那是自证式测试，两边一起错就一起绿。做法是直接问**要装进
+// 手机的那份脚本本人**: `--print-block` 把它准备写入的字节打到 stdout。
+//
+// 三次问，各挡一种失败:
+//   a) --patch-src = 暂存那份  → 暂存的模板读不出 screen 条目（改坏了/改名了）
+//   b) --patch-src = recognize/ → 源与暂存推导出的块不同 = 陈旧（gate 5 的交叉验证）
+//   c) 块里的 command: 必须等于这里算出来的落点 —— 漂了的后果是 MCP 子进程
+//      根本起不来而 DSH 主服务照常健康，一个非常难归因的失败。
 const DEVICE_TOOLS = '/data/adb/dsh/tools';
+const REG_SCRIPT = path.join(ROOT, 'dsh', 'module', 'bin', 'register-screen-mcp.mjs');
+const MODULES_DIR = path.join(ROOT, 'dsh', 'module', 'app', 'node_modules');
 const patchAbs = path.join(DEST, 'cordis.patch.example.yml');
-if (fs.existsSync(patchAbs)) {
-  const y = fs.readFileSync(patchAbs, 'utf8');
-  const cmds = [...y.matchAll(/^\s*command:\s*(\S+)\s*$/gm)].map((m) => m[1]);
-  if (cmds.length === 0) die('cordis.patch.example.yml 里没找到 command: 行 —— 模板失效了');
-  const want = `${DEVICE_TOOLS}/screen-mcp`;
-  const wrong = cmds.filter((c) => c !== want);
-  log('');
-  if (wrong.length > 0) {
-    die(`patch 模板的 command 与落点不符:\n  模板写的: ${wrong.join(', ')}\n  应该是:   ${want}`);
+if (!fs.existsSync(REG_SCRIPT)) die(`注册脚本不在: ${path.relative(ROOT, REG_SCRIPT)}`);
+if (!fs.existsSync(patchAbs)) die('tools/cordis.patch.example.yml 不在 —— 托管块没有真源了');
+// dsh/module/app/ 是 gitignore 的构建产物 (build-dsh-tree / fetch-runtime 生成)。
+// 没有真解析器时脚本会退回到文本判据 (见 deriveEntry) 并往 stderr 说一句
+// "自检不可用" —— stdout 仍然只输出块，所以这道门照样能用。真打包时那棵树
+// 必然在 (pack-module 要把它打进 zip)，退化的只是"在裸 checkout 上跑 --check"。
+const hasModules = fs.existsSync(MODULES_DIR);
+if (!hasModules) log(`  ! ${path.relative(ROOT, MODULES_DIR)} 不在: 本道门退回文本判据`);
+
+/** 问真脚本"你要写什么"。返回块文本（含结尾换行）。 */
+function printBlock(srcFile) {
+  const args = [REG_SCRIPT, '--print-block', '--patch-src', srcFile];
+  if (hasModules) args.push('--modules', MODULES_DIR);
+  const r = spawnSync(process.execPath, args, { encoding: 'utf8' });
+  const diag = ((r.stderr ?? '') + (r.stdout ?? '')).split('\n').filter((l) => l.includes('[register]')).join('\n      ');
+  if (r.status !== 0) {
+    die(`register-screen-mcp.mjs 没能从 ${path.relative(ROOT, srcFile)} 推导出 screen 条目` +
+        `\n  (exit=${r.status})\n      ${diag}`);
   }
-  log(`  ✓ patch 模板的 ${cmds.length} 个 command: 都指向 ${want}`);
+  return r.stdout;
 }
+
+log('');
+const blockStaged = printBlock(patchAbs);
+log('  ✓ 暂存模板可推导出托管块（装机时写入 home 层的就是这段）');
+// 块必须自成一段合法 patch: 首行是 begin 标记、末行是 end 标记，且只有一条 command。
+const MARK_BEGIN_RE = /^# >>> dsh-screen-mcp\b/;
+const MARK_END_RE = /^# <<< dsh-screen-mcp\b/;
+const blockLines = blockStaged.replace(/\n$/, '').split('\n');
+if (!MARK_BEGIN_RE.test(blockLines[0]) || !MARK_END_RE.test(blockLines[blockLines.length - 1])) {
+  die('推导出的块标记不完整（首/末行不是我们的标记）:\n' + blockStaged);
+}
+if (blockStaged.split('\n').filter((l) => MARK_BEGIN_RE.test(l)).length !== 1) {
+  die('推导出的块里有不止一个 begin 标记:\n' + blockStaged);
+}
+const cmds = [...blockStaged.matchAll(/^\s*command:\s*(\S+)\s*$/gm)].map((m) => m[1]);
+if (cmds.length !== 1) die(`块里应有且仅有 1 个 command:，实际 ${cmds.length} 个:\n${blockStaged}`);
+const want = `${DEVICE_TOOLS}/screen-mcp`;
+if (cmds[0] !== want) die(`patch 条目的 command 与落点不符:\n  块里写的: ${cmds[0]}\n  应该是:   ${want}`);
+log(`  ✓ 块内唯一 command: 指向 ${want}`);
+// 内容门**先于**陈旧门: 源和暂存同时都错时，先报"错在哪"而不是"去重新暂存"——
+// 照后者做完错还在，白绕一圈且误导人（和本文件第 5 道门的位置同理）。
+if (printBlock(path.join(SRC, 'cordis.patch.yml')) !== blockStaged) {
+  die('托管块内容: 暂存的那份与 recognize/ 那份推导结果不一致 —— tools/ 陈旧或模板被改坏');
+}
+log('  ✓ 块内容与 recognize/cordis.patch.yml 的推导结果一致（无第二份副本可比对）');
 
 // ───────────────────── 5. tools/ 必须等于 recognize/ 的归一化结果 ─────────────────────
 // 只验 tools/ 自身是否自洽是不够的: 改了 recognize/ 而忘了重新暂存，
@@ -272,8 +336,11 @@ log('');
 log('下一步: node probe/tools/pack-module.mjs --module dsh/module --out dsh/dist');
 if (!CHECK_ONLY) {
   log('');
-  log('接入 DSH 还需给 profile 打 patch。装机日志会给出可直接抄的命令，模板在:');
-  log('  /data/adb/dsh/tools/cordis.patch.example.yml');
-  log('  → 并进 $DSH_HOME/profiles/<profile>/cordis.patch.yml (web 是 service.sh 用的那个)');
-  log('  ⚠ 本脚本**不**自动改 profile: profile 里的 patch 是用户数据，装机覆盖它是破坏性的。');
+  log('接入是**自动**的，不需要手工并 YAML:');
+  log('  customize.sh 第 7 节跑 bin/register-screen-mcp.mjs，把上面推导出的那个托管块写进');
+  log('  home 层 /data/adb/dsh/cordis.patch.yml —— DSH 的 patch 分层里唯一"每次启动都读、');
+  log('  且没有任何 DSH 代码会重写"的一层，所以不覆盖任何用户数据。');
+  log('  卸载时 module/uninstall.sh 用同一个脚本 --remove 把块摘掉（并留下 []）。');
+  log('  装机日志里那行 [ OK ] 就是接入完成；出岔是 [WARN] 并说明原因，绝不 abort 安装。');
+  log('  ⚠ profiles/<p>/cordis.yml 由 DSH 在加载时改写（机器写的），不是接入点。');
 }

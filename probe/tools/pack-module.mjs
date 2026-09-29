@@ -204,6 +204,66 @@ if (haveScreen) {
 	log('屏幕识别:     -- 已按 --no-screen-mcp 排除');
 }
 
+// ── 自动接入的两件套: 登记脚本 + 卸载脚本 ────────────────────
+// 缺任何一个的后果都**不是报错**，而是静默少一块能力，正是本项目反复踩的那种:
+//   · bin/register-screen-mcp.mjs 不在 → customize.sh 第 7 节只打一行 [WARN]，
+//     模块装好了、DSH 跑起来了、屏幕相关 4 个工具就是不存在，看上去像"没这功能"。
+//   · uninstall.sh 不在 → 卸载后 home 层里永久留着一条指向已删文件的 patch 条目，
+//     下次任何 DSH 启动都会去 spawn 一个不存在的程序。
+// 所以 die 而不是 warn —— 和 SCREEN_TOOLS 同一套理由: 装机后排查比打包时拦住贵。
+const REG_REL = 'bin/register-screen-mcp.mjs';
+const UNINST_REL = 'uninstall.sh';
+if (haveScreen && !NO_SCREEN_MCP) {
+	const missing = [REG_REL, UNINST_REL].filter((r) => !files.some((f) => f.rel === r));
+	if (missing.length > 0) {
+		die(
+			`屏幕识别要自动接入，但模块里没有: ${missing.join(', ')}\n` +
+				`  ${REG_REL} 装机时把条目登记进 home 层 /data/adb/dsh/cordis.patch.yml\n` +
+				`  ${UNINST_REL} 卸载时把那条登记摘掉`
+		);
+	}
+	// 语法单独查一遍。stage-tools 第 4 道门会 spawn 它（顺带验了语法），但那条
+	// 门在 --no-screen-mcp 时是跳过的；而且这里的报错能点名"是这个文件坏了"，
+	// 不用人去猜 stage-tools 那句"推不出条目"是谁说的。
+	const chk = spawnSync(process.execPath, ['--check', path.join(MODULE_DIR, REG_REL)], { encoding: 'utf8' });
+	if (chk.status !== 0) {
+		die(`${REG_REL} 语法不过:\n  ${((chk.stderr ?? '') + (chk.stdout ?? '')).split('\n')[0]}`);
+	}
+	log(`接入两件套:   ${REG_REL} + ${UNINST_REL} 在包里，脚本语法通过`);
+}
+
+// ── 模块自己的脚本必须 LF ────────────────────────────────────
+// Android 的 sh 把 `\r` 当命令内容，`#!/system/bin/sh\r` 不是合法 shebang ——
+// service.sh 起不来，症状是"装完模块什么都没有"，而且没有任何一行报错。
+// 仓库里 core.autocrlf=true 是开着的，全靠 .gitattributes 的 `* text=auto eol=lf`
+// 兜住；那是**检出手**的性质，直接编辑工作树 / 别的工具写文件都能绕过它。
+// tools/ 由 stage-tools 第 3 道门查过，这里补的是它管不到的那批:
+// 根目录的 *.sh / module.prop / bin/* / recognize 之外手工放的文件。
+// 只看模块自己的文件: 根目录那几个 *.sh / module.prop，加上 bin/ 和 tools/。
+// **不能**按扩展名全仓库扫 —— app/ 和 usr/ 是构建产物，里面几千个 .json/.md 是
+// 上游包带的，其中真有带 CRLF 的，那会让打包在一个我们完全不控制、也不被 sh
+// 读的文件上失败（假阳性比漏检更糟: 它会让人开始信任"打包偶发失败"）。
+const ownText = files.filter((f) => {
+	if (!f.rel.includes('/')) return /\.(sh|prop)$/.test(f.rel);
+	const top = f.rel.split('/')[0];
+	return top === 'bin' || top === 'tools';
+});
+const withCR = [];
+for (const f of ownText) {
+	// 按字节查 0x0d: 解码成字符串再找会把一些合法的 UTF-8 序列也读一遍，
+	// 而这里要的恰恰是"原始字节里有没有 CR"。
+	if (fs.readFileSync(f.full).includes(0x0d)) withCR.push(f.rel);
+}
+if (withCR.length > 0) {
+	die(
+		`${withCR.length} 个模块脚本含 CR (CRLF 行尾)，刷进去会哑:\n` +
+			withCR.slice(0, 10).map((r) => '  ' + r).join('\n') +
+			(withCR.length > 10 ? `\n  … 还有 ${withCR.length - 10} 个` : '') +
+			'\n  修: node -e 里的 replace(/\\r\\n/g,"\\n")，或配 .gitattributes 的 eol=lf'
+	);
+}
+log(`行尾检查:     ${ownText.length} 个模块脚本全 LF`);
+
 if (NO_ZIP) {
 	log('');
 	log('--no-zip 指定, 只做检查, 没有产出 zip。');
@@ -303,10 +363,17 @@ for (let i = 0; i < files.length; i++) {
 			//
 			//   bin/                             模块的命令行入口 (dsh / dshctl)
 			//                                    —— 没有 .sh 后缀
+			//                                    (bin/register-screen-mcp.mjs 也在
+			//                                    bin/ 下拿到 0755: 它只被 `node <脚本>`
+			//                                    调用，执行位是跟着 customize.sh 第 5
+			//                                    节那条 set_perm_recursive "$MODPATH/bin"
+			//                                    的现实走的 —— zip 和设备一致比"精确"重要)
 			//   app/.../ripgrep-android-arm64/   rg 垫片: bin/rg 是 wrapper,
 			//                                    libexec/rg.real 是被 exec 的二进制
 			//   tools/screen-mcp                 屏幕识别 MCP 的启动器, 同样无后缀
 			//                                    (cordis.patch.yml 里 command 直接指它)
+			//   uninstall.sh                     KernelSU 卸载时 exec 的脚本
+			//                                    (根目录 *.sh 那条已经覆盖它)
 			//
 			// 这三处不可执行的后果不是"权限不整洁", 而是功能在 spawn 时直接 EACCES
 			// —— 而 rg 那处的报错会伪装成 "ripgrep launch failed"。

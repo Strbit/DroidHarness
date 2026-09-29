@@ -197,6 +197,64 @@ check('  报错点名漂移值与落点', /screen-mcp\.v2/.test(r9.out) && /落�
 fs.writeFileSync(pFile, pOrig);
 
 console.log('');
+console.log('=== 9b. 托管块由真脚本推导：模板里没有 screen 条目要报错 ===');
+// 第 4 道门现在是"**跑一遍要装进手机的那份脚本**，问它准备写什么"。
+// 要测的不是"我以为它能推导出什么"，而是它实际会写出的字节 —— 所以这里破坏
+// 的是**输入**：把模板里那条 insert 改名，脚本应当拒绝推导（exit 2），
+// 门必须把这件事报成致命而不是放行。
+// 反过来说：如果门里另写了一份解析逻辑，这个用例就会通过得莫名其妙。
+restage();
+{
+  const f = path.join(DEST, 'cordis.patch.example.yml');
+  const orig = fs.readFileSync(f);
+  const text = orig.toString('utf8').replace(/^(\s*)serverName:\s*screen$/m, '$1serverName: not-screen');
+  check('  (前置) 注入确实改到了 serverName 行', /^\s*serverName:\s*not-screen$/m.test(text));
+  fs.writeFileSync(f, Buffer.from(text, 'utf8'));
+  const r = run(['--check']);
+  check('模板里找不到 screen 条目 → 非 0 退出', r.code !== 0, `code=${r.code}`);
+  check('  报错点名"推不出 screen 条目"这件事', /推导出 screen|没能从/.test(r.out), r.out.slice(-400));
+  check('  报错点名是哪个源文件推不出来', /cordis\.patch\.example\.yml/.test(r.out), r.out.slice(-400));
+  fs.writeFileSync(f, orig);
+  const back = run(['--check']);
+  check('  还原后恢复 exit 0', back.code === 0, back.out.slice(-300));
+}
+
+console.log('');
+console.log('=== 9c. 真源文件缺失：绝不能"没有块也照样出包" ===');
+// 托管块的内容来自 tools/cordis.patch.example.yml。这份文件不在（改名/漏暂存）
+// 时，装机第 7 节会静默跳过，模型少了 4 个工具而日志只有一行 WARN ——
+// 打包阶段就该拒绝。
+restage();
+{
+  const f = path.join(DEST, 'cordis.patch.example.yml');
+  const orig = fs.readFileSync(f);
+  fs.rmSync(f);
+  const r = run(['--check']);
+  check('模板文件缺失 → 非 0 退出', r.code !== 0, `code=${r.code}`);
+  // 报"缺文件"还是报"没有真源"都行 —— 前者其实更准（是清单门先说话），
+  // 这条测的是**绝不静默出包**，不是某一句措辞。
+  check('  报错点名那个缺失的文件', /cordis\.patch\.example\.yml/.test(r.out), r.out.slice(-300));
+  fs.writeFileSync(f, orig);
+}
+
+console.log('');
+console.log('=== 9d. 注册脚本自己坏了：语法错也要在打包时拦住 ===');
+// 第 7 节是拿 node 跑它。脚本语法坏了的后果不是装机失败而是**静默不登记**
+// （run_node 非零 → case 落到 *)，正是"绿灯掩盖"的老配方。
+restage();
+{
+  const reg = path.join(ROOT, 'dsh', 'module', 'bin', 'register-screen-mcp.mjs');
+  const orig = fs.readFileSync(reg);
+  fs.appendFileSync(reg, '\nthis is not javascript at all (;\n');
+  const r = run(['--check']);
+  check('注册脚本语法坏 → 非 0 退出', r.code !== 0, `code=${r.code}`);
+  check('  报错点名那个脚本推不出条目', /register-screen-mcp\.mjs|推导出 screen/.test(r.out), r.out.slice(-400));
+  fs.writeFileSync(reg, orig);
+  const back = run(['--check']);
+  check('  还原后恢复 exit 0', back.code === 0, back.out.slice(-300));
+}
+
+console.log('');
 console.log('=== 10. 源改了而暂存没跟上：--check 必须发现陈旧 ===');
 // 这条防的是本项目真正栽过的失败的**变体**：PR 合了、recognize/ 变了，
 // 但打包用的 tools/ 还是旧的。旧版 --check 只验 tools/ 自身是否自洽 ——
