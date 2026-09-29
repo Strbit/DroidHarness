@@ -74,9 +74,12 @@ node probe\tools\pack-module.mjs --module dsh\module
 `--check` 只校验不写盘，适合单独当门禁用：
 
 ```powershell
-node dsh\tools\stage-tools.mjs --check   # 5 道门，含"与 recognize/ 源是否一致"
-node probe\tools\stage-tools-test.mjs    # 28 项负例：证明每道门真的会拦
-node probe\tools\customize-deploy-test.mjs  # 22 项：在 sh 里实测装机布署段
+node dsh\tools\stage-tools.mjs --check   # 5 道门，含"托管块能不能推导出来"
+node probe\tools\stage-tools-test.mjs    # 43 项负例：证明每道门真的会拦
+node probe\tools\customize-deploy-test.mjs  # 54 项：§5.5/§7/uninstall.sh 在 sh 里实测
+node probe\tools\register-screen-test.mjs   # 74 项：登记/卸载脚本的每条判据都过真 DSH 断言
+node probe\tools\pack-module.mjs --module dsh\module --out dsh\dist   # 打包
+node probe\tools\verify-zip.mjs        # 78 项：核验**产出的 zip**，并把包里的脚本真跑一遍
 ```
 
 门都在拦真事：
@@ -84,7 +87,9 @@ node probe\tools\customize-deploy-test.mjs  # 22 项：在 sh 里实测装机布
 - **闭包可达** —— 防把 PC 侧的 `lib/device.mjs`、`lib/observe.mjs` 当设备侧文件扫进来。
 - **强制 LF** —— Android `sh` 把 `\r` 当命令内容，而 **`node --check` 对 CRLF 是看不见的**（实测 `exit=0`），所以必须自己查字节。
 - **shebang 必须是 `#!/system/bin/sh`** —— Android 没有 `/bin/bash`。
-- **patch 模板的 `command:` 必须等于 `/data/adb/dsh/tools/screen-mcp`** —— 漂移的表现是 MCP 子进程起不来而 DSH 主服务照常健康，极难归因。
+- **托管块由真脚本现场推导** —— 打包时真的 `--print-block` 跑一遍 `register-screen-mcp.mjs`，
+  确认它能从模板推出那条 `insert`，且里面的 `command:` 等于 `/data/adb/dsh/tools/screen-mcp`。
+  漂移的表现是 MCP 子进程起不来而 DSH 主服务照常健康，极难归因。
 - **`tools/` 必须逐字节等于 `recognize/` 的归一化结果** —— 只验 `tools/` 自洽不够：改了源忘了重新暂存，陈旧那份照样 LF、照样语法通过，前四道门全绿而装进包的是旧代码（实测注入过，加这道门之前 `--check` 仍 `exit 0`）。
 
 最后这道排在内容门**之后**是刻意的：若源本身内容就错，先报"陈旧，去重新暂存"会把人带到
@@ -97,10 +102,29 @@ node probe\tools\customize-deploy-test.mjs  # 22 项：在 sh 里实测装机布
 Android 的 toybox 不保证，一旦它把 `tools/` 整个放进去就成了 `<dst>/tools/screen-mcp`，
 又回到"子进程起不来但主服务很健康"。
 
+**接入是自动的** —— `customize.sh` §7 会跑 `bin/register-screen-mcp.mjs`，把那条 `insert`
+登记进 **home 层** `/data/adb/dsh/cordis.patch.yml`，刷机之后不需要手工改任何 YAML。
+为什么是 home 层：DSH 的 patch 分层是
+`bundle → profiles/<p>/cordis.patch.yml → $DSH_HOME/cordis.patch.yml → --patch`，
+home 层是唯一"每次启动都读、而且没有任何 DSH 代码会重写"的一层，所以对它做外科手术
+不覆盖任何用户数据（`profiles/<p>/cordis.yml` 反而是装载时会被 DSH 自己改写的，绝不能当落点）。
+home 层对 **web 和命令行两个入口都生效**（`service.sh` 与 `bin/dsh` 共用 `bin/env.sh`），
+写 profile 层只会覆盖一个入口，症状变成"浏览器里有工具、命令行没有"。
+
+脚本做的是**纯文本手术**，只碰自己那对标记 `# >>> dsh-screen-mcp ... # <<< dsh-screen-mcp`
+之间的字节：块内容已是最新 → `UNCHANGED` 一个字节不动；条目过期（模块升级改了路径）→ 原地
+`REPLACED` 且位置不变；用户自己已经加过 `serverName: screen` → `SKIPPED-DUPE` 不插第二份
+（patch 层**不去重**，重复条目 = 两个静默子进程）；读不准形状（多文档、两个顶层序列、块外游离
+`[]`）→ `REFUSED` 且字节一字不动。写入前先用模块自带的 `yaml` 包自检 + 写后逐字节回读，
+因为**写坏 home 层是会让 DSH 起不来的**（解析失败是 throw，`service.sh` 有 5 次/10 秒的启动熔断）。
+`[]` 那个初值占位符必须被**替换**而不是留着 —— 实测托管块与字面 `[]` 共存（无论先后）DSH 直接
+`exit=1`，而纯注释文件同样起不来，所以卸载也要留下 `[]`（`uninstall.sh` 调同一个脚本 `--remove`）。
+
+块的内容**不在脚本里留副本**，装机时从 `tools/cordis.patch.example.yml` 现场推导 ——
+留副本就必然漂移，而漂移的症状恰好是上面那种"日志 [ OK ]、设备上 spawn 一个不存在的程序"。
+
 **这个包目前是代码级验证过的，设备级没验过** —— 手机 adb 一整个会话都离线。真正要验的是：
 launcher 能否找到 node、DSH 里是否出现 4 个 `mcp__screen__*` 工具、`tap`/`tree`/截图是否闭环。
-另外 `profiles/<p>/cordis.patch.yml` 仍需**手工**并入 `tools/cordis.patch.example.yml` 的 `insert` 条目
-（刷入不会自动改 profile：那是用户数据，覆盖它是破坏性的）。
 
 ### 为什么打包脚本是 Node 而不是 PowerShell
 

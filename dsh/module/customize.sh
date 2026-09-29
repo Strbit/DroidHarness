@@ -238,10 +238,12 @@ set_perm_recursive "$PREFIX" 0 0 0755 0755
 # 这里直接给 0755 而不是 a+rX: 解压出来的权限位不可靠, 而 X 依赖"本来就有执行位".
 # 给 JS 文件多一个执行位无害 —— 模块目录本来就只有 root 能进.
 chmod -R 0755 "$MODPATH/app" 2>/dev/null
-# bin/ 只有三个文件 (dsh / dshctl / env.sh), 递归一次比三条 set_perm 快也清楚。
+# bin/ 只有四个文件 (dsh / dshctl / env.sh / register-screen-mcp.mjs)，递归一次
+# 比四条 set_perm 快也清楚。
 #   dsh      —— 文档里 `dsh plugin --profile web add <pkg>` 用的入口 (B1 修复)
 #   dshctl   —— 启停控制
 #   env.sh   —— 两者共用的环境变量 (只被 source, 但给执行位无害)
+#   register-screen-mcp.mjs —— 第 7 节接屏幕识别用 (只被 node 显式调用)
 set_perm_recursive "$MODPATH/bin" 0 0 0755 0755
 set_perm "$MODPATH/service.sh" 0 0 0755 2>/dev/null
 # action.sh 是 KernelSU「执行」按钮的入口: ksud 直接 exec_script 它.
@@ -334,11 +336,8 @@ if [ "$HAS_SCREEN_MCP" = "1" ]; then
 	fi
 	if [ "$SM_OK" = "1" ]; then
 		ui_print "  [ OK ] 屏幕识别已布署 ($SM_DST_N 个文件 -> $SM_TOOLS_DST)"
-		ui_print "  接入: 把 tools/cordis.patch.example.yml 的 insert 条目并进"
-		ui_print "        $DSH_HOME_DIR/profiles/<profile>/cordis.patch.yml"
-		ui_print "        (本脚本不自动改 profile —— 那是用户数据，装机覆盖它是破坏性的)"
 	else
-		ui_print "  [WARN] 屏幕识别布署不完整 —— 上面的 mcp__screen__* 工具会缺失"
+		ui_print "  [WARN] 屏幕识别布署不完整 —— 第 7 节会跳过接入, 上面的 mcp__screen__* 工具会缺失"
 	fi
 fi
 # ── webroot/ 故意**不在这里出现** ────────────────────────────
@@ -414,6 +413,72 @@ esac
 
 # 收尾: 确认没有污染安装器的 TMPDIR (那会害安装器删错目录)
 ui_print "  (安装器 TMPDIR = ${TMPDIR:-未设} —— 不应是 /data/local/tmp)"
+
+# ─────────────────────────────────────────────────────────────
+# 7. 把屏幕识别**接进** DSH (安装即用)
+#
+# 为什么必须有这一节
+# ------------------
+# 第 5.5 节把服务本体放到 /data/adb/dsh/tools/ 了，但 DSH 并不会因此就"看见"它：
+# 模型要拿到那 4 个 mcp__screen__* 工具，得有一条 patch 把 MCP 适配器插进插件树。
+# 以前这一步是装机日志里一句"你自己并进 cordis.patch.yml"。那是把成本推回给用户:
+# 他得认识 YAML、知道文件在哪、还得赌自己没写坏缩进 —— 号称安装即用的模块不该
+# 有这种步骤。现在由模块自己做。
+#
+# 为什么落点是 home 层 $DSH_HOME/cordis.patch.yml，不是 profiles/<p>/
+# -------------------------------------------------------------------
+# readProfilePatches 依次读 bundle 层 → profiles/<p>/cordis.patch.yml →
+# **$DSH_HOME/cordis.patch.yml** → --patch。home 层会进到合成后的树里（实测
+# --dump-config 有我们那条 insert），而且它对 **web 和命令行两个入口都生效**:
+# service.sh 和 bin/dsh 共用 bin/env.sh。写 profile 层只覆盖一个入口，症状会是
+# "浏览器里有工具、命令行没有"。
+# 另一层原因: profiles/<p>/cordis.yml 装载时会被 DSH 自己改写，不是能长期共存
+# 的落点；home 层没有任何 DSH 写入者，我们写的内容不会跟谁抢。
+#
+# 为什么这节放在第 6 节**之后**
+# ----------------------------
+# 它要用 run_node（node 可执行性也是第 6 节刚刚冒烟验证过的）。放前面就得把
+# 那套 env 再抄一遍 —— 两份 env 迟早漂移，漂移的代价是装机时能跑、开机时崩。
+#
+# 为什么绝不 abort
+# ---------------
+# 接不进去 = 少 4 个工具，DSH 本身照常可用；abort = 整个模块装不上。
+# 所以这里只报 [WARN]。而 register-screen-mcp.mjs 内部相反 —— 它自检不过就
+# **一个字都不写**（宁可不登记）：写坏 home 层的代价是 DSH 起不来，而
+# service.sh 有 5 次/10 秒的启动熔断，熔断后模块自启也没了。
+# ─────────────────────────────────────────────────────────────
+if [ "$HAS_SCREEN_MCP" = "1" ] && [ "$SM_OK" = "1" ]; then
+	ui_print " "
+	ui_print "--- 接入 DSH (屏幕识别) ---"
+	REG_BIN="$MODPATH/bin/register-screen-mcp.mjs"
+	if [ -f "$REG_BIN" ]; then
+		# --home 显式传，不依赖环境变量: 安装器的 shell 里 DSH_HOME 未必存在
+		# (那是 env.sh 运行期才 export 的)，静默 fallback 会把 patch 写到别处。
+		# --modules 指到模块自带的 app/node_modules: 脚本要用它做写入前自检。
+		# --patch-src 也显式传: 托管块的**内容**来自这份模板（脚本里不留副本，
+		# 副本会漂移）。它本来默认就解析到 $MODPATH/tools/ 这一份，写出来是为了
+		# 让"装机日志里的 [ OK ] 是从哪条条目来的"在本文件里就能一眼看到。
+		REG_OUT=$(cd "$APP" && run_node "$REG_BIN" --home "$DSH_HOME_DIR" --modules "$APP/node_modules" --patch-src "$MODPATH/tools/cordis.patch.example.yml" 2>&1)
+		REG_STATUS=$(printf '%s\n' "$REG_OUT" | sed -n 's/^STATUS: //p' | tail -n 1)
+		case "$REG_STATUS" in
+		REGISTERED) ui_print "  [ OK ] 已登记到 $DSH_HOME_DIR/cordis.patch.yml" ;;
+		UNCHANGED) ui_print "  [ OK ] 早已登记且是最新条目 —— 未改动任何字节" ;;
+		REPLACED) ui_print "  [ OK ] 条目已过期，原地刷新（模块升级改了路径）" ;;
+		SKIPPED-DUPE) ui_print "  [ OK ] 你已手工加过 screen 这个 server —— 不插第二份" ;;
+		*)
+			ui_print "  [WARN] 没接进去 (status=${REG_STATUS:-无}) —— 4 个 mcp__screen__* 暂不可用"
+			# 把脚本原话打出来: 它拒绝写入总是有具体理由（文件读不准 / 自检不过），
+			# 只报"失败了"会让人去查错方向。
+			printf '%s\n' "$REG_OUT" | while IFS= read -r _l; do
+				ui_print "         $_l"
+			done
+			;;
+		esac
+	else
+		ui_print "  [WARN] 没有 bin/register-screen-mcp.mjs —— 屏幕识别不会自动接入"
+		ui_print "         这个文件必须由仓库里的 dsh/module/bin/ 带上，缺它是打包问题"
+	fi
+fi
 
 # ── 结尾提示: 这里印的每一条命令都必须是**能直接抄着跑**的 ──────────
 #
