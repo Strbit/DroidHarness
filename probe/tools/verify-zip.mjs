@@ -214,7 +214,13 @@ for (const [label, s] of [
   ['传 --remove', '--remove'],
   ['传 home 层路径', '--home "$DSH_HOME_DIR"'],
   ['node 缺失时不阻塞卸载', 'usr/bin/node 不可执行'],
-]) check(`${label}`, uninstTxt.includes(s), 'zip 里的 uninstall.sh 里没有它');
+  // KernelSU 是在**下次开机**时才跑这个脚本的（装机只写 remove 标记，真机实测）。
+  // 那时 PATH 可能是空的，所以不能靠 `env VAR=… 命令` 那种写法 —— 它得先找得到
+  // env 这个可执行文件才谈得上设变量。子 shell 里显式赋值不依赖任何外部命令。
+  ['子 shell 显式导出变量（不靠 env 可执行文件）', 'export PATH LD_LIBRARY_PATH HOME TMPDIR'],
+]) check(label, uninstTxt.includes(s), 'zip 里的 uninstall.sh 里没有它');
+// 反向: env 起进程那个旧写法不该回到包里。
+check('不再用 `env \\` 续行起进程', !/^env\s*\\/m.test(uninstTxt), 'zip 里还是那个依赖 PATH 找 env 的旧写法');
 check('uninstall.sh 不含 CR', !readData(find('uninstall.sh')).includes(0x0d));
 
 // ─────────────────── 7. 包自己能不能完成接入 ───────────────────
