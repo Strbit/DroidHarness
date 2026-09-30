@@ -366,6 +366,83 @@ for (const p of TEXT_PATCHES) {
 	log(`  ✓ ${p.label} (${applied} 处)`);
 }
 
+// ─────────────────── 2c. sharp 替身 + imgtool (图像归一化) ───────────────────
+//
+// 与 2b 的 shim 是同一类问题的另一种形态: 不是"某个原生模块装不上", 而是
+// **整个 sharp 包在这个平台上都起不来** —— sharp 0.35.x 的 optionalDependencies
+// 里根本没有 android 平台包 (只有 darwin/linux/linuxmusl/freebsd/wasm,
+// `@img/sharp-linux-arm64` 是 glibc/ELF 的, bionic 上起不来)。
+//
+// 后果不是"图片功能少一点": `@deepseek-ai/dsh-attachment-local` 在
+// detectImage/normalizeImage 里都要 sharp, 于是**任何**图片准入都抛错, 被上游
+// 包成 "durable image storage rejected" —— 模型看不见屏幕, 也存不下图片。
+//
+// 做法: 把 sharp 包的入口换成一个纯 JS 替身 (dsh/shim/sharp-android.js), 它把
+// 上游用到的那一小片接口翻译成对 imgtool 的一次子进程调用。imgtool 是纯 Go 的
+// 静态 aarch64 可执行文件 (tools/imgtool/main.go), 放在替身旁边, 自包含、不依赖
+// PATH。这里**只**换 dist/index.cjs 这一个入口文件, sharp 包其余部分原样留着。
+log('\n=== 2c. sharp 替身 + imgtool ===');
+
+const SHARP_DIR = path.join(APP, 'node_modules', 'sharp');
+const SHARP_MAIN = path.join(SHARP_DIR, 'dist', 'index.cjs');
+const SHARP_SHIM_SRC = path.join(ROOT, 'dsh', 'shim', 'sharp-android.js');
+// 装机版二进制由 build-imgtool.mjs 产出 (不入版本库, 与 usr/ 那套"构建时取"一致)。
+const IMGTOOL_ARM64 = path.join(ROOT, '.build', 'imgtool', 'imgtool-linux-arm64');
+const IMGTOOL_DST = path.join(SHARP_DIR, 'dist', 'imgtool');
+
+if (!fs.existsSync(SHARP_DIR)) {
+	die(`找不到 ${path.relative(ROOT, SHARP_DIR)} —— 这棵树不完整 (npm install 时 sharp 是 attachment-local 的依赖)`);
+}
+if (!fs.existsSync(SHARP_MAIN)) {
+	die(`sharp 入口不在预期位置: ${path.relative(APP, SHARP_MAIN)} —— 上游换结构了, 拒绝静默不部署`);
+}
+{
+	// 落点校验: 上游 package.json 的 main 必须还指着我们要替换的那个文件。
+	const pjPath = path.join(SHARP_DIR, 'package.json');
+	const pj = JSON.parse(fs.readFileSync(pjPath, 'utf8'));
+	const mainField = pj.main ?? 'index.js';
+	if (mainField !== './dist/index.cjs') {
+		die(`sharp 的 main 变成了 "${mainField}" (期望 ./dist/index.cjs) —— 替身落点不匹配`);
+	}
+}
+if (!fs.existsSync(SHARP_SHIM_SRC)) die(`找不到替身源码: ${path.relative(ROOT, SHARP_SHIM_SRC)}`);
+if (!fs.existsSync(IMGTOOL_ARM64)) {
+	die(
+		`找不到装机版 imgtool: ${path.relative(ROOT, IMGTOOL_ARM64)}\n` +
+			`  先跑: node dsh/tools/build-imgtool.mjs   (需要 Go 工具链)`,
+	);
+}
+{
+	// 二进制必须是 aarch64 静态 ELF —— 这里不校验的话, 拿 x86 或动态链接的
+	// 版本也能一路打包到真机, 然后在 spawn 时报"没有那个文件或目录"(缺解释器),
+	// 报错完全指不到打包这一步。
+	const b = fs.readFileSync(IMGTOOL_ARM64);
+	const machine = b[18] | (b[19] << 8);
+	if (!(b[0] === 0x7f && b[1] === 0x45 && b[2] === 0x4c && b[3] === 0x46 && b[4] === 2 && b[5] === 1 && machine === 0xb7 && b[16] === 2)) {
+		die(`装机版 imgtool 不是 aarch64 静态 ELF (machine=0x${machine.toString(16)}, type=${b[16]}) —— 真机上起不来`);
+	}
+}
+
+fs.copyFileSync(SHARP_SHIM_SRC, SHARP_MAIN);
+fs.copyFileSync(IMGTOOL_ARM64, IMGTOOL_DST);
+fs.chmodSync(IMGTOOL_DST, 0o755); // customize.sh 会 chmod -R 0755 app/, 但 zip 里就该是对的
+log(`  ✓ sharp 入口已换成 JS 替身: ${path.relative(APP, SHARP_MAIN)}`);
+log(`  ✓ imgtool 就位: ${path.relative(APP, IMGTOOL_DST)} (${(fs.statSync(IMGTOOL_DST).size / 1024).toFixed(0)} KiB, aarch64 静态)`);
+
+// 清掉装不上的平台 optionalDependencies: 留着只会让 npm ls 报 unmet,
+// 而且会让人误以为"装个 @img/sharp-linux-arm64 就好了"。
+{
+	const pjPath = path.join(SHARP_DIR, 'package.json');
+	const pj = JSON.parse(fs.readFileSync(pjPath, 'utf8'));
+	if (pj.optionalDependencies && Object.keys(pj.optionalDependencies).length > 0) {
+		pj.optionalDependencies = {};
+		pj.description = 'JS shim (Android): sharp 没有 android 平台包; 入口是 imgtool (Go 静态二进制) 的替身';
+		fs.writeFileSync(pjPath, JSON.stringify(pj, null, 2) + '\n');
+		log(`  ✓ 已清掉 sharp 的 optionalDependencies (那些平台包在 Android 上不存在)`);
+	}
+}
+shimTargets.push(SHARP_MAIN);
+
 // ─────────────────────────── 3. 校验 ───────────────────────────
 log('\n=== 校验 ===');
 
@@ -378,6 +455,7 @@ const checks = [
 	['ripgrep stub: bin/rg (入口)', path.join(RG_STUB_DIR, 'bin', 'rg')],
 	['ripgrep stub: libexec/rg.real', path.join(RG_STUB_DIR, 'libexec', 'rg.real')],
 	['ripgrep stub: libpcre2-8.so', path.join(RG_STUB_DIR, 'libexec', 'libpcre2-8.so')],
+	['sharp 替身: dist/imgtool (aarch64 静态)', IMGTOOL_DST],
 	...shimTargets.map((t) => [`shim 落点 (${path.relative(APP, t)})`, t]),
 ];
 let bad = 0;
@@ -438,6 +516,26 @@ if (/shim-ok object function/.test(smokeOut)) {
 	log(`  ✓ shim 实测通过: ${smokeOut}`);
 } else {
 	warn(`  ✗ shim 实测失败: ${smokeOut}`);
+	bad++;
+}
+
+// 真正 require 一次 sharp, 证明"换掉入口"这件事真的生效。
+// 这里**不会**执行 imgtool (它只在第一次图像操作时才被 spawn), 所以这条在
+// Windows 上也能跑 —— 它验的是"上游 require('sharp') 拿到的到底是谁"。
+// 真正解码/编码那一层由 probe/tools/imgtool-test.mjs 用 Windows 版 imgtool 验。
+const sharpSmoke = spawnSync(
+	nodeBin,
+	[
+		'-e',
+		'const s=require("sharp");const v=s.versions||{};console.log("sharp-shim-ok",typeof s,v.shim||"?");',
+	],
+	{ cwd: APP, encoding: 'utf8' }
+);
+const sharpOut = ((sharpSmoke.stdout ?? '') + (sharpSmoke.stderr ?? '')).trim();
+if (/sharp-shim-ok function imgtool/.test(sharpOut)) {
+	log(`  ✓ require("sharp") 拿到的是替身: ${sharpOut}`);
+} else {
+	warn(`  ✗ require("sharp") 没拿到替身 (图像准入会全链路失败): ${sharpOut.slice(0, 300)}`);
 	bad++;
 }
 

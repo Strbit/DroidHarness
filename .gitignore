@@ -34,3 +34,9 @@ dsh/module/tools/
 
 # android-probe 的构建产物（dex 由 tools/build-probe.mjs 生成）
 android-probe/dist/
+
+# imgtool local build output (tools/imgtool/). The build script writes to
+# .build/imgtool/ (ignored above); these catch a manual go build run in place.
+tools/imgtool/imgtool
+tools/imgtool/imgtool.exe
+tools/imgtool/imgtool-linux-arm64

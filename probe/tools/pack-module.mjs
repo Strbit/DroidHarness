@@ -370,12 +370,15 @@ for (let i = 0; i < files.length; i++) {
 			//                                    的现实走的 —— zip 和设备一致比"精确"重要)
 			//   app/.../ripgrep-android-arm64/   rg 垫片: bin/rg 是 wrapper,
 			//                                    libexec/rg.real 是被 exec 的二进制
+			//   app/node_modules/sharp/dist/imgtool
+			//                                    sharp 替身的后端 (Go 静态二进制),
+			//                                    被 spawn 的就是它
 			//   tools/screen-mcp                 屏幕识别 MCP 的启动器, 同样无后缀
 			//                                    (cordis.patch.yml 里 command 直接指它)
 			//   uninstall.sh                     KernelSU 卸载时 exec 的脚本
 			//                                    (根目录 *.sh 那条已经覆盖它)
 			//
-			// 这三处不可执行的后果不是"权限不整洁", 而是功能在 spawn 时直接 EACCES
+			// 这几处不可执行的后果不是"权限不整洁", 而是功能在 spawn 时直接 EACCES
 			// —— 而 rg 那处的报错会伪装成 "ripgrep launch failed"。
 			// 虽然 customize.sh 会兜底 chmod, 但不该把正确性押在安装器上。
 			const isExec =
@@ -383,6 +386,7 @@ for (let i = 0; i < files.length; i++) {
 				file.rel.endsWith('.sh') ||
 				file.rel.startsWith('bin/') ||
 				file.rel === 'tools/screen-mcp' ||
+				file.rel === 'app/node_modules/sharp/dist/imgtool' ||
 				file.rel.startsWith('app/node_modules/@vscode/ripgrep-android-arm64/');
 			const mode = isExec ? 0o100755 : 0o100644;
 			const nameBuf = Buffer.from(file.rel, 'utf8');
