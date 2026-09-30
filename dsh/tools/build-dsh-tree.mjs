@@ -312,6 +312,27 @@ async function linkOrCopyExcl(from, to) {
 }
 `;
 
+/**
+ * 给 attachment-local 的目录 fsync 加 Android 根目录豁免。
+ *
+ * 真机实测 (Android 16, myron): 对 `/` (文件系统根) 做 dir fsync 报
+ * `EINVAL: invalid argument, fsync` —— bionic/内核不允许对 fs 根 fd sync。
+ * 上游 ensureDurableHome/ensureDurableDirectory 的 fsync 遍历用
+ * `parse(home).root` 当停止边界, 而 home=/data/adb/dsh 的 root 恰好是 `/`,
+ * 于是**每一次图片/文件落盘**都在"向上 sync 到根"这一步炸掉:
+ *
+ *   EINVAL: invalid argument, fsync
+ *     (被包成 ATTACHMENT_WRITE_FAILED → "durable image storage rejected")
+ *
+ * PC 上复现不了: Linux 对 `/` 的 fsync 合法 (ext4), Windows 根本走不到这里
+ * (syncDirectory 开头就对 win32 返回)。所以这条补丁只能靠真机验证发现。
+ *
+ * 修法 (单点): 三处"向上 fsync"循环全走 syncDirectory, 在它的 win32 豁免
+ * 旁边加一个根目录豁免 (`parse(path).root === path` 时直接返回)。其余
+ * 真实目录仍逐级 sync, 耐久性语义不变 (唯一损失是"/ 之下的第一级条目",
+ * 本部署不存在 —— home 永远在 /data/adb 之下)。
+ * 上游同时 import 了 path 的 parse (attachment-local 里本来就有), 无需新增 import。
+ */
 const TEXT_PATCHES = [
 	{
 		label: 'dsh-fs-local: writeFileAtomic 在 FUSE 上把 link() 降级成 copyFile',
@@ -331,6 +352,21 @@ const TEXT_PATCHES = [
 			{
 				find: '\tconst linkFile = internals.linkFile ?? link;',
 				replace: '\tconst linkFile = internals.linkFile ?? linkOrCopyExcl;',
+			},
+		],
+	},
+	{
+		label: 'attachment-local: dir fsync 跳过文件系统根 (bionic 对 / sync 报 EINVAL)',
+		file: ['@deepseek-ai', 'dsh-attachment-local', 'lib', 'index.js'],
+		edits: [
+			{
+				// 单点修改: 三处"向上 fsync"循环 (ensureDurableDirectory /
+				// publishStagedObject / publishImmutableAlias) 全走 syncDirectory,
+				// 在它的 win32 豁免旁边加一个 Android 根目录豁免就全覆盖了。
+				// 其余真实目录仍逐级 sync, 耐久性语义不变 (唯一损失是"/ 之下的
+				// 第一级条目", 本部署不存在 —— home 永远在 /data/adb 之下)。
+				find: '	if (process.platform === "win32") return;\n	/* v8 ignore start -- Windows cannot exercise directory fsync; POSIX behavior tests enforce this peer. */\n	const handle = await open(path, constants.O_RDONLY);',
+				replace: '	if (process.platform === "win32") return;\n	/* [Android 补丁] bionic/内核对文件系统根的 fd sync 报 EINVAL (真机实测);\n	 * 上游的耐久性遍历会一路走到根 (parse(home).root === "/"), 于是每次\n	 * 落盘都炸。跳过根这一级, 其余目录照常逐级 sync。 */\n	if (parse(path).root === path) return;\n	/* v8 ignore start -- Windows cannot exercise directory fsync; POSIX behavior tests enforce this peer. */\n	const handle = await open(path, constants.O_RDONLY);',
 			},
 		],
 	},
