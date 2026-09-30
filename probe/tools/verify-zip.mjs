@@ -127,10 +127,31 @@ const REQUIRED = [
   'tools/lib/displays.mjs', 'tools/lib/cmd-display.mjs',
   // 托管块的真源。缺它 = 脚本推导不出条目 = 不会接入。
   'tools/cordis.patch.example.yml',
+  // sharp 替身 + 它的后端。少任何一个, 设备上**所有**图片准入都失败
+  // (屏幕识别 screen_image、图片附件), 而 DSH 主服务照常健康 —— 又一例
+  // "静默缺能力"。注意这两个在 app/ 里, 是 build-dsh-tree 第 2c 节生成的。
+  'app/node_modules/sharp/dist/index.cjs',
+  'app/node_modules/sharp/dist/imgtool',
 ];
 for (const name of REQUIRED) {
   const e = find(name);
   check(`${name.padEnd(34)} 在包里${e ? ` (${e.usize} B)` : ''}`, !!e);
+}
+
+// 光"文件在"不够: 入口文件可能是**真 sharp**(装机时被 npm install 覆盖回去,
+// 或者 2c 那节压根没跑)。真 sharp 在 Android 上一定起不来, 而症状是
+// "durable image storage rejected" —— 指不到这里。所以核内容标记。
+{
+  const shimEntry = find('app/node_modules/sharp/dist/index.cjs');
+  const shimText = shimEntry ? readData(shimEntry).toString('utf8') : '';
+  check('sharp 入口是替身 (含 shim 标记), 不是真 sharp', shimText.includes('sharp shim (Android)'), shimText.slice(0, 80));
+  const binEntry = find('app/node_modules/sharp/dist/imgtool');
+  if (binEntry) {
+    const b = readData(binEntry);
+    const machine = b[18] | (b[19] << 8);
+    const isArm64Static = b[0] === 0x7f && b[1] === 0x45 && b[2] === 0x4c && b[3] === 0x46 && b[4] === 2 && b[5] === 1 && machine === 0xb7 && b[16] === 2;
+    check('imgtool 是 aarch64 静态 ELF (真机能直接 exec)', isArm64Static, `machine=0x${machine.toString(16)} type=${b[16]}`);
+  }
 }
 
 // ─────────────────── 2. 模式位（KernelSU 不保留 zip 之外的权限） ───────────────────
@@ -139,6 +160,9 @@ console.log('=== 2. 执行位 ===');
 const NEED_X = [
   'customize.sh', 'service.sh', 'action.sh', 'uninstall.sh',
   'bin/dsh', 'bin/dshctl', 'bin/env.sh', 'tools/screen-mcp', 'usr/bin/node',
+  // sharp 替身的后端: 被 spawn 的就是它。zip 里没执行位的话, 有些解包工具
+  // 会落成 0644 —— customize.sh 虽会兜底 chmod, 但不该把正确性押在安装器上。
+  'app/node_modules/sharp/dist/imgtool',
 ];
 for (const name of NEED_X) {
   const e = find(name);
@@ -163,6 +187,8 @@ const CR_BANNED = [
   // 而 DSH 主服务照常健康 —— 本项目最熟的那类"静默缺能力"。
   'tools/lib/ui-lock.mjs',
   'tools/lib/displays.mjs', 'tools/lib/cmd-display.mjs',
+  // sharp 替身是 JS, 混进 CRLF 在设备上无害但会让"逐字节一致"的核对失效。
+  'app/node_modules/sharp/dist/index.cjs',
 ];
 for (const name of CR_BANNED) {
   const e = find(name);
@@ -196,6 +222,10 @@ const MARKERS = [
   ['§7 认 SKIPPED-DUPE (不插第二份)', 'SKIPPED-DUPE)'],
   ['§7 认 REPLACED (升级换条目)', 'REPLACED)'],
   ['§7 失败只 WARN 不 abort', '[WARN] 没接进去'],
+  // §3 的 sharp 替身门禁 —— 缺它说明 zip 是"没有图像后端"那一版, 而症状会
+  // 伪装成"图片格式不对"(durable image storage rejected)。
+  ['§3 核 sharp 替身标记', 'sharp shim (Android)'],
+  ['§3 核 imgtool 在位', 'dist/imgtool'],
 ];
 for (const [label, s] of MARKERS) check(label, custTxt.includes(s), 'zip 里找不到 —— 打包用的是旧 customize.sh');
 

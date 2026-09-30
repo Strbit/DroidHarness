@@ -48,17 +48,40 @@ cd D:\projects\DroidHarness
 # 1. 取运行时 (aarch64 Node + bash + ripgrep + npm + pnpm)
 node probe\tools\fetch-runtime.mjs --out dsh\module
 
-# 2. 装 DSH 应用树并打补丁 (两个 shim 都会实测校验)
+# 2. 编译图像工具 imgtool (需要 Go; 产出 .build\imgtool\, 不入版本库)
+node dsh\tools\build-imgtool.mjs
+
+# 3. 装 DSH 应用树并打补丁 (shim / sharp 替身都会实测校验)
 node dsh\tools\build-dsh-tree.mjs
 
-# 3. 暂存设备侧屏幕识别 (recognize/ → dsh\module\tools\)
+# 4. 暂存设备侧屏幕识别 (recognize/ → dsh\module\tools\)
 node dsh\tools\stage-tools.mjs
 
-# 4. 打包
+# 5. 打包
 node probe\tools\pack-module.mjs --module dsh\module
 ```
 
 产物在 `dsh\dist\`。
+
+### 第 2 步为什么需要 Go
+
+Android 上没有 sharp：sharp 0.35.x 的平台包里没有 android（只有 darwin/linux/
+linuxmusl/freebsd/wasm，而 `@img/sharp-linux-arm64` 是 glibc/ELF 的，bionic 上起不来）。
+`@deepseek-ai/dsh-attachment-local` 的每一次图片准入都要 sharp，于是问题不是
+"图片功能少一点"，而是 **`screen_image` 和图片附件整条链路都抛错**，报的还是
+`durable image storage rejected` 这种指不到根因的话。
+
+替身 = `dsh/shim/sharp-android.js`（纯 JS，用 `build-dsh-tree.mjs` 第 2c 节覆盖
+`app/node_modules/sharp/dist/index.cjs`）+ `tools/imgtool/main.go`（Go 静态
+aarch64 二进制，由 `build-imgtool.mjs` 编出来放到替身旁边）。它是**纯 Go**、
+零 cgo，所以交叉编译不需要 NDK。
+
+覆盖面（诚实说明）：不透明图的 JPEG 归一化、16bit/灰度/EXIF 方向、请求图变体
+都在覆盖内；**带真实透明的图本构建不支持**（Go 生态只有 webp 解码、没有编码），
+这类图会明确报错而不是把 alpha 静默压平。PC 侧验收见
+`node probe\tools\imgtool-test.mjs`（50 项断言，其中 B 组跑的是**真的**
+attachment-local 全链路）。
+
 
 ### 第 3 步不能跳
 

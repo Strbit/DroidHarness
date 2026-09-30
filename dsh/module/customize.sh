@@ -147,6 +147,20 @@ else
 	ui_print "         检查 dsh/tools/build-dsh-tree.mjs 是否跑过"
 fi
 
+# sharp 替身 + imgtool。sharp 没有 android 平台包, 不换入口的话
+# @deepseek-ai/dsh-attachment-local 里每次图片准入都抛 "sharp is not installed",
+# 被上游包成 "durable image storage rejected" —— 症状像"图片格式不对", 实际是
+# "这个平台上根本没有 sharp"。屏幕识别 (screen_image) 和图片附件都走这条路。
+# grep 认的是替身文件里的标记串, 不是文件名: 入口被换回去了要能看出来。
+SHARP_DIR="$APP/node_modules/sharp"
+SHARP_MAIN="$SHARP_DIR/dist/index.cjs"
+if [ -f "$SHARP_MAIN" ] && grep -q "sharp shim (Android)" "$SHARP_MAIN" 2>/dev/null && [ -f "$SHARP_DIR/dist/imgtool" ]; then
+	ui_print "  [ OK ] 图像编码替身在位 (screen_image / 图片附件可用)"
+else
+	ui_print "  [FAIL] sharp 替身或 imgtool 缺失 —— 图片准入会整条失败"
+	ui_print "         先跑: node dsh/tools/build-imgtool.mjs && node dsh/tools/build-dsh-tree.mjs"
+fi
+
 # KernelSU 的 WebUI 入口. 官方要求: webroot/ 下**必须**有 index.html, 否则
 # Manager 根本不显示「WebUI」按钮 —— 也就是说缺文件的表现不是报错, 而是
 # "按钮压根没出现", 很容易让人以为模块坏了。装机时就报出来。
