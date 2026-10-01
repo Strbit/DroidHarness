@@ -204,14 +204,18 @@ export async function physicalInput(kind, args, { timeout = 15000, spawnImpl } =
  * LF 强制: 本文件可能由 Windows 侧工具链接触; busybox sh 把 \r 当命令内容。
  */
 function ensureRunner() {
+  // 幂等检查必须锚定**版本标记行**而不是类名: 类名在所有版本的脚本里都在,
+  // 而参数布局改过 —— 拿类名判"已在"会放行旧布局的脚本, 注入时 $1='text'
+  // 被当 displayId, parseInt 直接炸。改布局时同步改这一行标记。
+  const VERSION_MARK = '# argv: <text> <displayId> <b64-utf8> <replace|append>';
   try {
     const cur = fs.readFileSync(RUNNER_PATH, 'utf8');
-    if (cur.includes('com.dsh.uiaction.DshActionMain')) return;
+    if (cur.includes(VERSION_MARK) && cur.includes('com.dsh.uiaction.DshActionMain')) return;
   } catch { /* 不在, 重写 */ }
   const script = [
     '#!/system/bin/sh',
     '# 由 screen-mcp (lib/uiaction.mjs) 生成; 删除后下次动作会重建。',
-    '# argv: <text> <displayId> <b64-utf8> <replace|append>',
+    VERSION_MARK,
     'PID=$(pgrep -f system_server | head -1)',
     'export BOOTCLASSPATH=$(tr \'\\0\' \'\\n\' < /proc/$PID/environ | sed -n \'s/^BOOTCLASSPATH=//p\')',
     'export DEX2OATBOOTCLASSPATH=$(tr \'\\0\' \'\\n\' < /proc/$PID/environ | sed -n \'s/^DEX2OATBOOTCLASSPATH=//p\')',
