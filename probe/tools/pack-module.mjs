@@ -246,6 +246,9 @@ if (haveScreen && !NO_SCREEN_MCP) {
 const ownText = files.filter((f) => {
 	if (!f.rel.includes('/')) return /\.(sh|prop)$/.test(f.rel);
 	const top = f.rel.split('/')[0];
+	// dex 是编译二进制(魔数 dex\n): 字节流天然含 0x0d, CR 检查是文本世界的
+	// 规则, 对它只会误报。它的门在 stage-tools 拷贝分支: 魔数已验。
+	if (top === 'tools' && f.rel.endsWith('.dex')) return false;
 	return top === 'bin' || top === 'tools';
 });
 const withCR = [];

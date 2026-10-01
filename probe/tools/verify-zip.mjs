@@ -125,6 +125,9 @@ const REQUIRED = [
   // 而 DSH 主服务照常健康 —— 本项目最熟的那类"静默缺能力"。
   'tools/lib/ui-lock.mjs',
   'tools/lib/displays.mjs', 'tools/lib/cmd-display.mjs',
+  // 动作层(tap/swipe/key/text)。漏 uiaction.mjs 的症状同上(ERR_MODULE_NOT_FOUND);
+  // 漏 dex = screen_text 每次都 dex-missing, 4 个动作工具全废。
+  'tools/lib/uiaction.mjs', 'tools/dsh-action.dex',
   // 托管块的真源。缺它 = 脚本推导不出条目 = 不会接入。
   'tools/cordis.patch.example.yml',
   // sharp 替身 + 它的后端。少任何一个, 设备上**所有**图片准入都失败

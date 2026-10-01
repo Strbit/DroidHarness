@@ -233,6 +233,25 @@ function main() {
 
 	L.push('---');
 	L.push('');
+	// 借鉴实现(非 npm 依赖): 源码级参考必须归因, 而且只能写在这里 —— 手改产物
+	// 会被本脚本下次运行覆盖(本文件是唯一真源)。
+	L.push('## 二·五、借鉴实现（非依赖，源码级参考）—— 1 个');
+	L.push('');
+	L.push('`recognize/uiaction/DshActionMain.java` 的关键实现在设计上参考了');
+	L.push('[AcidGr/agent-mobile-use](https://github.com/AcidGr/agent-mobile-use)（MIT,');
+	L.push('© 2026 AcidGr）的 `vd-tool-java/src/com/agent/ToolMain.java`：');
+	L.push('');
+	L.push('- UiAutomation 反射引导序列（HandlerThread looper / `connect(int)`+`connect()`');
+	L.push('  双形态 / `setServiceInfo` 标志组合）—— 绕开 app_process 无主 Looper 的 exit 137');
+	L.push('- `getWindowsOnAllDisplays()` 读非默认屏树');
+	L.push('- `ACTION_SET_TEXT` + 60ms + `refresh()` 读回校验、`isMasked`（密码框圆点判成功）');
+	L.push('- 无 fallback 的单通道注入纪律');
+	L.push('');
+	L.push('本仓库的实现是重写（argv 一次一进程、无 stdin daemon、聚焦模式单一通道），');
+	L.push('未逐行复制；在此按 MIT 归因。');
+	L.push('');
+	L.push('---');
+	L.push('');
 	L.push('## 三、生成方式');
 	L.push('');
 	L.push('```sh');

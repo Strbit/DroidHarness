@@ -13,7 +13,12 @@
 #   @deepseek-ai/dsh-mcp-client      通用 MCP 适配器(DSH 自带), 只做协议翻译
 #
 # 工具以 mcp__screen__<name> 出现:
-#   mcp__screen__list_displays / __screen_tree / __screen_targets / __screen_image
+#   观察: mcp__screen__list_displays / __screen_tree / __screen_targets / __screen_image
+#   动作: mcp__screen__screen_tap / __screen_swipe / __screen_key / __screen_text
+#     · tap/swipe/key 走 /system/bin/input(支持 -d 副屏)
+#     · text 用无障碍 ACTION_SET_TEXT(app_process dex)——中文/emoji 可入,
+#       静默不弹键盘, 写后读回校验; 微信等"只认真实无障碍服务"的 App 由
+#       本层自动挂/还原系统预装服务(见 tools/lib/uiaction.mjs)
 - insert:
     - id: mcp-screen
       name: '@deepseek-ai/dsh-mcp-client'

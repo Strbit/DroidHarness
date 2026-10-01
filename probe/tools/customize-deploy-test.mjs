@@ -124,7 +124,9 @@ check('  没有多出一层 tools/（这正是 dir/. 写法的风险）', !fs.ex
 check('lib/ 下 5 个 mjs 全部落地', ['uitree', 'fields', 'spawn-env', 'displays', 'cmd-display'].every((n) => fs.existsSync(j(DST, 'lib', `${n}.mjs`))));
 check('patch 模板也在', fs.existsSync(j(DST, 'cordis.patch.example.yml')));
 check('screen-mcp.mjs 内容与源逐字节一致', fs.readFileSync(j(DST, 'screen-mcp.mjs')).equals(fs.readFileSync(j(REAL_MOD, 'screen-mcp.mjs'))));
-check('落地文件一个 CR 都没有', walkF(DST).every((f) => !fs.readFileSync(f).includes(0x0d)));
+// dex 是编译二进制, 字节流天然含 0x0d —— CR 检查是文本世界的规则, 对它只会误报
+// (它的门在 stage-tools 拷贝分支: 魔数已验)。
+check('落地文件一个 CR 都没有', walkF(DST).every((f) => f.endsWith('.dex') || !fs.readFileSync(f).includes(0x0d)));
 check('落地文件数 = N_FILES（cp 没漏）', walkF(DST).length === N_FILES, `实际 ${walkF(DST).length}`);
 // 布署段自己的复核有没有说"可执行" —— 测的是**脚本的判断**，不是 NTFS 的位。
 check('布署段的 -x 复核判定可执行', /screen-mcp 可执行/.test(t2.out), t2.out);

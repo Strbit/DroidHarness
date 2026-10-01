@@ -383,10 +383,10 @@
 - `@sec-ant/readable-stream@0.4.1` — MIT
 - `@sindresorhus/merge-streams@4.0.0` — MIT
 - `@stablelib/base64@1.0.1` — MIT
-- `@standard-schema/spec@1.1.0` — MIT
 - `@types/node@26.6.3` — MIT
 - `@types/retry@0.12.0` — MIT
 - `@vscode/ripgrep@1.18.0` — MIT
+- `@vscode/ripgrep-android-arm64@15.2.0` — MIT
 - `@xterm/addon-serialize@0.14.0` — MIT
 - `@xterm/headless@6.0.0` — MIT
 - `agent-base@7.1.4` — MIT
@@ -595,6 +595,23 @@
 ### 其他（1）
 
 - `argparse@2.0.1` — Python-2.0
+
+---
+
+## 二·五、借鉴实现（非依赖，源码级参考）—— 1 个
+
+`recognize/uiaction/DshActionMain.java` 的关键实现在设计上参考了
+[AcidGr/agent-mobile-use](https://github.com/AcidGr/agent-mobile-use)（MIT,
+© 2026 AcidGr）的 `vd-tool-java/src/com/agent/ToolMain.java`：
+
+- UiAutomation 反射引导序列（HandlerThread looper / `connect(int)`+`connect()`
+  双形态 / `setServiceInfo` 标志组合）—— 绕开 app_process 无主 Looper 的 exit 137
+- `getWindowsOnAllDisplays()` 读非默认屏树
+- `ACTION_SET_TEXT` + 60ms + `refresh()` 读回校验、`isMasked`（密码框圆点判成功）
+- 无 fallback 的单通道注入纪律
+
+本仓库的实现是重写（argv 一次一进程、无 stdin daemon、聚焦模式单一通道），
+未逐行复制；在此按 MIT 归因。
 
 ---
 
