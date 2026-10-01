@@ -3,8 +3,7 @@
 // 为什么需要这个文件
 // ------------------
 // DSH 服务进程的 environ 里有 `LD_LIBRARY_PATH=/data/adb/modules/dsh_android/usr/lib`
-// (它在 service.sh 里被 export, 因为模块自带的 node 需要它来找 libz 等库)。
-//
+// (它在 service.sh 里被 export, 因为模块自带的 node 需要它来找 libz 等库)。//
 // 而 `screen-mcp` 由 harness 经 stdio spawn, **必然继承**这个变量。
 //
 // 问题: 该变量指向的是 Termux 编译的库。系统二进制(尤其 `uiautomator` 会经
@@ -25,6 +24,8 @@
 // 注意 `screencap` 实测两者都能出图(它不像 uiautomator 那样起 ART),
 // 但仍然归入"系统二进制"一类: 依赖"某个二进制恰好不受污染"是脆弱的,
 // 分类依据是"它是不是系统二进制", 不是"它现在恰好能不能跑"。
+
+import { execFile } from 'node:child_process';
 
 /** 哪些命令算"系统二进制": 跑它们时必须剔除 Termux 的库路径。 */
 const SYSTEM_BIN_RE = /^\/(system|vendor|apex)\//;
@@ -75,6 +76,11 @@ export function runCommand(cmd, args, opts = {}) {
     baseEnv = process.env,
     spawnImpl = null,
   } = opts;
+  // 默认必须能跑: 曾经这里只有 `const spawn = spawnImpl;` —— 调用方忘了传就
+  // 是 `spawn is not a function`, 而**观察工具全都传了**(screen-mcp 传 execFile),
+  // 所以这个坑只在新增的动作层(uiaction.mjs)上暴露, PC 单测又恰好只测了注入
+  // 路径的那几条。真机 MCP 链路一跑就炸 —— 默认实现兜住它, 注入仍然优先。
+  const spawn = spawnImpl ?? execFile;
 
   const execOptions = {
     maxBuffer: 256 * 1024 * 1024,
@@ -85,7 +91,6 @@ export function runCommand(cmd, args, opts = {}) {
     ...execOpts,
   };
 
-  const spawn = spawnImpl;
   return new Promise((resolve, reject) => {
     spawn(cmd, args, execOptions, (err, stdout, stderr) => {
       if (err) reject(Object.assign(new Error(`${cmd} ${args.join(' ')}: ${err.message}`), { stderr }));

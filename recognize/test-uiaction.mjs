@@ -116,6 +116,28 @@ t('DEX_PATH 指向 tools 根(与 lib 同级的 dsh-action.dex)', () => {
   assert.ok(!DEX_PATH.includes('/lib/'), 'dex 不应在 lib/ 下: ' + DEX_PATH);
 });
 
+// ── runCommand 默认实现必须能跑（真机 regression）──────────
+// 症状: screen-mcp 里所有观察工具都传了 spawnImpl(execFile), 所以"默认 spawnImpl
+// 是 null"这个坑一直被掩盖; 动作层(uiaction.mjs)起先没传, 真机 MCP 链路一跑就
+// `spawn is not a function`。这条断言让它在 PC 上就能红。
+console.log('');
+console.log('runCommand 默认实现 (真机 regression 回归)');
+const spawnEnv = await import('./lib/spawn-env.mjs');
+{
+  let ok = false;
+  let errMsg = '';
+  try {
+    const r = await spawnEnv.runCommand(process.execPath, ['-e', 'process.stdout.write("ok")'], { timeout: 15000 });
+    ok = String(r.stdout).trim() === 'ok';
+    if (!ok) errMsg = 'stdout=' + JSON.stringify(String(r.stdout));
+  } catch (e) {
+    errMsg = e.message;
+  }
+  t('不传 spawnImpl 时 runCommand 仍能执行(默认 execFile)', () => {
+    assert.ok(ok, errMsg + ' ← 默认实现坏了, 真机上所有子进程调用都会挂');
+  });
+}
+
 console.log('');
 if (process.exitCode) {
   console.log(`FAIL —— 有失败项`);

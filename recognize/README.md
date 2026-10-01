@@ -30,13 +30,13 @@
 ```powershell
 cd recognize
 
-# 不连设备也能跑的测试（共 102 项）
+# 不连设备也能跑的测试（共 103 项）
 node recognize.mjs selftest        # 解析器 + 合并逻辑（11 项）
 node test-fields.mjs               # 截断 / 有界化 / 缓存新鲜度契约（22 项）
 node test-spawn-env.mjs            # 子进程环境分类（15 项）
 node test-screen-image-cache.mjs   # screen_image 缓存链路（6 项）
 node test-displays.mjs             # 跨设备屏解析 + 真机 dump 回归（34 项）
-node test-uiaction.mjs             # 动作层纯逻辑：服务挂载状态机 + argv 构造（13 项）
+node test-uiaction.mjs             # 动作层纯逻辑：服务挂载状态机 + argv 构造（14 项）
 node bench-frame-path.mjs          # 帧路径编码代价量化
 
 # 需要设备
@@ -246,7 +246,7 @@ recognize/
 ├── test-fields.mjs               单元测试：截断 / 有界化 / 缓存契约（22 项）
 ├── test-spawn-env.mjs            单元测试：子进程环境分类（15 项，拦住 LD_LIBRARY_PATH 污染）
 ├── test-screen-image-cache.mjs   单元测试：screen_image 缓存链路（6 项）
-├── test-uiaction.mjs             单元测试：动作层纯逻辑（13 项：服务挂载状态机 + argv 构造）
+├── test-uiaction.mjs             单元测试：动作层纯逻辑（14 项：服务挂载状态机 + argv 构造）
 ├── test-serve.mjs                PC 侧 CLI 的逐行 JSON 协议（**需要设备**，5 项断言）
 ├── test-screen-mcp.mjs           端到端：MCP 协议（**需要设备**，7 项断言）
 ├── uiaction/
@@ -430,27 +430,55 @@ node 自身仍健康                 -> v26.4.0
 screencap 不受影响              -> 562471 / 563077 B（带与不带都能出图）
 ```
 
-**动作层在设备 B 上的实测（2026-10，探针脚本阶段，先于 MCP 链路接线）**：
+**动作层在设备 B 上的实测（2026-10）**：
 
 ```
-微信树屏蔽机理    : 未挂服务 -> UiAutomation 树 app_nodes=0（主屏/副屏都空）；
-                    挂系统预装 SelectToSpeak -> app_nodes 0→19（主屏）/ 0→24（副屏）
-ACTION_SET_TEXT   : 微信 EditText(com.tencent.mm:id/bkk) 写入「国庆快乐」ok=true,
-                    cost 159ms, 读回 verified_text 精确一致；QQ 输入框同样通过
-副屏可达性        : input -d 3 tap/keyevent 真实落地（打开群资料页并返回）
+微信树屏蔽机理    : 未挂服务 -> MCP screen_tree 报 "1 节点 / 不可用: tree-empty"
+                    挂系统预装 SelectToSpeak -> "112 节点, 15 有文字, 20 可操作 —— 可用"
+                    （同一界面、同一工具, 唯一变量是服务绑定；内容可读:
+                      "我是刘思宇" / "我通过了你的朋友验证请求" 等微信聊天文字）
+ACTION_SET_TEXT   : 经 MCP 链路 tools/call screen_text 注入微信 EditText
+                    (com.tencent.mm:id/bkk, 戴荣辉聊天页):
+                      注入 {"ok":true,"mode":"action_set_text","cost_ms":212,
+                            "before_text":"","verified_text":"国庆快乐"}
+                      清空 {"ok":true,"before_text":"国庆快乐","verified_text":""}
+                    读回来自节点 refresh() 后 getText(), 不是回显输入；
+                    清空那次的 before_text 恰是上一次写入的内容 —— 交叉证明。
+子屏可达性        : input -d 3 tap/keyevent 真实落地（打开群资料页并返回）
 虚拟副屏创建      : app_process + VirtualDisplayConfig 反射成功（1200x2608@480, trusted）
 screencap 副屏    : `screencap -d 3` 报 Display Id not valid —— 副屏截图需 ImageReader
                     路径（未做，属虚拟副屏工程的范畴）
 ```
 
-单元测试（本机，无需设备）—— 共 102 项
+**两个只有真机链路才会暴露的缺陷（都已修 + 已加回归门）**：
+
+```
+1. spawn-env.mjs 默认 spawnImpl 为 null
+   观察工具全都显式传了 execFile，所以这个坑被掩盖；动作层起先没传,
+   真机 screen_text 直接 "spawn is not a function"。
+   → runCommand 默认 execFile；test-uiaction 加一条"不传 spawnImpl 也能跑"的
+     回归断言（反向验证过: 改回旧写法该断言精确变红）。
+
+2. app_process 没有主 Looper（logcat 铁证）
+   FATAL EXCEPTION: UiAutomation
+     NullPointerException: Looper.mQueue on a null object reference
+       at android.os.Handler.<init>(Handler.java:272)
+   症状是 shell 只打印 "Killed"、stderr 全空 —— screen_text 报 "Command failed"
+   而没有任何线索。
+   → main() 开头 if (Looper.getMainLooper() == null) Looper.prepareMainLooper();
+   → 同时让 injectText 在失败时把动作进程的 stdout/stderr 带进错误信息
+     （这次绕远路的直接原因就是那两行是空的）。
+```
+
+单元测试（本机，无需设备）—— 共 103 项
   recognize.mjs selftest  : 11/11 通过（解析器 + 合并逻辑）
   test-fields             : 22/22 通过（head+tail 截断 / 数组有界化 / 缓存新鲜度契约）
   test-spawn-env          : 15/15 通过（子进程环境分类 —— 拦住上面设备 B 那个坑）
   test-screen-image-cache : 6/6 通过（screen_image 缓存链路 / 主副屏不串味）
   test-displays           : 34/34 通过（跨设备屏解析 —— 主路径 cmd display，dumpsys 兜底，
                             含一条直接喂真机 dump 文件的回归）
-  test-uiaction           : 13/13 通过（动作层：服务挂载状态机 / argv 构造 / dex 落点）
+  test-uiaction           : 14/14 通过（动作层：服务挂载状态机 / argv 构造 / dex 落点 /
+                             runCommand 默认实现 —— 最后一条拦的是真机抓到的 spawn bug）
   test-screen-mcp         : 端到端 MCP 协议，带断言（已实测"该失败时 exit=1"）
   bench-frame-path        : zlib 量化（level 1 = 21 ms, level 9 = 546 ms, 体积几乎一样）
 

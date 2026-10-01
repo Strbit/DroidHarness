@@ -49,6 +49,16 @@ public final class DshActionMain {
     private static final String END = "<<<END_OF_JSON>>>";
 
     public static void main(String[] args) {
+        // ⚠ 主 Looper 必须最先准备(真机 logcat 实测的坑, 不要挪走):
+        // app_process 起的进程**没有主 Looper**。UiAutomation.connect() 会走到
+        // AccessibilityInteractionClient, 它的构造器执行 new Handler(Looper.getMainLooper());
+        // 拿到的 Looper 是 null → Handler 构造器读 Looper.mQueue NPE →
+        // "FATAL EXCEPTION: UiAutomation" → RuntimeInit 把整个进程杀掉
+        // (表现为 shell 打印 "Killed"、exit 137、stderr 里什么都没有)。
+        // 真机症状: screen_text 报 "Command failed" 且无任何输出 —— 极难归因。
+        if (android.os.Looper.getMainLooper() == null) {
+            android.os.Looper.prepareMainLooper();
+        }
         String json;
         int code;
         try {

@@ -217,8 +217,11 @@ function ensureRunner() {
     '# 由 screen-mcp (lib/uiaction.mjs) 生成; 删除后下次动作会重建。',
     VERSION_MARK,
     'PID=$(pgrep -f system_server | head -1)',
-    'export BOOTCLASSPATH=$(tr \'\\0\' \'\\n\' < /proc/$PID/environ | sed -n \'s/^BOOTCLASSPATH=//p\')',
-    'export DEX2OATBOOTCLASSPATH=$(tr \'\\0\' \'\\n\' < /proc/$PID/environ | sed -n \'s/^DEX2OATBOOTCLASSPATH=//p\')',
+    // 继承的优先(sh 服务的 env 由 init 导出, 实测带 BOOTCLASSPATH), 没有
+    // 再从 system_server 的 /proc 借 —— 两个来源, 同一份真值, 不依赖 root。
+    '[ -n "$BOOTCLASSPATH" ] || export BOOTCLASSPATH=$(tr \'\\0\' \'\\n\' < /proc/$PID/environ | sed -n \'s/^BOOTCLASSPATH=//p\')',
+    '[ -n "$DEX2OATBOOTCLASSPATH" ] || export DEX2OATBOOTCLASSPATH=$(tr \'\\0\' \'\\n\' < /proc/$PID/environ | sed -n \'s/^DEX2OATBOOTCLASSPATH=//p\')',
+    '[ -n "$BOOTCLASSPATH" ] || { echo "{\\"ok\\":false,\\"error\\":\\"no-bootclasspath\\",\\"reason\\":\\"继承与 /proc 都拿不到 BOOTCLASSPATH\\"}"; exit 3; }',
     'export ANDROID_ROOT=/system ANDROID_DATA=/data',
     'export ANDROID_ART_ROOT=/apex/com.android.art',
     'export ANDROID_I18N_ROOT=/apex/com.android.i18n',
@@ -251,11 +254,25 @@ export async function injectText(displayId, text, { timeout = 45000, mode = 'rep
     try {
       // /system/bin/sh 是系统二进制 → envForCommand 自动剔除 LD_LIBRARY_PATH
       // (Termux 库路径会打死 app_process 的 ART, 见 spawn-env.mjs 头部实测)。
-      const res = await run(
-        '/system/bin/sh',
-        [RUNNER_PATH, 'text', String(Number(displayId)), b64, 'focused', modeArg],
-        { timeout },
-      );
+      let res;
+      try {
+        res = await run(
+          '/system/bin/sh',
+          [RUNNER_PATH, 'text', String(Number(displayId)), b64, 'focused', modeArg],
+          { timeout },
+        );
+      } catch (e) {
+        // 失败时**必须**把动作进程的 stdout/stderr 带出来。真机上曾因为这里只有
+        // 一句 "Command failed" + 空 stderr, 绕了好几轮才从 logcat 挖到
+        // "main Looper 没准备" 那条根因 —— 动作进程的 JSON 就在 stdout 里。
+        const so = String(e.stdout || '').trim();
+        const se = String(e.stderr || '').trim();
+        throw new Error(
+          `动作进程失败: ${e.message}\n` +
+          `  stdout: ${so ? so.slice(0, 500) : '(空)'}\n` +
+          `  stderr: ${se ? se.slice(0, 500) : '(空)'}`,
+        );
+      }
       const out = String(res.stdout || '');
       const end = out.indexOf('<<<END_OF_JSON>>>');
       const line = (end >= 0 ? out.slice(0, end) : out)
