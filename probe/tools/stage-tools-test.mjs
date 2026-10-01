@@ -151,8 +151,13 @@ const pairs = [
   ['lib/ui-lock.mjs', 'lib/ui-lock.mjs'],
   ['lib/displays.mjs', 'lib/displays.mjs'],
   ['lib/cmd-display.mjs', 'lib/cmd-display.mjs'],
+  // 动作层: 文本, 与其他 lib 同一条比对路径
+  ['lib/uiaction.mjs', 'lib/uiaction.mjs'],
   ['cordis.patch.yml', 'cordis.patch.example.yml'],
 ];
+// dex 的源不在 recognize/（在 .build/uiaction/，由 build-uiaction.mjs 编出），
+// 不进 pairs（utf8 逐字节比对会炸）；但必须在暂存对账里出现。
+const BINARY_STAGED = ['dsh-action.dex'];
 // 不靠正则解析 stage-tools 源码(脆)，直接核对它**实际写出的文件**。
 // 光数行数不够: 清单里加一个新文件而 pairs 没跟上时行数会不一致(能抓到),
 // 但 pairs 里有名字写错的文件时行数是平的(抓不到) —— 所以逐个比对名字。
@@ -161,7 +166,7 @@ const stagedNames = fin0.out
   .split('\n')
   .filter((l) => /^\s*\+ tools\//.test(l))
   .map((l) => l.trim().replace(/^\+ tools\//, '').replace(/\s+\d+ B$/, '').trim());
-const wantNames = pairs.map(([, d]) => d);
+const wantNames = [...pairs.map(([, d]) => d), ...BINARY_STAGED];
 const nameMismatch = [...new Set([...stagedNames, ...wantNames])].filter(
   (n) => !stagedNames.includes(n) || !wantNames.includes(n)
 );

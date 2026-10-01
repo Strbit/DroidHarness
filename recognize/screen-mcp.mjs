@@ -29,6 +29,7 @@ import { parseDisplays } from './lib/displays.mjs';
 import { parseDisplaysPreferred } from './lib/cmd-display.mjs';
 import { parseUiXml, labelOf, toTargets, isUsefulTree } from './lib/uitree.mjs';
 import { uiLock } from './lib/ui-lock.mjs';
+import { physicalInput, injectText } from './lib/uiaction.mjs';
 
 const PROTOCOL_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05', '2024-10-07'];
 const LATEST = PROTOCOL_VERSIONS[0];
@@ -495,6 +496,99 @@ const TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: 'screen_tap',
+    description:
+      '在指定屏幕坐标处模拟一次**物理点击**（注入触摸事件，等价手指点下去）。\n\n' +
+      '坐标从哪来：screen_tree / screen_targets 返回的 center，或 screen_image 里目测。\n' +
+      '支持任意屏（displayId 非 0 时走 `input -d <id>`，虚拟副屏实测可用）。\n' +
+      '这是动作类工具：它会真的改变设备状态，确认坐标后再调。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        x: { type: 'number', description: '像素 X 坐标（屏的逻辑坐标系）' },
+        y: { type: 'number', description: '像素 Y 坐标' },
+        displayId: {
+          oneOf: [{ type: 'number' }, { type: 'string' }],
+          description: '逻辑 displayId。省略则用默认屏(0)。',
+        },
+      },
+      required: ['x', 'y'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'screen_swipe',
+    description:
+      '从起点坐标**滑动**到终点坐标（可带时长，长按=大 durationMs）。\n\n' +
+      '适用：滚动列表、翻页、拖动滑块。支持任意屏。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        x1: { type: 'number', description: '起点 X' },
+        y1: { type: 'number', description: '起点 Y' },
+        x2: { type: 'number', description: '终点 X' },
+        y2: { type: 'number', description: '终点 Y' },
+        durationMs: { type: 'number', description: '滑动总时长毫秒。省略用系统默认(~300)。长按/慢拖可传 800~1500' },
+        displayId: {
+          oneOf: [{ type: 'number' }, { type: 'string' }],
+          description: '逻辑 displayId。省略则用默认屏(0)。',
+        },
+      },
+      required: ['x1', 'y1', 'x2', 'y2'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'screen_key',
+    description:
+      '发送一个**系统按键**（KEYCODE）。常用：4=返回, 3=主页, 66=回车, 61=Tab, 111=ESC。\n\n' +
+      '适用：收起键盘、退出页面、确认输入。支持任意屏。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        keycode: {
+          oneOf: [{ type: 'number' }, { type: 'string' }],
+          description: 'Android KEYCODE 数字（4=返回, 3=主页, 66=回车）。字符串会转成数字。',
+        },
+        displayId: {
+          oneOf: [{ type: 'number' }, { type: 'string' }],
+          description: '逻辑 displayId。省略则用默认屏(0)。',
+        },
+      },
+      required: ['keycode'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'screen_text',
+    description:
+      '向**当前聚焦的输入框**注入任意 Unicode 文本（含中文/emoji），支持**替换模式或追加模式**。\n\n' +
+      '机制：无障碍 ACTION_SET_TEXT —— 静默写入，不弹软键盘、不经过剪贴板，' +
+      '注入后读回校验（返回 before_text / verified_text 供你确认落点）。\n\n' +
+      '**先 screen_tap 点击目标输入框取得焦点，再调本工具（不带 text_before 参数）**。\n' +
+      'mode: "replace"（默认）清空后写入；"append" 在现有文本后追加（用于不想丢草稿的场景）。\n\n' +
+      '平台限制：只能在默认屏用（displayId 非 0 会明确报错）；微信只在挂了系统无障碍' +
+      '服务时才收 ACTION_SET_TEXT，本工具会自动挂载并在用完还原（期间屏幕可能出现' +
+      '"无障碍"提示，属预期）。写入失败会带 before/after 证据报错，绝不重试到别的控件。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', description: '要写入的完整文本（UTF-8，含中文）' },
+        mode: {
+          type: 'string',
+          enum: ['replace', 'append'],
+          description: 'replace=替换输入框全部内容（默认）；append=追加到现有内容后（保留草稿）',
+        },
+        displayId: {
+          oneOf: [{ type: 'number' }, { type: 'string' }],
+          description: '逻辑 displayId。省略则用默认屏(0)。非 0 明确报错。',
+        },
+      },
+      required: ['text'],
+      additionalProperties: false,
+    },
+  },
 ];
 
 /**
@@ -722,6 +816,69 @@ async function toolsCall(name, args) {
           displayState: disp.state,
         },
       };
+    }
+
+    case 'screen_tap':
+    case 'screen_swipe':
+    case 'screen_key': {
+      const kind = name === 'screen_tap' ? 'tap' : name === 'screen_swipe' ? 'swipe' : 'key';
+      const displayId = args?.displayId !== undefined && args?.displayId !== null
+        ? Number(args.displayId)
+        : 0;
+      if (!Number.isFinite(displayId)) return { isError: true, text: `displayId 不是数字: ${args?.displayId}` };
+      try {
+        let r;
+        if (kind === 'tap') {
+          const x = Number(args?.x), y = Number(args?.y);
+          if (!Number.isFinite(x) || !Number.isFinite(y)) return { isError: true, text: 'x/y 必须是数字' };
+          r = await physicalInput('tap', { x, y, displayId });
+        } else if (kind === 'swipe') {
+          const x1 = Number(args?.x1), y1 = Number(args?.y1), x2 = Number(args?.x2), y2 = Number(args?.y2);
+          if (![x1, y1, x2, y2].every(Number.isFinite)) return { isError: true, text: 'x1/y1/x2/y2 必须是数字' };
+          r = await physicalInput('swipe', {
+            x1, y1, x2, y2, displayId,
+            durationMs: args?.durationMs !== undefined ? Number(args.durationMs) : undefined,
+          });
+        } else {
+          const kc = Number(args?.keycode);
+          if (!Number.isFinite(kc)) return { isError: true, text: `keycode 不是数字: ${args?.keycode}` };
+          r = await physicalInput('key', { keycode: kc, displayId });
+        }
+        return { text: `${kind} 已发送: ${JSON.stringify(r.args)} (${r.cost_ms} ms, displayId=${displayId})` };
+      } catch (e) {
+        return { isError: true, text: `input 动作失败: ${e.message}${e.detail ? `\n${e.detail}` : ''}` };
+      }
+    }
+
+    case 'screen_text': {
+      const displayId = args?.displayId !== undefined && args?.displayId !== null ? Number(args.displayId) : 0;
+      if (!Number.isFinite(displayId)) return { isError: true, text: `displayId 不是数字: ${args?.displayId}` };
+      if (displayId !== 0) {
+        // 与 screen_tree 同一条纪律: 静默把动作发到错误的屏, 比报错危险得多。
+        return {
+          isError: true,
+          text: `screen_text 暂只支持默认屏(displayId 0), 收到 ${displayId}。` +
+            `非默认屏的输入框请先在对应屏上聚焦后改用设备侧其他通道。`,
+        };
+      }
+      const text = args?.text;
+      if (typeof text !== 'string') return { isError: true, text: 'text 必须是字符串' };
+      const mode = args?.mode === 'append' ? 'append' : 'replace';
+      const r = await injectText(displayId, text, { mode });
+      if (!r.ok) {
+        // 业务失败(如 no_focused_input): 带证据报错, 模型能据此决定先点一下再试。
+        return { isError: true, text: `screen_text 失败: ${r.error}${r.reason ? `\n${r.reason}` : ''}` +
+          (r.focus_hint ? `\nfocus_hint: ${r.focus_hint}` : '') };
+      }
+      const lines = [
+        `已写入${mode === 'append' ? '(追加)' : ''}: displayId=${r.display} mode=${r.mode} 耗时=${r.cost_ms}ms`,
+        r.vid ? `控件: ${r.vid} (${r.type || '?'}) @ [${r.bounds || '?'}]` : null,
+        `before: ${JSON.stringify(r.before_text ?? null)}`,
+        `verified: ${JSON.stringify(r.verified_text ?? null)}`,
+      ].filter(Boolean);
+      // verify_unavailable / verify_mismatch 如实带出 —— 不悄悄当成功
+      if (r.error) lines.push(`⚠ ${r.error}: ${r.reason || ''}`);
+      return { text: lines.join('\n') + '\n\n' + JSON.stringify(r, null, 2) };
     }
 
     default:

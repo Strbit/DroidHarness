@@ -30,12 +30,13 @@
 ```powershell
 cd recognize
 
-# 不连设备也能跑的测试（共 89 项）
+# 不连设备也能跑的测试（共 102 项）
 node recognize.mjs selftest        # 解析器 + 合并逻辑（11 项）
 node test-fields.mjs               # 截断 / 有界化 / 缓存新鲜度契约（22 项）
 node test-spawn-env.mjs            # 子进程环境分类（15 项）
 node test-screen-image-cache.mjs   # screen_image 缓存链路（6 项）
 node test-displays.mjs             # 跨设备屏解析 + 真机 dump 回归（34 项）
+node test-uiaction.mjs             # 动作层纯逻辑：服务挂载状态机 + argv 构造（13 项）
 node bench-frame-path.mjs          # 帧路径编码代价量化
 
 # 需要设备
@@ -245,8 +246,11 @@ recognize/
 ├── test-fields.mjs               单元测试：截断 / 有界化 / 缓存契约（22 项）
 ├── test-spawn-env.mjs            单元测试：子进程环境分类（15 项，拦住 LD_LIBRARY_PATH 污染）
 ├── test-screen-image-cache.mjs   单元测试：screen_image 缓存链路（6 项）
+├── test-uiaction.mjs             单元测试：动作层纯逻辑（13 项：服务挂载状态机 + argv 构造）
 ├── test-serve.mjs                PC 侧 CLI 的逐行 JSON 协议（**需要设备**，5 项断言）
-├── test-screen-mcp.mjs           端到端：MCP 协议（**需要设备**，6 项断言）
+├── test-screen-mcp.mjs           端到端：MCP 协议（**需要设备**，7 项断言）
+├── uiaction/
+│   └── DshActionMain.java        动作注入的 Java 源码（dex 真源；build-uiaction.mjs 编译）
 ├── device-selftest.mjs           设备侧自检（走 spawn-env，含归因）
 ├── bench-frame-path.mjs          帧路径性能量化
 └── README.md
@@ -254,11 +258,56 @@ recognize/
 
 ---
 
+## 动作层：从「看见」到「点下去」（screen_tap / screen_swipe / screen_key / screen_text）
+
+`screen-mcp` 不再只做观察。动作层四件套（以 `mcp__screen__screen_*` 暴露）：
+
+| 工具 | 通道 | 说明 |
+|---|---|---|
+| `screen_tap` / `screen_swipe` / `screen_key` | `/system/bin/input` | 物理触摸/按键注入。`displayId` 非 0 走 `input -d <id>`（虚拟副屏实测可用） |
+| `screen_text` | 无障碍 `ACTION_SET_TEXT`（dex） | **任意 Unicode 含中文/emoji**。静默写入不弹键盘、不经剪贴板，写后读回校验（`before_text`/`verified_text`） |
+
+### 为什么文字注入必须是 Java dex
+
+文字注入唯一的确定性通道是无障碍 `ACTION_SET_TEXT`：`CharSequence` 原生携带
+UTF-8，Node 没有、`input text` 只收 ASCII（HyperOS 实测 CJK 触发
+`InputShellCommand.sendText` NPE）、uiautomator shell 命令没有该动作。
+承体是 `uiaction/DshActionMain.java` 编出的 dex（约 11 KiB），由
+`dsh/tools/build-uiaction.mjs` 用 Android SDK（javac + d8）编译，随模块
+tools/ 布署到 `/data/adb/dsh/tools/dsh-action.dex`。一次动作一个进程
+（app_process + exit），不与 `uiautomator dump` 抢 UiAutomation 单会话。
+
+### 微信的关键事实：树只认真实无障碍服务
+
+真机实测（小米 25102RKBEC / Android 16 / HyperOS）：微信只在**有真实
+AccessibilityService 绑定时**才交出无障碍树 —— `UiAutomation` 不算
+（`registerUiTestAutomationService` 不进 `mEnabledServices`）。所以
+`screen_text` 动作前会自动把系统预装的 SelectToSpeak（免安装任何 APK）
+追加进 `enabled_accessibility_services`，动作后按原值还原：
+
+- 写前读原值，只追加自己；原值已含该服务则**完全不动**（别人的配置）
+- marker 文件（`/data/local/tmp/dsh-a11y-attached.json`）记录"挂之前是什么"，
+  kill -9 留下的脏状态由下次动作前的 reconcile 按记录还原
+- 挂载期间部分 App 可能出现"无障碍"提示横幅，属预期
+
+副作用红利：挂载期间同屏的 `screen_tree` / `screen_targets` 也能读到微信的树
+（实测 app_nodes 0 → 19）。
+
+### 无 fallback 纪律
+
+`screen_text` 是单通道：一次 `ACTION_SET_TEXT`、一次读回、一个结论。
+写失败带证据报错（`no_focused_input` 带 `focus_hint`、`inject_rejected`、
+`verify_mismatch` 带 before/after），**绝不**退化为"点中心再粘贴"——
+任何 fallback 都会把"定位错了"放大成"乱点 + 剪贴板被清"。
+
+---
+
 ## 与触控的关系
 
-本模块**只做观察，不做注入**。按设计文档的分层，`dev_tap` / `dev_swipe` / `dev_key` 属于输入注入，是另一块；识别层负责给出"点哪里"，注入层负责"点下去"。
-
-所以 `targets` 里每个可点目标都带 `center`，可直接喂给注入层。
+观察层（screen_tree / screen_targets / screen_image）负责给出"点哪里"，
+动作层（screen_tap / screen_swipe / screen_key / screen_text）负责"点下去 /
+写进去"。两者在同一个 MCP 服务里，`targets` 里每个可点目标都带 `center`，
+可直接喂给 `screen_tap`。
 
 ---
 
@@ -367,7 +416,7 @@ PC 形态
 设备形态（手机本地 Node v26.4.0）
   spawn-screencap : 1,378,566 B, PNG 校验通过
   uitree          : 25,303 B, hasHierarchy=true
-  MCP 协议        : initialize 2025-11-25 / tools/list 4 工具 / tools/call 全部正确
+  MCP 协议        : initialize 2025-11-25 / tools/list 8 工具 / tools/call 全部正确
   多屏            : list_displays 正确报出主屏；非默认屏请求树 → 明确报错 tree-needs-app
   接入 DSH        : 日志确认「[screen-mcp] 客户端已初始化」，进程树显示 DSH 拉起 MCP 子进程
 ```
@@ -381,13 +430,27 @@ node 自身仍健康                 -> v26.4.0
 screencap 不受影响              -> 562471 / 563077 B（带与不带都能出图）
 ```
 
-单元测试（本机，无需设备）—— 共 89 项
+**动作层在设备 B 上的实测（2026-10，探针脚本阶段，先于 MCP 链路接线）**：
+
+```
+微信树屏蔽机理    : 未挂服务 -> UiAutomation 树 app_nodes=0（主屏/副屏都空）；
+                    挂系统预装 SelectToSpeak -> app_nodes 0→19（主屏）/ 0→24（副屏）
+ACTION_SET_TEXT   : 微信 EditText(com.tencent.mm:id/bkk) 写入「国庆快乐」ok=true,
+                    cost 159ms, 读回 verified_text 精确一致；QQ 输入框同样通过
+副屏可达性        : input -d 3 tap/keyevent 真实落地（打开群资料页并返回）
+虚拟副屏创建      : app_process + VirtualDisplayConfig 反射成功（1200x2608@480, trusted）
+screencap 副屏    : `screencap -d 3` 报 Display Id not valid —— 副屏截图需 ImageReader
+                    路径（未做，属虚拟副屏工程的范畴）
+```
+
+单元测试（本机，无需设备）—— 共 102 项
   recognize.mjs selftest  : 11/11 通过（解析器 + 合并逻辑）
   test-fields             : 22/22 通过（head+tail 截断 / 数组有界化 / 缓存新鲜度契约）
   test-spawn-env          : 15/15 通过（子进程环境分类 —— 拦住上面设备 B 那个坑）
   test-screen-image-cache : 6/6 通过（screen_image 缓存链路 / 主副屏不串味）
   test-displays           : 34/34 通过（跨设备屏解析 —— 主路径 cmd display，dumpsys 兜底，
                             含一条直接喂真机 dump 文件的回归）
+  test-uiaction           : 13/13 通过（动作层：服务挂载状态机 / argv 构造 / dex 落点）
   test-screen-mcp         : 端到端 MCP 协议，带断言（已实测"该失败时 exit=1"）
   bench-frame-path        : zlib 量化（level 1 = 21 ms, level 9 = 546 ms, 体积几乎一样）
 

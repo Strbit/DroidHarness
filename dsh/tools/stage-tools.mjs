@@ -105,6 +105,13 @@ const FILES = [
   ['lib/ui-lock.mjs', 'lib/ui-lock.mjs'],
   ['lib/displays.mjs', 'lib/displays.mjs'],
   ['lib/cmd-display.mjs', 'lib/cmd-display.mjs'],
+  // 动作层 (tap/swipe/key/text): screen-mcp import 它; 缺 copy 的症状同上。
+  ['lib/uiaction.mjs', 'lib/uiaction.mjs'],
+  // ACTION_SET_TEXT 的承体: app_process 跑的 dex。**源码**在 recognize/uiaction/，
+  // 这里的产物由 build-uiaction.mjs 编出 —— 它是清单里唯一一个"源不在 recognize/
+  // 顶层的文件"，所以拷贝分支对它特判(见下面 SRC 之外的补充源)。
+  // 装到 tools/ 根(与 screen-mcp 同级): lib/uiaction.mjs 按 `../dsh-action.dex` 找它。
+  ['.build-uiaction-classes.dex', 'dsh-action.dex'],
   // 接入条目的**唯一真源**。装机时 register-screen-mcp.mjs 从它推导出写进 home 层
   // 的托管块（见第 4 道门）—— 所以它不是"给人抄的模板"，而是装配的输入。
   // 仍放在 tools/ 且名字带 .example：一是它在设备上可读，二是避免任何人以为
@@ -142,13 +149,42 @@ if (CHECK_ONLY) {
   }
   log(`校验模式: tools/ 下 ${staged.length} 个文件（不写盘）`);
 } else {
-  fs.mkdirSync(path.join(DEST, 'lib'), { recursive: true });
   for (const [srcRel, dstRel] of FILES) {
-    const srcAbs = path.join(SRC, srcRel);
-    if (!fs.existsSync(srcAbs)) die(`recognize 里没有 ${srcRel} —— 清单和仓库不同步，先核对 PR #11 的落点`);
+    // dex 的源不在 recognize/ 而在构建产物目录 —— 它是编译出的二进制, 不是文本。
+    // 真源(Java)在 recognize/uiaction/, 由 build-uiaction.mjs 编到 .build/uiaction/。
+    // 清单键名用一个不可能与 recognize/ 内文件冲突的形制, 解析在这里特判。
+    let srcAbs;
+    let isBinary = false;
+    if (srcRel === '.build-uiaction-classes.dex') {
+      srcAbs = path.resolve(ROOT, '.build', 'uiaction', 'classes.dex');
+      isBinary = true;
+      if (!fs.existsSync(srcAbs)) {
+        die(
+          `找不到 ${path.relative(ROOT, srcAbs)} —— 动作注入 dex 没编。\n` +
+          `  先跑: node dsh/tools/build-uiaction.mjs   (需要 Android SDK 的 javac+d8)`,
+        );
+      }
+    } else {
+      srcAbs = path.join(SRC, srcRel);
+      if (!fs.existsSync(srcAbs)) die(`recognize 里没有 ${srcRel} —— 清单和仓库不同步，先核对 PR #11 的落点`);
+    }
     const dstAbs = path.join(DEST, dstRel);
     fs.mkdirSync(path.dirname(dstAbs), { recursive: true });
 
+    if (isBinary) {
+      // 二进制: 原样拷贝(LF 归一化会腐蚀 dex)。魔数校验在 build-uiaction 做过,
+      // 这里再验一次 —— 防止"编了别的东西后忘了重编, 拿旧产物顶包"。
+      const b = fs.readFileSync(srcAbs);
+      if (!(b.length > 4 && b[0] === 0x64 && b[1] === 0x65 && b[2] === 0x78 && b[3] === 0x0a)) {
+        die(`tools/${dstRel}: 不是合法 dex (magic=${b.subarray(0, 4).toString('hex')}) —— 重跑 build-uiaction.mjs`);
+      }
+      fs.writeFileSync(dstAbs, b);
+      staged.push({ rel: dstRel, abs: dstAbs, bytes: b.length });
+      // 行尾形制与其他行一致(`<name>  <N> B`): stage-tools-test 按这个形制
+      // 解析对账 —— 多一个后缀就会让它的清单比对误报。
+      log(`  + tools/${dstRel.padEnd(24)} ${String(b.length).padStart(7)} B`);
+      continue;
+    }
     // 读 → 强制 LF → 写。不是"检查后拒绝"而是"直接归一化":
     // 工作区里出现 CRLF 是 autocrlf 的产物，不是谁写错了，内容等价。
     // 归一化后 zip 里的字节就是设备上要执行的字节。
@@ -211,6 +247,12 @@ log('');
 log('逐文件校验:');
 let bad = 0;
 for (const f of staged) {
+  // dex 是编译二进制: CR/BOM/语法检查都是文本世界的规则, 对它只会误报
+  // (dex 字节流天然可能含 0x0d)。它的门在拷贝分支: 魔数校验已做。
+  if (f.rel.endsWith('.dex')) {
+    log(`  ✓ tools/${f.rel}  dex 魔数已验 (${f.bytes} B)`);
+    continue;
+  }
   const buf = fs.readFileSync(f.abs);
   const cr = buf.includes(0x0d);
   const bom = buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf;
@@ -313,6 +355,15 @@ log('  ✓ 块内容与 recognize/cordis.patch.yml 的推导结果一致（无�
 // 内容门的结论更靠近根因，所以它先说。
 const drifted = [];
 for (const [srcRel, dstRel] of FILES) {
+  // dex 的源在 .build/ 而非 recognize/ —— 与写入分支同一套解析规则。
+  // 二进制不做 LF 归一化(会腐蚀), 逐字节比对即可; 但要防"改了 .java 忘了
+  // 重编"—— 写入分支拷的就是构建产物, 所以这里比源产物 vs 已暂存副本。
+  if (srcRel === '.build-uiaction-classes.dex') {
+    const srcAbs = path.resolve(ROOT, '.build', 'uiaction', 'classes.dex');
+    if (!fs.existsSync(srcAbs)) die(`找不到 ${path.relative(ROOT, srcAbs)} —— 先跑 build-uiaction.mjs`);
+    if (!fs.readFileSync(srcAbs).equals(fs.readFileSync(path.join(DEST, dstRel)))) drifted.push(dstRel);
+    continue;
+  }
   const srcAbs = path.join(SRC, srcRel);
   if (!fs.existsSync(srcAbs)) die(`recognize 里没有 ${srcRel} —— 清单和仓库不同步`);
   if (!normalizeLf(fs.readFileSync(srcAbs)).equals(fs.readFileSync(path.join(DEST, dstRel)))) {

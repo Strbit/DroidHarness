@@ -32,7 +32,8 @@ console.log(`启动: ${launchDesc}`);
 
 // 期望答复的 id。1=initialize 2=tools/list 3=list_displays
 // 4=screen_targets(默认屏) 5=screen_image 6=screen_targets(非默认屏, 应明确报错)
-const WANT_IDS = [1, 2, 3, 4, 5, 6];
+// 7=screen_text(非默认屏, 应明确报错且不碰 a11y/dex)
+const WANT_IDS = [1, 2, 3, 4, 5, 6, 7];
 
 let buf = '';
 const responses = [];
@@ -61,6 +62,9 @@ setTimeout(() => send({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { n
 setTimeout(() => send({ jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'screen_image', arguments: {} } }), 12000);
 // 非默认屏的树必须明确报错，而不是悄悄返回主屏的树
 setTimeout(() => send({ jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'screen_targets', arguments: { displayId: 2 } } }), 20000);
+// screen_text 的屏校验必须先于一切副作用: 非 0 屏直接报错, 不碰 a11y/不碰 dex
+// (这条在 PC 和真机上都必须 isError —— 它是动作类工具"不发到错误的屏"的那道门)
+setTimeout(() => send({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'screen_text', arguments: { displayId: 2, text: 'x' } } }), 21000);
 setTimeout(() => { try { child.kill(); } catch { /* 已退出 */ } report(); }, 32000);
 
 let done = false;
@@ -108,8 +112,12 @@ function report() {
     }
   }
 
-  // ── 3. tools/list 必须列出 4 个工具 ───────────────────
-  const EXPECTED_TOOLS = ['list_displays', 'screen_tree', 'screen_targets', 'screen_image'];
+  // ── 3. tools/list 必须列出 8 个工具 ───────────────────
+  const EXPECTED_TOOLS = [
+    'list_displays', 'screen_tree', 'screen_targets', 'screen_image',
+    // 动作层: tap/swipe/key 走 input, text 走 ACTION_SET_TEXT (dex)
+    'screen_tap', 'screen_swipe', 'screen_key', 'screen_text',
+  ];
   const r2 = byId.get(2);
   if (r2) {
     const names = (r2.result?.tools || []).map((t) => t.name);
@@ -189,6 +197,23 @@ function report() {
         failures.push('#6 报错信息未说明原因（应含 tree-needs-app）');
       } else {
         notes.push('#6 非默认屏的树: 明确报错 ✓（未静默返回主屏的树）');
+      }
+    }
+  }
+
+  // ── 9. #7 screen_text 非默认屏必须明确报错（先于一切副作用）──
+  // 动作类工具把输入打到错误的屏比报错危险得多。这条在 PC（dex 不存在）与
+  // 真机（dex 在）上都必须 isError，且文本里说明屏的限制。
+  const r7 = byId.get(7);
+  if (r7) {
+    if (!r7.result?.isError) {
+      failures.push('#7 screen_text 非默认屏应当明确报错，实际返回了成功 —— 会把文字打到错误的屏');
+    } else {
+      const txt = (r7.result.content || []).find((x) => x.type === 'text')?.text || '';
+      if (!/默认屏|displayId/.test(txt)) {
+        failures.push('#7 报错信息未说明屏限制: ' + txt.slice(0, 120));
+      } else {
+        notes.push('#7 screen_text 非默认屏: 明确报错 ✓（未产生任何副作用）');
       }
     }
   }
