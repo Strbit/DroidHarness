@@ -990,12 +990,24 @@ async function toolsCall(name, args) {
         const bad = requireOwnVdDisplay(requested0, 'screen_image');
         if (bad) return bad;
         try {
-          const { jpeg, displayId, costMs, width, height } = await vdShot();
+          const { jpeg, displayId, costMs, width, height, fromCache, frameTimestamp } = await vdShot();
+          // 对齐主屏分支的可观测性(排查报告 §4.3): 副屏分支原先这些字段一个都没有。
+          // 副屏帧是现取的、没有缓存, 所以 fromCache 恒为 false —— 如实报出来。
+          const ageMs = Date.now() - (frameTimestamp ?? Date.now());
+          let disp = null;
+          try { disp = await displayState(displayId); } catch { /* 拿不到就不报状态 */ }
           return {
             text: `屏幕: displayId=${displayId}（虚拟副屏）\n` +
+              `状态: ${disp?.state ?? '未知'}\n` +
               `分辨率: ${width}x${height}   大小: ${(jpeg.length / 1024).toFixed(0)} KB\n` +
-              `采集: 刚采集(进程内 ImageReader), 耗时 ${costMs} ms\n` +
-              `格式: JPEG —— 副屏走进程内 ImageReader, 系统 screencap 抓不到虚拟屏。`,
+              `采集: ${fromCache ? `来自缓存(${ageMs} ms 前)` : '刚采集(进程内 ImageReader)'}` +
+              `，耗时 ${costMs} ms\n` +
+              `格式: JPEG —— 副屏走进程内 ImageReader, 系统 screencap 抓不到虚拟屏。\n` +
+              (disp && disp.state !== 'ON'
+                ? `⚠ displayState 不是 ON：这张图可能不代表当前界面。\n`
+                : '') +
+              `\n⚠ 颜色已修（曾因 RGBA/ARGB 通道错位导致红变蓝、暗部发紫）。` +
+              `若怀疑复发：往副屏投纯红 (255,0,0) 采一次，采到 (0,0,254) 即为复发。`,
             image: { data: jpeg.toString('base64'), mimeType: 'image/jpeg' },
           };
         } catch (e) {

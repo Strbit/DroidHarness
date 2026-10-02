@@ -248,14 +248,53 @@ public final class VdMain {
             for (int y = 0; y < h; y++) {
                 int base = y * (w + rowPad);
                 for (int x = 0; x < w; x++) {
-                    int a = buf.get((base + x) * pixStride) & 0xFF;
-                    int r = buf.get((base + x) * pixStride + 1) & 0xFF;
-                    int g = buf.get((base + x) * pixStride + 2) & 0xFF;
-                    int b = buf.get((base + x) * pixStride + 3) & 0xFF;
+                    // ⚠⚠ 通道顺序: PixelFormat.RGBA_8888 的缓冲区字节布局就是
+                    //     **R,G,B,A**, 而 Bitmap 的 int 像素是 **A,R,G,B**。
+                    // 我第一版把缓冲区也按 A,R,G,B 读, 导致 alpha 槽里装进了真值 R;
+                    // setPixels 后位图被当成 premultiplied, JPEG 编码时又乘一次
+                    // "alpha", 于是产出这条确定性色彩变换(真机逐点实测):
+                    //     观测.R = 真值.R × 真值.G / 255
+                    //     观测.G = 真值.R × 真值.B / 255
+                    //     观测.B = 真值.R × 真值.A / 255   (不透明时 = 真值.R)
+                    // 表现: 红色变蓝、绿色变黑、暗部发紫(因为 R/G 被平方压制,
+                    // B 保持原值 → B 远大于 R/G); 而白色是这条变换的不动点,
+                    // 所以"白字看着正常"极具迷惑性。
+                    // (排查报告 workspace/123 用 16 个色块、含先预测后验证的独立
+                    //  第二组, 把这四条公式钉死了; 本行的修正就是那个根因。)
+                    int r = buf.get((base + x) * pixStride) & 0xFF;
+                    int g = buf.get((base + x) * pixStride + 1) & 0xFF;
+                    int b = buf.get((base + x) * pixStride + 2) & 0xFF;
+                    int a = buf.get((base + x) * pixStride + 3) & 0xFF;
                     pixels[y * w + x] = (a << 24) | (r << 16) | (g << 8) | b;
                 }
             }
             bmp.setPixels(pixels, 0, w, 0, 0, w, h);
+
+            // ── 黑帧检测(P0): 绝不能把"全黑 JPEG"当成功返回 ──────────
+            // 最坏的失败模式是成功返回一张内容为空的合法图片: JPEG 头校验
+            // 查不出"图是黑的", Agent 会据此误判"副屏没内容"。
+            // 排查报告(workspace/123)记录过一次恒黑的事故, 虽然在当前版本上
+            // 未能复现(四个界面状态四个 md5), 但这个闸必须常在: 宁可报错。
+            // 采样网格 32x32: 一个界面再暗, 也不至于所有采样点都精确为 0。
+            {
+                final int GS = 32;
+                int nonBlack = 0, samples = 0;
+                for (int gy = 0; gy < GS; gy++) {
+                    for (int gx = 0; gx < GS; gx++) {
+                        int x = (gx + 1) * w / (GS + 1);
+                        int y = (gy + 1) * h / (GS + 1);
+                        int p = pixels[y * w + x];
+                        if ((p & 0x00FFFFFF) != 0) nonBlack++;
+                        samples++;
+                    }
+                }
+                if (nonBlack == 0) {
+                    throw new IllegalStateException(
+                            "取到全黑帧（" + samples + " 个采样点全为 0）—— ImageReader 未获得有效内容。" +
+                            "副屏内容请改用无障碍树读取; 若持续出现, 检查副屏是否真的在渲染");
+                }
+            }
+
             File out = new File(outPath);
             File parent = out.getParentFile();
             if (parent != null) parent.mkdirs();
