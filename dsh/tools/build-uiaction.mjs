@@ -108,6 +108,7 @@ log(`javac: ${classFiles.length} 个 .class`);
 // 2. d8 → classes.dex
 // Windows 上 d8 是 .bat —— spawnSync 直接调 .bat 会 ENOENT/EINVAL（Node 需要经
 // cmd.exe），所以 win32 走 shell: true；此时参数里的空格路径必须自己加引号。
+// 注意: d8 输出文件名固定 classes.dex, 多个 dex 要依次编并**改名保留**。
 const dexPath = path.join(OUT, 'classes.dex');
 const d8Args = ['--release', '--lib', androidJar, '--output', OUT, ...classFiles];
 const d8Opts = { encoding: 'utf8' };
@@ -127,4 +128,97 @@ const magicOk = buf.length > 4 && buf[0] === 0x64 && buf[1] === 0x65 && buf[2] =
 if (!magicOk) die(`! 产物不是合法 dex (magic=${buf.subarray(0, 4).toString('hex')})`);
 const sha = crypto.createHash('sha256').update(buf).digest('hex').slice(0, 16);
 log(`  ✓ classes.dex: ${(buf.length / 1024).toFixed(1)} KiB  dex v${String.fromCharCode(buf[4])}  sha256:${sha}`);
+
+// ── 2b. hook dex (Xposed 模块入口, LSPosed 加载) ──────────────────────
+// **先编 hook 再编主 dex**: d8 --output 目录的产物名固定 classes.dex, 后编的
+// 会覆盖先编的 —— hook 编完立即改名 hook.dex, 主 dex 最后编就是最终名。
+const HOOK_SRC = path.join(ROOT, 'recognize', 'uiaction', 'hook');
+// 编译期 stub 必须**跟源码在一起**（放 .build/ 会被 gitignore 掉，新克隆的仓库
+// 直接编不出 hook —— 实测踩过）。STUB 是 HOOK_SRC 的子目录，所以下面枚举
+// hook 源码时要把它排除，否则 stub 会被当成 hook 源码一起编进去（重复类）。
+const STUB = path.join(HOOK_SRC, 'stub');
+if (!fs.existsSync(STUB)) die(`! 缺编译期 stub: ${STUB}（它是仓库文件，不该缺失）`);
+const hookClassesDir = path.join(OUT, 'hook-classes');
+fs.rmSync(hookClassesDir, { recursive: true, force: true });
+fs.mkdirSync(hookClassesDir, { recursive: true });
+const hookFiles = [];
+(function walk(dir) {
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) { if (p !== STUB) walk(p); }
+    else if (e.name.endsWith('.java')) hookFiles.push(p);
+  }
+})(HOOK_SRC);
+if (hookFiles.length) {
+  const stubJar = path.join(OUT, 'xposed-stub.jar');
+  // stub 先编成 jar (javac 不能直接吃源码目录做 classpath)
+  const stubDir = path.join(OUT, 'stub-classes');
+  fs.rmSync(stubDir, { recursive: true, force: true });
+  fs.mkdirSync(stubDir, { recursive: true });
+  const stubFiles = [];
+  (function walk(dir) {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.name.endsWith('.java')) stubFiles.push(p);
+    }
+  })(STUB);
+  const sj = spawnSync('javac', ['--release', '8', '-encoding', 'UTF-8', '-d', stubDir, ...stubFiles], { encoding: 'utf8' });
+  if (sj.status !== 0) die(`! stub javac 失败:\n${(sj.stdout || '') + (sj.stderr || '')}`);
+  // jar 工具 (JDK 自带) 打包 stub
+  const jr = spawnSync('jar', ['cf', stubJar, '-C', stubDir, 'de'], { encoding: 'utf8' });
+  if (jr.status !== 0) die(`! jar 失败:\n${(jr.stdout || '') + (jr.stderr || '')}`);
+  const jc2 = spawnSync('javac', [
+    '--release', '8',
+    '-classpath', `${androidJar}${path.delimiter}${stubJar}`,
+    '-d', hookClassesDir,
+    '-encoding', 'UTF-8',
+    ...hookFiles,
+  ], { encoding: 'utf8' });
+  if (jc2.status !== 0) die(`! hook javac 失败:\n${(jc2.stdout || '') + (jc2.stderr || '')}`);
+  const hookClassFiles = [];
+  (function walk(dir) {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.name.endsWith('.class')) hookClassFiles.push(p);
+    }
+  })(hookClassesDir);
+  // hook 的 classes 目录独立产出, 不与主 dex 同目录 —— 免覆盖
+  const hookOut = path.join(OUT, 'hook-out');
+  fs.rmSync(hookOut, { recursive: true, force: true });
+  fs.mkdirSync(hookOut, { recursive: true });
+  let hr;
+  if (process.platform === 'win32') {
+    const q = (s) => (/[ ]/.test(s) ? `"${s}"` : s);
+    hr = spawnSync(`"${d8}"`, ['--release', '--lib', androidJar, '--output', hookOut, ...hookClassFiles.map(q)], { ...d8Opts, shell: true });
+  } else {
+    hr = spawnSync(d8, ['--release', '--lib', androidJar, '--output', hookOut, ...hookClassFiles], d8Opts);
+  }
+  if (hr.status !== 0) die(`! hook d8 失败:\n${(hr.stdout || '') + (hr.stderr || '')}`);
+  const hookDex = path.join(OUT, 'hook.dex');
+  fs.copyFileSync(path.join(hookOut, 'classes.dex'), hookDex);
+  const hb = fs.readFileSync(hookDex);
+  if (!(hb.length > 4 && hb[0] === 0x64 && hb[1] === 0x65 && hb[2] === 0x78 && hb[3] === 0x0a)) {
+    die('! hook.dex 不是合法 dex');
+  }
+  log(`  ✓ hook.dex: ${(hb.length / 1024).toFixed(1)} KiB`);
+
+  // hook APK: LSPosed 模块的载体 (Xposed 模块必须是已安装的 APK)。
+  // 装进模块的 apk/ 目录, customize.sh 装机时 pm install + 注册作用域。
+  const apkOut = path.join(ROOT, 'dsh', 'module', 'apk');
+  fs.mkdirSync(apkOut, { recursive: true });
+  const apkDst = path.join(apkOut, 'dsh-hook.apk');
+  try {
+    const apkSrc = path.join(OUT, 'dsh-hook.apk');
+    if (fs.existsSync(apkSrc)) {
+      fs.copyFileSync(apkSrc, apkDst);
+      log(`  ✓ apk/dsh-hook.apk: ${(fs.statSync(apkDst).size / 1024).toFixed(1)} KiB (装机时 pm install + 注册 LSPosed)`);
+    } else {
+      log(`  ! 没找到 ${path.relative(ROOT, apkSrc)} —— 先跑 build-hook-apk.mjs 才会打进模块`);
+    }
+  } catch (e) {
+    log(`  ! 复制 hook APK 失败: ${e.message}`);
+  }
+}
 log(`产出: ${path.relative(ROOT, dexPath)}`);

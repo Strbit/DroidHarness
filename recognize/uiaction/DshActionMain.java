@@ -80,6 +80,11 @@ public final class DshActionMain {
                 } else if ("nodeinfo".equals(action)) {
                     if (args.length < 2) { json = errJson("usage", "nodeinfo <displayId>"); code = 1; }
                     else { json = runNodeInfo(Integer.parseInt(args[1])); code = isOk(json) ? 0 : 3; }
+                } else if ("tree".equals(action)) {
+                    // 副屏树: uiautomator dump 只认主屏(--display 被静默忽略), 这里
+                    // 用 UiAutomation.getWindowsOnAllDisplays() 拿任意屏的树。
+                    if (args.length < 2) { json = errJson("usage", "tree <displayId>"); code = 1; }
+                    else { json = runTree(Integer.parseInt(args[1])); code = isOk(json) ? 0 : 3; }
                 } else {
                     json = errJson("usage", "未知动作: " + action); code = 1;
                 }
@@ -280,8 +285,62 @@ public final class DshActionMain {
 
     // ── 动作: 列出可编辑节点（供模型确认靶子）──────────────────
 
-    private static String runNodeInfo(int displayId) {
+    // ── 动作: 任意屏的控件树（副屏读树的唯一通道）────────────────
+
+    /**
+     * 输出与 lib/uitree.mjs 的 XML 解析**不同的** JSON 平铺树。
+     * 为什么不是 XML: uiautomator XML 的形状绑定它的 dump 器; 这里直接给
+     * 模型可读的一行一节点 JSON, 字段与 screen_tree 的语义对齐
+     * (text/desc/resourceId/className/bounds/clickable/enabled/depth)。
+     * 截断纪律同 screen_tree: text/desc 保头(300)保尾(160)。
+     */
+    private static String runTree(int displayId) {
         long start = System.currentTimeMillis();
+        try {
+            Boot boot = boot();
+            List<AccessibilityNodeInfo> all = scanDisplay(boot, displayId);
+            StringBuilder items = new StringBuilder();
+            int depth = 0;
+            for (AccessibilityNodeInfo an : all) {
+                if (items.length() > 0) items.append(",");
+                CharSequence tc = an.getText();
+                CharSequence dc = an.getContentDescription();
+                String text = tc != null ? truncate(tc.toString(), 300, 160) : "";
+                String desc = dc != null ? truncate(dc.toString(), 300, 160) : "";
+                android.graphics.Rect r = new android.graphics.Rect();
+                an.getBoundsInScreen(r);
+                items.append("{\"text\":\"").append(esc(text))
+                     .append("\",\"desc\":\"").append(esc(desc))
+                     .append("\",\"resourceId\":\"").append(esc(nz(an.getViewIdResourceName())))
+                     .append("\",\"className\":\"").append(esc(typeOf(an)))
+                     .append("\",\"bounds\":{\"x1\":").append(r.left)
+                     .append(",\"y1\":").append(r.top)
+                     .append(",\"x2\":").append(r.right)
+                     .append(",\"y2\":").append(r.bottom)
+                     .append("},\"clickable\":").append(an.isClickable())
+                     .append(",\"scrollable\":").append(an.isScrollable())
+                     .append(",\"editable\":").append(an.isEditable())
+                     .append(",\"focused\":").append(an.isFocused())
+                     .append(",\"enabled\":").append(an.isEnabled())
+                     .append(",\"depth\":").append(depth).append("}");
+                if (++depth >= 400) break;   // 硬顶: 与 screen_tree 的 boundArray 上限同级
+            }
+            return "{\"ok\":true,\"display\":" + displayId
+                    + ",\"cost_ms\":" + (System.currentTimeMillis() - start)
+                    + ",\"node_count\":" + Math.min(depth, all.size())
+                    + ",\"nodes\":[" + items + "]}";
+        } catch (Throwable t) {
+            return errJson("internal_error", String.valueOf(t));
+        }
+    }
+
+    /** head+tail 截断(与 NODE_FIELD 同一纪律)。 */
+    private static String truncate(String s, int head, int tail) {
+        if (s.length() <= head + tail) return s;
+        return s.substring(0, head) + "...[cut:" + (s.length() - head - tail) + "]..." + s.substring(s.length() - tail);
+    }
+
+    private static String runNodeInfo(int displayId) {        long start = System.currentTimeMillis();
         try {
             Boot boot = boot();
             List<AccessibilityNodeInfo> all = scanDisplay(boot, displayId);

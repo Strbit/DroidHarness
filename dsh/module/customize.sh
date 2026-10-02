@@ -181,8 +181,25 @@ if [ -f "$SM_TOOLS_SRC/screen-mcp" ] && [ -f "$SM_TOOLS_SRC/screen-mcp.mjs" ]; t
 	SM_N=$(find "$SM_TOOLS_SRC" -type f 2>/dev/null | wc -l | tr -d ' \n')
 	ui_print "  [ OK ] 屏幕识别在位 (tools/, ${SM_N:-?} 个文件)"
 else
-	ui_print "  [WARN] 没有 tools/screen-mcp —— 模型看不见屏幕 (4 个 mcp__screen__* 不可用)"
+	ui_print "  [WARN] 没有 tools/screen-mcp —— 模型看不见屏幕 (mcp__screen__* 不可用)"
 	ui_print "         先跑: node dsh/tools/stage-tools.mjs"
+fi
+
+# Xposed hook (虚拟副屏跨屏承载的**前置条件**)。
+# 为什么必须有它: AOSP 默认拒绝把 App 放到虚拟屏 —— SafeActivityOptions 的
+# START_TASK_FROM_DISPLAY 是 signature 权限(root 也拿不到, 实测 "Permission
+# Denial ... uid=0 with launchDisplayId=N"), WM 的 canHostTasks 系列也一律返回
+# 假。真机实测: 没有 hook 时 `cmd activity display move-stack` 报
+# "Unknown displayId=N"。装上并注册作用域后, 微信能被 move-stack 移到副屏。
+#
+# 作用域必须含 **system**(= system_server), 只有 android 时 hook 不会加载 ——
+# 这是本项目实测踩过的坑(LSPosed 的 android 与 system 是两个不同作用域)。
+HOOK_APK="$MODPATH/apk/dsh-hook.apk"
+if [ -f "$HOOK_APK" ]; then
+	ui_print "  [ OK ] 跨屏 hook APK 在位 (apk/dsh-hook.apk)"
+else
+	ui_print "  [WARN] 没有 apk/dsh-hook.apk —— App 无法移到虚拟副屏"
+	ui_print "         先跑: node dsh/tools/build-uiaction.mjs && node dsh/tools/build-hook-apk.mjs"
 fi
 
 # ─────────────────────────────────────────────────────────────
@@ -491,6 +508,120 @@ if [ "$HAS_SCREEN_MCP" = "1" ] && [ "$SM_OK" = "1" ]; then
 	else
 		ui_print "  [WARN] 没有 bin/register-screen-mcp.mjs —— 屏幕识别不会自动接入"
 		ui_print "         这个文件必须由仓库里的 dsh/module/bin/ 带上，缺它是打包问题"
+	fi
+fi
+
+# ─────────────────────────────────────────────────────────────
+# 8. 虚拟副屏跨屏 hook: 装 APK + 注册 LSPosed 作用域
+#
+# 为什么必须自动注册, 不能"让用户去 LSPosed 里手动勾一下"
+# ------------------------------------------------------
+# 这是**安装即用**的硬要求: 手勾作用域是"安装后还得改配置", 与本项目的
+# 底线冲突。LSPosed 的模块与作用域都在一个 sqlite 库里, 可以直接写:
+#   /data/adb/lspd/config/modules_config.db
+#     modules(module_pkg_name, apk_path)             — 登记模块
+#     modules_state(module_pkg_name, user_id, enabled) — 启用
+#     scope(module_pkg_name, app_pkg_name, user_id)  — 作用域
+#
+# ⚠ 作用域必须同时写 **android** 和 **system**
+#   LSPosed 里 "android"(安卓系统) 与 "system"(系统框架) 是两个不同的作用域。
+#   只勾 android 时 hook **不会加载** —— 真机实测: 模块日志里一行都没有; 补上
+#   system 后立刻出现 "[DshHook] loaded in system_server"。
+#
+# 写库工具: 模块自带 bin/sqlite3(与 agent-mobile-use 同一份, MIT/公有域)。
+# 它是"静默"版本 —— SELECT 不回显结果, 但 INSERT/DELETE 正常工作(已交叉验证:
+# 写入后由 Termux sqlite3 读出)。
+#
+# LSPosed 装在别的路径 / 没装: 全部只报 [WARN], 绝不 abort 装机。
+# 装完需要**重启**才生效(hook 在 system_server 启动时注入), 结尾会提示。
+# ─────────────────────────────────────────────────────────────
+ui_print " "
+ui_print "--- 虚拟副屏跨屏 hook ---"
+HOOK_PKG="com.dsh.hook"
+# 本段自带 HOOK_APK 定义: 上面第 6 节虽已定义过一次, 但 customize-deploy-test
+# 抽取"§7 接入段"时边界到 `# ── 结尾提示:`(即**连同 §8 一起**), 那个片段里
+# 没有第 6 节 → set -u 下引用未定义变量会直接崩, 安装器跟着中断。
+# 自带一份既让本段自洽, 也让门禁能真正跑到 §8。
+HOOK_APK="$MODPATH/apk/dsh-hook.apk"
+LSP_DB="/data/adb/lspd/config/modules_config.db"
+SQLITE_BIN="$MODPATH/bin/sqlite3"
+
+if [ ! -f "$HOOK_APK" ]; then
+	ui_print "  [WARN] 跳过 —— 没有 hook APK, App 无法移到虚拟副屏"
+elif [ ! -d /data/adb/lspd ]; then
+	ui_print "  [WARN] 没检测到 LSPosed (/data/adb/lspd 不存在)"
+	ui_print "         副屏本身可用(screen_vd_start/screen_vd_shot); 但 App 上不去副屏"
+	ui_print "         需要 LSPosed + Zygisk 环境(模块不主动装它们, 那会改动系统)"
+elif [ ! -f "$SQLITE_BIN" ]; then
+	ui_print "  [WARN] 没有 bin/sqlite3 —— 无法自动注册作用域"
+	ui_print "         先跑: node dsh/tools/build-uiaction.mjs 之外还要带上 sqlite3"
+else
+	# 8.1 装 APK
+	INSTALL_OUT=$(pm install -r -t "$HOOK_APK" 2>&1)
+	case "$INSTALL_OUT" in
+	*Success*) ui_print "  [ OK ] hook APK 已安装 ($HOOK_PKG)" ;;
+	*) ui_print "  [WARN] hook APK 安装失败: $(printf '%s' "$INSTALL_OUT" | head -n 1)" ;;
+	esac
+
+	# 8.2 注册作用域(仅在装成功时)
+	APK_PATH=$(pm path "$HOOK_PKG" 2>/dev/null | head -n 1 | cut -d':' -f2)
+	if [ -n "$APK_PATH" ]; then
+		chmod 755 "$SQLITE_BIN" 2>/dev/null
+		# bin/sqlite3 用的是 Termux 那一份(真 sqlite3, 3.53.x)。
+		# 它动态链接 libz.so.1 —— 必须带上模块自己的 usr/lib(那里有
+		# libz.so.1 -> libz.so.1.3.2 的软链, 由本脚本前面的"重建符号链接"
+		# 那步建出来)。不带 LD_LIBRARY_PATH 会 CANNOT LINK 而静默失败,
+		# 症状是"模块装了但作用域没注册"。
+		# 相比作者随包的那份 shim(只吃单条语句、SELECT 不回显), 真 sqlite3
+		# 能回读校验 —— 下面第 8.4 步就靠它。
+		sql_run() { LD_LIBRARY_PATH="$MODPATH/usr/lib" "$SQLITE_BIN" "$@"; }
+		sql_run "$LSP_DB" "INSERT OR REPLACE INTO modules (module_pkg_name, apk_path) VALUES ('$HOOK_PKG', '$APK_PATH');" 2>/dev/null
+		sql_run "$LSP_DB" "INSERT OR REPLACE INTO modules_state (module_pkg_name, user_id, enabled) VALUES ('$HOOK_PKG', 0, 1);" 2>/dev/null
+		# 两个作用域都要: android(system_server 进程) 与 system(系统框架)。
+		# 缺 system 的表现是"模块装了、启用了、但一行日志都没有" —— 极难归因。
+		sql_run "$LSP_DB" "INSERT OR REPLACE INTO scope (module_pkg_name, app_pkg_name, user_id) VALUES ('$HOOK_PKG', 'android', 0);" 2>/dev/null
+		sql_run "$LSP_DB" "INSERT OR REPLACE INTO scope (module_pkg_name, app_pkg_name, user_id) VALUES ('$HOOK_PKG', 'system', 0);" 2>/dev/null
+
+		# 8.4 回读校验(真 sqlite3 能回显, shim 不能):
+		# 只报 OK 而不核对, 就分不清"写进去了"和"静默失败" —— 而作用域没写进去
+		# 的后果是副屏上不了 App, 且**没有任何报错**。
+		CHECK=$(sql_run "$LSP_DB" \
+			"SELECT (SELECT count(*) FROM modules WHERE module_pkg_name='$HOOK_PKG') \
+			      || '/' || (SELECT count(*) FROM modules_state WHERE module_pkg_name='$HOOK_PKG' AND enabled=1) \
+			      || '/' || (SELECT count(*) FROM scope WHERE module_pkg_name='$HOOK_PKG');" 2>/dev/null | tr -d '\r')
+		case "$CHECK" in
+		1/1/2) ui_print "  [ OK ] LSPosed 作用域已注册 (android + system, 回读校验 1/1/2)" ;;
+		"")    ui_print "  [WARN] 作用域写库后回读为空 —— sqlite3 可能跑不起来(LD_LIBRARY_PATH 不对?)" ;;
+		*)     ui_print "  [WARN] 作用域回读异常($CHECK, 期望 1/1/2) —— 可能只写进去一部分" ;;
+		esac
+
+		# 8.3 安全启用标记 —— hook 只在存在这个文件时才生效。
+		#
+		# 为什么要它(这是"必须格式化 /data 才救回来"那次事故的整改):
+		#   在 system_server 里 hook 出问题会让系统起不来, 而那时用户**没法**
+		#   去 LSPosed 里关模块(系统都进不去)。有了标记文件:
+		#     · 数据被清 / 手动删除标记 → 模块**彻底惰性**, 不可能再拖垮开机
+		#     · 想临时关掉: 删这个文件, 或 setprop persist.dsh.vd.hook 0
+		#   hook 端另有三道自保: 只改"返回 boolean"的方法(不会误改别的重载)、
+		#   全程吞异常、连续 3 次启动失败自动停用自己。
+		#
+		# ⚠ 路径必须是 /data/system, 不能放 /data/adb/dsh ——
+		#   /data/adb 是 drwx------(700, 仅 root), hook 跑在 system_server
+		#   (uid 1000) 里读不到它, File.exists() 会当成"不存在"(实测踩过:
+		#   标记建了, 日志仍报 inert)。/data/system 是 system_server 自己的
+		#   地盘, 一定能读, 且 factory reset 会清掉它。
+		MARKER="/data/system/dsh-vd-hook.on"
+		if : > "$MARKER" 2>/dev/null; then
+			ui_print "  [ OK ] 安全启用标记已创建 ($MARKER)"
+		else
+			ui_print "  [WARN] 建不了启用标记 —— hook 将保持惰性(App 上不了副屏)"
+		fi
+		rm -f /data/system/dsh-vd-hook-fails 2>/dev/null  # 清掉历史失败计数
+
+		ui_print "         ⚠ 需重启一次才生效 —— hook 在 system_server 启动时注入"
+		ui_print "  [救急] 万一开机异常: 删掉 $MARKER 即可让 hook 失效"
+	else
+		ui_print "  [WARN] 装完拿不到 APK 路径, 作用域未注册"
 	fi
 fi
 

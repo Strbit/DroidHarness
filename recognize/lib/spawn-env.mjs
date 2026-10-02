@@ -93,8 +93,12 @@ export function runCommand(cmd, args, opts = {}) {
 
   return new Promise((resolve, reject) => {
     spawn(cmd, args, execOptions, (err, stdout, stderr) => {
-      if (err) reject(Object.assign(new Error(`${cmd} ${args.join(' ')}: ${err.message}`), { stderr }));
-      else resolve({ stdout, stderr });
+      if (err) {
+        // stdout 必须跟 err 一起走: 动作进程(dex)用 exit 3 表达业务失败, 结论 JSON
+        // 就在 stdout —— 只带 stderr 的话, 调用方拿不到结论, 真机上表现为
+        // "Command failed" + 空 stderr 的无头案(实测绕了好几轮)。
+        reject(Object.assign(new Error(`${cmd} ${args.join(' ')}: ${err.message}`), { stdout, stderr }));
+      } else resolve({ stdout, stderr });
     });
   });
 }
