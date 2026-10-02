@@ -610,8 +610,34 @@
 - `ACTION_SET_TEXT` + 60ms + `refresh()` 读回校验、`isMasked`（密码框圆点判成功）
 - 无 fallback 的单通道注入纪律
 
-本仓库的实现是重写（argv 一次一进程、无 stdin daemon、聚焦模式单一通道），
-未逐行复制；在此按 MIT 归因。
+`recognize/uiaction/VdMain.java`（虚拟副屏守护进程）与
+`recognize/uiaction/hook/DshHookEntry.java`（跨屏承载 hook）同样参考了该项目的
+`vd-server-go/main.go`、`vd-tool-java/src/com/agent/DaemonMain.java` 与
+`agent-hook-apk/src/com/agent/mobileuse/HookEntry.java`：
+
+- VirtualDisplay 的旗标组合 `1545 | 16384 | 65536`
+  （PUBLIC | OWN_CONTENT_ONLY | SHOULD_SHOW_SYSTEM_DECORATIONS | TRUSTED |
+  OWN_FOCUS | STEAL_TOP_FOCUS_DISABLED）—— 其中 OWN_FOCUS +
+  STEAL_TOP_FOCUS_DISABLED 是"副屏上的 App 不抢物理屏前台"的全部机制来源
+- 镜像物理屏挖孔（`getCutout` → `setDisplayCutout`），避免副屏布局把状态栏画进孔里
+- 需要放开的 system_server 判定点清单（`canHostTasks` /
+  `isCallerAllowedToLaunchOnDisplay` / `canPlaceEntityOnDisplay` /
+  `canBeLaunchedOnDisplay` / `canLaunchOnDisplay` / `validatePackageName`）
+- `am start --display` 在非默认屏承载 Activity 的前置条件
+
+**本仓库的改写在以下几处与参考实现不同（都是真机实测后的取舍，非逐行复制）：**
+
+- hook 改为**精确到重载**：只用反射枚举同名方法、且仅对返回类型严格为 `boolean`
+  的重载调 `XposedBridge.hookMethod`。参考实现用的无差别 `hookAllMethods` 会把
+  所有重载（含非 boolean 的）一并强制返回 `Boolean.TRUE` —— 实测会让
+  system_server 在调用点崩溃、反复重启、只能进 recovery。（这是本仓库踩过的
+  真实事故，整改见 `DshHookEntry.java` 顶部注释与 `dsh/module/customize.sh` §8。）
+- 副屏销毁前**先清掉副屏上的 RootTask 再 release**（`am stack remove`）。参考实现
+  只 `vd.release()`；实测那样会把 task reparent 回 display 0 且置顶，把用户正在
+  用的 App 顶掉。
+- 不做 H.264 实时流与"前台/后台/待机"三态模式机 —— DSH 的形状是"按需看一眼"
+  （读树 → 动作 → 截图确认），帧率需求为零，只保留 ImageReader 单帧通道。
+- 归因方式：本仓库的实现为独立重写，未逐行复制；在此按 MIT 归因。
 
 ---
 

@@ -29,7 +29,7 @@ import { parseDisplays } from './lib/displays.mjs';
 import { parseDisplaysPreferred } from './lib/cmd-display.mjs';
 import { parseUiXml, labelOf, toTargets, isUsefulTree } from './lib/uitree.mjs';
 import { uiLock } from './lib/ui-lock.mjs';
-import { physicalInput, injectText } from './lib/uiaction.mjs';
+import { physicalInput, injectText, vdStart, vdStop, vdShot, vdGet, fetchTree, launchOnDisplay, findTasks, vdHandoff, topPackageOnDisplay } from './lib/uiaction.mjs';
 
 const PROTOCOL_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05', '2024-10-07'];
 const LATEST = PROTOCOL_VERSIONS[0];
@@ -464,9 +464,14 @@ const TOOLS = [
       '截取指定屏幕并**直接返回图片**，由你的视觉能力去读。\n\n' +
       '适用：自绘界面、游戏、图标上的文字、需要理解布局与语义的场合；' +
       '也是无障碍树"没用的树"时的兜底。\n\n' +
-      '**这个工具支持任意屏**（包括虚拟副屏），因为 screencap 走的是 SurfaceFlinger id。' +
-      '省略 displayId 时截默认屏。虚拟副屏用 list_displays 查到它的 surfaceFlingerId ' +
-      '或逻辑 displayId 后传进来即可。\n\n' +
+      '**两条内部路线，按 displayId 自动选：**\n' +
+      '  · 默认屏 / 物理屏 → 系统 `screencap`（走 SurfaceFlinger id），返回 **PNG**\n' +
+      '  · 虚拟副屏（displayId 非 0）→ 进程内 ImageReader，返回 **JPEG**\n\n' +
+      '⚠ 为什么虚拟副屏不能走 screencap：实测 `screencap -d <副屏逻辑id>` 会报\n' +
+      '`Failed to take screenshot. Display Id \'N\' is not valid.` —— 系统截图抓不到\n' +
+      '虚拟屏。副屏的帧只能由 screen_vd_start 起的那个守护进程在进程内取。\n\n' +
+      '⚠ 传非 0 的 displayId 时，它必须是**本实例启动的那块副屏**；否则明确报错\n' +
+      '（不静默改成截主屏 —— 那会让模型拿着主屏的图去点副屏的坐标）。\n\n' +
       '注意返回里的 deviceState 字段：若 displayState 不是 ON，这张图是**最后一帧旧画面**，' +
       '不能反映当前真实界面（熄屏时 screencap 不报错，这是已知的静默失败）。',
     inputSchema: {
@@ -568,8 +573,9 @@ const TOOLS = [
       '注入后读回校验（返回 before_text / verified_text 供你确认落点）。\n\n' +
       '**先 screen_tap 点击目标输入框取得焦点，再调本工具（不带 text_before 参数）**。\n' +
       'mode: "replace"（默认）清空后写入；"append" 在现有文本后追加（用于不想丢草稿的场景）。\n\n' +
-      '平台限制：只能在默认屏用（displayId 非 0 会明确报错）；微信只在挂了系统无障碍' +
-      '服务时才收 ACTION_SET_TEXT，本工具会自动挂载并在用完还原（期间屏幕可能出现' +
+      'displayId: 省略=默认屏。**虚拟副屏上也可以用**（先 screen_vd_start，传它的 displayId），' +
+      '但聚焦仍需先用 screen_tap -d <displayId> 点击该屏的输入框。\n' +
+      '微信等"只认系统无障碍服务"的 App 由本工具自动挂载并在用完还原（期间屏幕可能出现' +
       '"无障碍"提示，属预期）。写入失败会带 before/after 证据报错，绝不重试到别的控件。',
     inputSchema: {
       type: 'object',
@@ -582,10 +588,117 @@ const TOOLS = [
         },
         displayId: {
           oneOf: [{ type: 'number' }, { type: 'string' }],
-          description: '逻辑 displayId。省略则用默认屏(0)。非 0 明确报错。',
+          description: '逻辑 displayId。省略=默认屏(0)。虚拟副屏传 screen_vd_start 返回的 displayId。',
         },
       },
       required: ['text'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'screen_vd_start',
+    description:
+      '启动一块**虚拟副屏**（trusted VirtualDisplay，不抢物理屏的前台焦点）。\n\n' +
+      '用途：自动化操作在副屏上进行，**不干扰用户正在用的主屏**。副屏上可以启动任意 App、' +
+      '读树（screen_tree/displayId）、点击（screen_tap/displayId）、注入文字（screen_text/displayId）、' +
+      '截图（screen_vd_shot）。\n\n' +
+      '几何参数省略时自动取物理屏的宽高与密度（推荐）；也可以显式指定更小的尺寸（省显存）。\n' +
+      '本 MCP 实例同一时间只支持一块副屏；换尺寸先 stop。MCP 服务退出时副屏随之销毁。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        width: { type: 'number', description: '副屏宽（像素）。省略=物理屏宽' },
+        height: { type: 'number', description: '副屏高（像素）。省略=物理屏高' },
+        dpi: { type: 'number', description: '副屏密度。省略=物理屏密度' },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'screen_vd_stop',
+    description:
+      '**丢弃**虚拟副屏：把它上面的 App 连同当前状态一起清掉，再释放显存。\n\n' +
+      '⚠ **副屏上有 App 时本工具默认拒绝执行**（报错说明原因），因为实测：\n' +
+      '销毁承载着 App 的副屏，用户**会看到那个 App 在主屏上闪一下**（WM 的跨屏\n' +
+      'CLOSE 过渡会把被删 task 的 surface 从副屏尺寸动到主屏尺寸上渲染）。\n' +
+      '试过"删栈期间关掉过渡动画"，用户复看**仍然闪**，所以没采用。\n\n' +
+      '于是默认行为是：\n' +
+      '  · 副屏上有 App → 拒绝，并给出两个正确选择\n' +
+      '      要留住状态 → `screen_vd_handoff`（搬回主屏，用户接手）\n' +
+      '      确实要丢   → 传 `force: true`（明确接受"会闪一下 + 状态丢失"）\n' +
+      '  · 副屏上没有 App（空屏）→ 正常销毁，全程不打扰用户\n\n' +
+      '不在跑时幂等返回。\n\n' +
+      '**agent 干完活的默认收尾是"什么都不做"**：副屏和 App 都留着，用户前台\n' +
+      '一动不动；等用户自己接手（handoff）或明确要求丢弃。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        force: {
+          type: 'boolean',
+          description: '副屏上有 App 时强制丢弃（调用方明确接受"用户屏幕上会闪一下 + App 状态丢失"）。默认 false',
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'screen_vd_handoff',
+    description:
+      '**交接**：把副屏上的 App 搬回主屏，连它当前的状态一起交给用户接手。\n\n' +
+      '典型用法：AI 在副屏把外卖选好、停在支付界面，然后调用本工具 —— **界面原样出现在用户屏幕上**，\n' +
+      '用户直接就能付款下单（reparent 不重建 Activity，所以停在原处，不会退回首页）。\n\n' +
+      '与 screen_vd_stop 的区别：\n' +
+      '  · handoff = 交给用户 → 搬到主屏并置顶（此时接管前台是**期望行为**）\n' +
+      '  · stop    = 丢弃     → 清掉副屏内容再释放（全程不碰用户前台）\n\n' +
+      '参数 package 省略时，交接副屏上**最顶层**的那个 App。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        package: { type: 'string', description: '要交接的 App 包名。省略=副屏最顶层的 App' },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'screen_vd_shot',
+    description:
+      '截取**虚拟副屏**当前画面（JPEG），由你的视觉能力去读。\n\n' +
+      '等价于 `screen_image { displayId: <副屏的 displayId> }` —— 保留它是为了让调用方' +
+      '不必记住/回填那个 id（副屏 id 是每次 screen_vd_start 现分配的）。\n' +
+      '返回图片 + 副屏几何元数据。这是"虚拟副屏上发生了什么"的直接证据 —— 读树拿不到的' +
+      '自绘界面（游戏/WebView 首帧）用这条看。\n\n' +
+      '也适合在交接前**确认状态**（比如确认支付界面已就绪再 handoff）。',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'screen_app',
+    description:
+      '把某个 App 启动到指定的屏上。**它不会碰主屏上已有的实例** —— 这是"自动化不打扰用户"的关键。\n\n' +
+      '机制：`am start -f 0x18000000 --display N`（NEW_TASK|MULTIPLE_TASK）。\n' +
+      '即使该 App 已在主屏运行（微信这类 singleTask 应用），也会在副屏**新建一个独立 task**，\n' +
+      '主屏那份原样不动（实测：全程主屏前台逐字未变）。副屏上跑的是同一账号/同一进程的另一个\n' +
+      '任务窗口，不是分身用户。\n\n' +
+      '⚠ 反例（都已实测踩过，不要用）：\n' +
+      '  · `am start --display N`（不带 MULTIPLE_TASK）→ singleTask 应用会把 intent 交给主屏\n' +
+      '    已有实例，**把用户正在看的 App 拉到前台**\n' +
+      '  · `cmd activity display move-stack` → "迁移"语义，立刻抢走前台；副屏销毁时还会再抢一次\n\n' +
+      '命令后会**复核** task 真的落在目标屏（命令返回 0 但实际没动的情况实测存在）。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        package: { type: 'string', description: 'App 包名，如 com.tencent.mm' },
+        activity: { type: 'string', description: '可选：要启动的 Activity 全名。省略则启动 launch activity' },
+        displayId: {
+          oneOf: [{ type: 'number' }, { type: 'string' }],
+          description: '目标逻辑 displayId（副屏用 screen_vd_start 返回的值）。省略=默认屏 0',
+        },
+        dryRun: { type: 'boolean', description: '只查询不动作：返回该 App 的 task 都在哪些屏。默认 false' },
+      },
+      required: ['package'],
       additionalProperties: false,
     },
   },
@@ -599,6 +712,37 @@ const TOOLS = [
  */
 function toolsWithHonestyNote() {
   return TOOLS.map((t) => ({ ...t, description: t.description + HONESTY_NOTE }));
+}
+
+/**
+ * 非默认屏必须是**本实例启动的那块虚拟副屏** —— 否则明确报错。
+ *
+ * 为什么必须校验(而不是"能读到就给"):
+ *   dex 侧的 getWindowsOnAllDisplays 对**不存在的逻辑屏**也返回空树, 于是
+ *   `screen_targets {displayId: 2}` 会拿到"0 个目标, 成功" —— 模型据此以为
+ *   "那块屏上什么都没有", 是典型的**静默错坐标**。screen_text 一直有这道校验
+ *   (打错屏比报错危险得多); screen_tree / screen_targets 在 PR B 里改走 dex
+ *   路线后必须同步补上。
+ *
+ * @returns 出错时返回 {isError:true, text}; 通过时返回 null
+ */
+function requireOwnVdDisplay(displayId, toolName) {
+  const vd = vdGet();
+  if (!vd) {
+    return {
+      isError: true,
+      text: `displayId=${displayId} 不是默认屏，而本实例没有运行中的虚拟副屏。` +
+        `先 screen_vd_start，再用它返回的 displayId。`,
+    };
+  }
+  if (Number(displayId) !== vd.displayId) {
+    return {
+      isError: true,
+      text: `displayId=${displayId} 与运行中的副屏 (displayId=${vd.displayId}) 不符。` +
+        `${toolName} 请传 ${vd.displayId}。`,
+    };
+  }
+  return null;
 }
 
 // ── 工具实现 ──────────────────────────────────────────────
@@ -656,6 +800,34 @@ async function toolsCall(name, args) {
 
     case 'screen_tree': {
       const logical = args?.displayId ?? 0;
+
+      // 副屏分支: uiautomator dump 只认主屏(--display 被平台静默忽略, 见
+      // uiTreeDump 的注释)。非默认屏走 dex 的 getWindowsOnAllDisplays。
+      if (Number(logical) !== 0) {
+        const bad = requireOwnVdDisplay(logical, 'screen_tree');
+        if (bad) return bad;
+        const r = await fetchTree(Number(logical));
+        if (!r.ok) {
+          return { isError: true, text: `副屏(${logical})无障碍树读取失败: ${r.error}${r.reason ? `\n${r.reason}` : ''}` };
+        }
+        const nodes = (r.nodes || []).map((n) => ({
+          text: n.text, desc: n.desc, resourceId: n.resourceId, className: n.className,
+          bounds: n.bounds, clickable: n.clickable, editable: n.editable,
+          focused: n.focused, enabled: n.enabled, depth: n.depth,
+        }));
+        const labelled = nodes.filter((n) => n.text || n.desc || n.resourceId);
+        const head = `副屏(${logical})无障碍树: ${r.node_count} 节点, ${labelled.length} 有文字` +
+          `（采集于 ${new Date().toISOString()}，走 dex getWindowsOnAllDisplays）`;
+        const summary = compactSummary(head, labelled, { headLimit: 120, tailLimit: 30 });
+        const bounded = boundArray(nodes, { headLimit: 200, tailLimit: 50 });
+        const payload = {
+          displayId: r.displayId, capturedAt: Date.now(), costMs: r.cost_ms,
+          nodeCount: r.node_count, nodes: bounded.items, nodesOmitted: bounded.omitted,
+          source: 'vd-a11y-dex',
+        };
+        return { text: summary + '\n\n' + JSON.stringify(payload, null, 2) };
+      }
+
       const disp = await displayState(logical);
       const dump = await uiTreeDump(logical);
       if (!dump.ok) return { isError: true, text: `无障碍树读取失败: ${dump.error}\n${dump.detail || ''}` };
@@ -711,6 +883,50 @@ async function toolsCall(name, args) {
 
     case 'screen_targets': {
       const logical = args?.displayId ?? 0;
+
+      // 副屏分支: 与 screen_tree 同源(见那边的注释)。
+      // uiautomator dump 只作用于主屏(--display 被平台静默忽略), 非默认屏必须走
+      // dex 的 getWindowsOnAllDisplays。此前这里没有这个分支, 副屏上会直接报
+      // tree-needs-app —— 目标里"解除非默认屏限制"包含本工具。
+      if (Number(logical) !== 0) {
+        const bad = requireOwnVdDisplay(logical, 'screen_targets');
+        if (bad) return bad;
+        const r = await fetchTree(Number(logical));
+        if (!r.ok) {
+          return { isError: true, text: `副屏(${logical})无障碍树读取失败: ${r.error}${r.reason ? `\n${r.reason}` : ''}` };
+        }
+        const all = r.nodes || [];
+        const interactable = all.filter((n) => (n.clickable || n.editable) &&
+          (args?.includeDisabled || n.enabled !== false));
+        const targets = interactable.map((n) => {
+          const b = n.bounds || { x1: 0, y1: 0, x2: 0, y2: 0 };
+          return {
+            label: n.text || n.desc || n.resourceId || '',
+            text: n.text || '', desc: n.desc || '', resourceId: n.resourceId || '',
+            className: n.className || '', package: '',
+            bounds: b,
+            center: { x: Math.round((b.x1 + b.x2) / 2), y: Math.round((b.y1 + b.y2) / 2) },
+            clickable: !!n.clickable, longClickable: false, scrollable: false,
+            editable: !!n.editable, enabled: n.enabled !== false,
+            confidence: 'high',
+          };
+        });
+        const editableCount = all.filter((n) => n.editable).length;
+        const head = `副屏(${logical})可点目标 ${targets.length} 个` +
+          `（共 ${all.length} 节点, 其中可输入 ${editableCount} 个）` +
+          `（采集于 ${new Date().toISOString()}，走 dex getWindowsOnAllDisplays）`;
+        const summary = compactSummary(head, targets, { headLimit: 80, tailLimit: 20 });
+        const bounded = boundArray(targets, { headLimit: 200, tailLimit: 50 });
+        return {
+          text: summary + '\n\n' + JSON.stringify({
+            displayId: r.displayId, capturedAt: Date.now(), costMs: r.cost_ms,
+            nodeCount: r.node_count, editableCount,
+            targets: bounded.items, targetsOmitted: bounded.omitted,
+            source: 'vd-a11y-dex',
+          }, null, 2),
+        };
+      }
+
       const disp = await displayState(logical);
       const dump = await uiTreeDump(logical);
       if (!dump.ok) return { isError: true, text: `无障碍树读取失败: ${dump.error}\n${dump.detail || ''}` };
@@ -763,6 +979,29 @@ async function toolsCall(name, args) {
     }
 
     case 'screen_image': {
+      const requested0 = args?.displayId;
+      // 副屏分支: 系统 screencap **抓不到虚拟屏** —— 实测
+      //   screencap -d <副屏逻辑id>  → "Failed to take screenshot. Display Id 'N' is not valid."
+      // 副屏画面只能来自 VdMain 进程内的 ImageReader。契约: displayId 非 0 时必须是
+      // 本实例启动的那块副屏, 否则明确报错(不静默截主屏 —— 那是"静默错坐标")。
+      // 注意输出格式: 这条路是 JPEG(ImageReader → Bitmap.compress),
+      // 系统 screencap 那条是 PNG。
+      if (requested0 !== undefined && requested0 !== null && Number(requested0) !== 0) {
+        const bad = requireOwnVdDisplay(requested0, 'screen_image');
+        if (bad) return bad;
+        try {
+          const { jpeg, displayId, costMs, width, height } = await vdShot();
+          return {
+            text: `屏幕: displayId=${displayId}（虚拟副屏）\n` +
+              `分辨率: ${width}x${height}   大小: ${(jpeg.length / 1024).toFixed(0)} KB\n` +
+              `采集: 刚采集(进程内 ImageReader), 耗时 ${costMs} ms\n` +
+              `格式: JPEG —— 副屏走进程内 ImageReader, 系统 screencap 抓不到虚拟屏。`,
+            image: { data: jpeg.toString('base64'), mimeType: 'image/jpeg' },
+          };
+        } catch (e) {
+          return { isError: true, text: `副屏截图失败: ${e.message}` };
+        }
+      }
       // 支持逻辑 displayId 或 SurfaceFlinger id: 先按逻辑 id 查表, 查不到就当 sfId 直接用
       let sfId = null;
       let logical = null;
@@ -854,12 +1093,23 @@ async function toolsCall(name, args) {
       const displayId = args?.displayId !== undefined && args?.displayId !== null ? Number(args.displayId) : 0;
       if (!Number.isFinite(displayId)) return { isError: true, text: `displayId 不是数字: ${args?.displayId}` };
       if (displayId !== 0) {
-        // 与 screen_tree 同一条纪律: 静默把动作发到错误的屏, 比报错危险得多。
-        return {
-          isError: true,
-          text: `screen_text 暂只支持默认屏(displayId 0), 收到 ${displayId}。` +
-            `非默认屏的输入框请先在对应屏上聚焦后改用设备侧其他通道。`,
-        };
+        // 副屏注入: 必须是**本实例启动的那块** —— 随便填一个 displayId 会把
+        // 文字打到别人/系统的屏上, 与"静默错坐标"同罪。
+        const vd = vdGet();
+        if (!vd) {
+          return {
+            isError: true,
+            text: `displayId=${displayId} 不是默认屏, 而本实例没有运行中的虚拟副屏。` +
+              `先 screen_vd_start, 再用返回的 displayId。`,
+          };
+        }
+        if (displayId !== vd.displayId) {
+          return {
+            isError: true,
+            text: `displayId=${displayId} 与运行中的副屏 (displayId=${vd.displayId}) 不符。` +
+              `副屏动作请传 ${vd.displayId}。`,
+          };
+        }
       }
       const text = args?.text;
       if (typeof text !== 'string') return { isError: true, text: 'text 必须是字符串' };
@@ -879,6 +1129,170 @@ async function toolsCall(name, args) {
       // verify_unavailable / verify_mismatch 如实带出 —— 不悄悄当成功
       if (r.error) lines.push(`⚠ ${r.error}: ${r.reason || ''}`);
       return { text: lines.join('\n') + '\n\n' + JSON.stringify(r, null, 2) };
+    }
+
+    case 'screen_vd_start': {
+      const width = args?.width != null ? Number(args.width) : null;
+      const height = args?.height != null ? Number(args.height) : null;
+      const dpi = args?.dpi != null ? Number(args.dpi) : null;
+      for (const [k, v] of [['width', width], ['height', height], ['dpi', dpi]]) {
+        if (v !== null && !Number.isFinite(v)) return { isError: true, text: `${k} 不是数字: ${v}` };
+      }
+      try {
+        const r = await vdStart(width, height, dpi);
+        const lines = r.already
+          ? `副屏已在运行 (幂等返回): displayId=${r.displayId}, ${r.width}x${r.height}@${r.dpi}`
+          : `副屏已启动: displayId=${r.displayId}, ${r.width}x${r.height}@${r.dpi}`;
+        return {
+          text: `${lines}\n\n接下来:\n` +
+            `  · 把 App 放到副屏: screen_app { package, displayId: ${r.displayId} }\n` +
+            `    （即使该 App 已在主屏运行, 也会在副屏新建一个独立 task, 主屏那份不动）\n` +
+            `  · 读/点/输入副屏: screen_tree、screen_targets、screen_tap、screen_text 传 displayId=${r.displayId}\n` +
+            `  · 看副屏画面: screen_image { displayId: ${r.displayId} } 或 screen_vd_shot\n` +
+            `  · 让用户接手: screen_vd_handoff（搬回主屏, 状态不丢）\n\n` +
+            `**干完活的默认收尾是"什么都不做"** —— 副屏和 App 都留着, 用户前台一动不动。\n` +
+            `只有内容确实不要了才 screen_vd_stop（副屏上有 App 时它默认拒绝, 因为实测会闪）。\n\n` +
+            `⚠ 跨屏承载依赖 LSPosed hook 生效; 没有 hook 时 screen_app 会明确报错(不会假装成功)。`,
+        };
+      } catch (e) {
+        return { isError: true, text: `副屏启动失败: ${e.message}` };
+      }
+    }
+
+    case 'screen_vd_stop': {
+      try {
+        const before = vdGet();
+        const r = await vdStop({ force: !!args?.force });
+        if (!r.stopped) {
+          if (r.reason === 'occupied') {
+            // 默认拒绝销毁有 App 的副屏 —— 这是实测结论(会闪一下), 不是保守。
+            return { isError: true, text: r.detail };
+          }
+          return { text: '没有运行中的副屏（幂等）' };
+        }
+        const cleared = (r.clearedStacks || []).filter((s) => s.ok).length;
+        return {
+          text: `副屏已丢弃并释放 (displayId=${r.displayId ?? '?'})\n` +
+            `已清掉副屏上的 ${cleared} 个栈 —— 副屏内容不再存在。\n` +
+            (r.forced
+              ? `⚠ 本次是 force 丢弃：副屏上原有的 App 连状态一起没了，且**用户屏幕上可能闪过一下那个 App**（实测存在）。\n`
+              : `用户主屏前台未受影响。\n`) +
+            (cleared === 0 && before
+              ? '（副屏上本来就没有 App；若有 App 请检查 am stack remove 是否生效）'
+              : ''),
+        };
+      } catch (e) {
+        return { isError: true, text: `副屏停止失败: ${e.message}` };
+      }
+    }
+
+    case 'screen_vd_handoff': {
+      const vd = vdGet();
+      if (!vd) return { isError: true, text: '副屏未运行。先 screen_vd_start。' };
+      let pkg = args?.package;
+      if (typeof pkg !== 'string' || !pkg.trim()) {
+        try {
+          pkg = await topPackageOnDisplay(vd.displayId);
+        } catch { pkg = null; }
+        if (!pkg) {
+          return {
+            isError: true,
+            text: `副屏(displayId=${vd.displayId}) 上没有可交接的 App —— 先 screen_app 启动一个。`,
+          };
+        }
+      } else {
+        pkg = pkg.trim();
+      }
+      try {
+        const r = await vdHandoff(pkg);
+        if (!r.ok) {
+          return {
+            isError: true,
+            text: `交接失败 (${r.error}): ${r.detail || r.output || ''}`,
+          };
+        }
+        return {
+          text: `已交接: ${pkg} 从副屏(displayId=${r.from}) 搬到主屏 display 0（task #${r.taskId}）\n` +
+            `App 状态原样保留（reparent 不重建 Activity）—— 用户现在可以在自己屏幕上直接继续操作。\n` +
+            `副屏仍在运行；如果不再需要，用 screen_vd_stop 丢弃。`,
+        };
+      } catch (e) {
+        return { isError: true, text: `交接失败: ${e.message}` };
+      }
+    }
+
+    case 'screen_vd_shot': {
+      if (!vdGet()) {
+        return { isError: true, text: '副屏未运行。先 screen_vd_start。' };
+      }
+      try {
+        const { jpeg, displayId, costMs, width, height } = await vdShot();
+        return {
+          text: `副屏截图: displayId=${displayId}  ${width}x${height}  ${(jpeg.length / 1024).toFixed(0)} KB  (${costMs} ms)`,
+          image: { data: jpeg.toString('base64'), mimeType: 'image/jpeg' },
+        };
+      } catch (e) {
+        return { isError: true, text: `副屏截图失败: ${e.message}` };
+      }
+    }
+
+    case 'screen_app': {
+      const pkg = args?.package;
+      if (typeof pkg !== 'string' || !pkg.trim()) return { isError: true, text: 'package 必须是非空字符串' };
+      const displayId = args?.displayId !== undefined && args?.displayId !== null ? Number(args.displayId) : 0;
+      if (!Number.isFinite(displayId)) return { isError: true, text: `displayId 不是数字: ${args?.displayId}` };
+
+      if (args?.dryRun) {
+        try {
+          const tasks = await findTasks(pkg.trim());
+          if (!tasks.length) return { text: `${pkg} 当前没有运行中的 task。` };
+          return {
+            text: `${pkg} 的 task:\n` + tasks.map((t) =>
+              `  task #${t.taskId}  display=${t.displayId}${t.isRoot ? ' (root)' : ''}${t.visible ? ' 可见' : ''}`,
+            ).join('\n'),
+          };
+        } catch (e) {
+          return { isError: true, text: `查询 task 失败: ${e.message}` };
+        }
+      }
+
+      // 目标屏合法性: 非 0 必须是本实例的副屏(与 screen_text 同一条纪律)
+      if (displayId !== 0) {
+        const vd = vdGet();
+        if (!vd) {
+          return {
+            isError: true,
+            text: `displayId=${displayId} 不是默认屏, 而本实例没有运行中的虚拟副屏。先 screen_vd_start。`,
+          };
+        }
+        if (displayId !== vd.displayId) {
+          return {
+            isError: true,
+            text: `displayId=${displayId} 与运行中的副屏 (displayId=${vd.displayId}) 不符。`,
+          };
+        }
+      }
+
+      try {
+        const r = await launchOnDisplay(displayId, pkg.trim(), args?.activity || null);
+        if (!r.ok) {
+          return {
+            isError: true,
+            text: `${pkg} 移到 display ${displayId} 失败 (${r.method}): ${r.error}\n` +
+              (r.detail ? `${r.detail}\n` : '') +
+              (r.output ? `原始输出: ${r.output}\n` : '') +
+              (r.error === 'move-stack-failed' || r.error === 'am-start-failed'
+                ? '\n提示: 跨屏承载需要 LSPosed hook 生效(见模块说明)。缺 hook 时 WM 会拒绝把 task 放到虚拟屏。'
+                : ''),
+          };
+        }
+        const how = r.method === 'move-stack' ? `已用 move-stack 搬运 task #${r.taskId}（保留 App 状态）`
+          : r.method === 'already-there' ? `已经在 display ${displayId}（task #${r.taskId}）`
+          : '已冷启动到目标屏';
+        return { text: `${pkg} → display ${displayId}\n${how}\n${r.output || ''}`.trim() };
+      } catch (e) {
+        return { isError: true, text: `screen_app 失败: ${e.message}` };
+      }
     }
 
     default:

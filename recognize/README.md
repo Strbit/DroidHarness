@@ -302,6 +302,130 @@ AccessibilityService 绑定时**才交出无障碍树 —— `UiAutomation` 不�
 
 ---
 
+## 虚拟副屏：让自动化不打扰用户（screen_vd_start / screen_vd_stop / screen_vd_handoff / screen_vd_shot / screen_app）
+
+目标不是"主屏 vs 副屏"，而是**前台 vs 后台**：用户在主屏看小说/打游戏，
+agent 在副屏干活（发消息、点外卖），**用户的前台一下都不该变**。
+
+### 机制（真机实测，这是全部的关键）
+
+副屏用旗标 `1545 | 16384 | 65536` 创建，其中两个是核心：
+
+```
+16384  VIRTUAL_DISPLAY_FLAG_OWN_FOCUS                 副屏有自己的焦点
+65536  VIRTUAL_DISPLAY_FLAG_STEAL_TOP_FOCUS_DISABLED  不抢物理屏的顶层焦点
+```
+
+于是两块屏**各有各的 `mCurrentFocus`**。实测：主屏在看 piliplus、副屏跑着设置时
+
+```
+mCurrentFocus=... com.android.settings/MiuiSettings     ← 副屏的焦点
+mCurrentFocus=... com.example.piliplus/.MainActivity     ← 主屏的焦点，没动
+```
+
+物理屏的前台从头到尾没被碰过。**这是副屏存在的全部意义**，不是"换个地方看画面"。
+
+### App 怎么上副屏：`screen_app`
+
+`am start -f 0x18000000 --display N`（`NEW_TASK | MULTIPLE_TASK`）。
+即使该 App 已在主屏运行（微信这类 singleTask），也会在副屏**新建一个独立 task**，
+主屏那份原样不动 —— 副屏上是同一账号/同一进程的另一个任务窗口，**不是分身用户**。
+
+**两条实测踩过的反例，别用：**
+
+| 写法 | 后果 |
+|---|---|
+| `am start --display N`（不带 MULTIPLE_TASK） | singleTask 应用会把 intent 交给主屏既有实例，**把用户正在看的 App 拉到前台**，而且没上副屏 |
+| `cmd activity display move-stack` | "迁移"语义，立刻抢走前台；副屏销毁时 task reparent 回来会**再抢一次** |
+
+`screen_app` 省略 `activity` 时会先 `cmd package resolve-activity --brief <pkg>`
+解析启动 Activity —— `am start -n` 只接受 `包/Activity` 全称，给裸包名会报
+`Bad component name`（实测）。命令发出后还会**复核** task 真的落在目标屏
+（命令返回 0 而实际没动的情况实测存在）。
+
+### 三种收尾，由调用方按意图选
+
+| 意图 | 工具 | 主屏前台 |
+|---|---|---|
+| 让用户**接手**（AI 停在支付界面，用户来付款） | `screen_vd_handoff` | 搬到主屏并置顶 —— 此时接管前台是**期望行为** |
+| 还要**接着用**（AI 还没干完） | 什么都不做，副屏常驻 | 全程不变 |
+| 内容**不要了** | `screen_vd_stop` | 有 App 时**默认拒绝**（见下） |
+
+**`screen_vd_stop` 为什么会拒绝：** 实测销毁一个**承载着 App** 的副屏时，用户
+**会看到那个 App 在主屏上闪一下** —— 删栈会让 WM 跑一条跨屏 CLOSE 过渡，把被删
+task 的 surface 从副屏尺寸动到**主屏**尺寸上渲染：
+
+```
+onTransitionReady t=CLOSE r=[0@Point(0,0)]
+  ...Task #199 com.tencent.mm  sb=Rect(0,0-800,1200) eb=Rect(0,0-2608,1200) d=22->0
+```
+
+`sb`=副屏尺寸、`eb`=**主屏**尺寸、`d`=显示从 22 变到 0。用户原话："闪过去一个
+悬浮窗一样的东西，能看到是微信，闪一下就没了"。
+
+试过但**无效**的做法（已撤）：删栈期间临时把过渡动画 scale 设 0。用户复看**仍然
+闪**，那条跨屏过渡记录也仍在；而且它改的是全局设置，有副作用，所以没采用。
+
+于是契约改成：
+
+- 副屏上**有 App** → 默认**拒绝**，并给出两个正确选择：
+  要留住状态用 `screen_vd_handoff`，确实要丢传 `force: true`（明确接受"会闪一下 + 状态丢失"）
+- 副屏是**空屏** → 正常销毁，全程不打扰用户
+
+**agent 干完活的默认收尾是"什么都不做"** —— 副屏和 App 都留着，用户前台一动不动。
+这也正是参考实现（agent-mobile-use）的做法：它的模式机从不销毁副屏，`stop` 路径
+从不被正常流程调用，且 `vd.release()` 之前也不清栈。
+
+`screen_vd_handoff` 是 `move-stack <taskId> 0`：reparent **不重建 Activity**，
+所以界面停在原处（支付页还是支付页）。实测交接前后是同一个 `taskId`、同一个
+`topActivity`。
+
+### 销毁副屏时"先清栈"解决了什么、没解决什么
+
+`screen_vd_stop`（以及 `VdMain.cleanup()`）的顺序是
+**先 `am stack remove` 清掉副屏上的 RootTask，再 release 副屏**。
+
+- **解决的**：直接 release 时 WM 会把 task reparent 回 display 0 **且置顶**
+  （AOSP 的 `moveRootTaskToDisplay` 固定 `onTop=true`），用户正在用的 App 被顶掉。
+  实测：用户在看 piliplus、副屏跑着设置，直接释放 → 前台立刻变成设置。
+- **没解决的**：删栈本身仍会触发一条跨屏 CLOSE 过渡，用户**仍会看到那个 App
+  闪一下**（见上一节的 logcat 证据）。所以最终结论不是"清栈就干净了"，而是
+  **有 App 就不销毁**。
+
+### 跨屏承载的前置条件：LSPosed hook
+
+AOSP 默认拒绝把 App 放到非默认屏（`START_TASK_FROM_DISPLAY` 是 signature 权限，
+root 也拿不到）。所以需要 `recognize/uiaction/hook/DshHookEntry.java` 在
+system_server 里放开几处判定。它是**本仓库最危险的一段代码**，因此有四道闸：
+
+1. **只改返回类型严格为 `boolean` 的重载** —— 用反射枚举同名方法逐个判定，
+   非 boolean 的一律跳过并记日志。无差别 `hookAllMethods` 会把所有重载一并
+   强制返回 `Boolean.TRUE`，只要有一个签名不匹配就会在**调用点**崩溃 →
+   system_server 崩溃循环 → 只能进 recovery。**这是真踩过的事故。**
+2. **全程 try/catch，任何异常只记日志**：最坏结果是"这个钩子没装上"，不是开机崩。
+3. **启用标记 `/data/system/dsh-vd-hook.on`**：安装器创建；数据被清 → 标记消失
+   → 模块**彻底惰性**。（路径必须在 system_server 读得到的地方 —— 放
+   `/data/adb/dsh/` 会因 `/data/adb` 是 0700 而永远读不到，实测踩过。）
+4. **启动失败自愈**：连续多次启动都活不过 120s 就自动停用自己，并留下
+   `/data/system/dsh-vd-hook-fails` 计数。活过 120s 则计数清零。
+
+临时关掉：`setprop persist.dsh.vd.hook 0`（下次注入生效），或删掉启用标记。
+
+### 已知边界（诚实记下来）
+
+- **守护进程被 SIGKILL 时来不及清理**：app_process 在 SIGTERM 下也不会跑 JVM
+  关闭钩子（ART 没装信号处理器，进程被直接终止），所以"先清栈"只能覆盖
+  stdin EOF / `quit` / 正常退出三条路。猝死时副屏的 task 会掉回主屏抢前台
+  （实测 `kill -9` 后前台变成设置）。**JS 侧有兜底**：
+  `vdStart` 记录用户当时的前台 App，子进程**意外**退出时核对并把它拉回来
+  （`vdStop` 的正常路径会标记 `expected`，不触发兜底）。JS 侧兜底需要 MCP
+  进程活着 —— 这是当前设计的边界。
+- 3 个 hook 目标类在 MIUI/HyperOS 上被精简（`DisplayManager#canHostTasks`、
+  `DisplayContent#canHostTasksLocked`、`LogicalDisplay`），打 MISS 继续；
+  实测 11 个重载命中即够用。
+
+---
+
 ## 与触控的关系
 
 观察层（screen_tree / screen_targets / screen_image）负责给出"点哪里"，

@@ -243,12 +243,33 @@ if (haveScreen && !NO_SCREEN_MCP) {
 // **不能**按扩展名全仓库扫 —— app/ 和 usr/ 是构建产物，里面几千个 .json/.md 是
 // 上游包带的，其中真有带 CRLF 的，那会让打包在一个我们完全不控制、也不被 sh
 // 读的文件上失败（假阳性比漏检更糟: 它会让人开始信任"打包偶发失败"）。
+// 文本 / 二进制的判定**按内容**(前 8KB 有没有 NUL)，不按扩展名。
+// 为什么: 原先只硬编码排除了 tools/*.dex；后来 bin/ 里放进了 sqlite3
+// (ELF, 魔数 7f 45 4c 46)，它的字节流天然含 0x0d，这条 CR 检查立刻误报 ——
+// 而它是 sh 根本不会读的二进制。按内容判定一次覆盖 dex / ELF / 将来任何
+// 二进制，不会再因为"多放了一个二进制"而假失败(假阳性比漏检更糟: 它会让人
+// 开始不信任打包结果)。
+function looksBinary(file) {
+	try {
+		const fd = fs.openSync(file, 'r');
+		try {
+			const buf = Buffer.alloc(8000);
+			const n = fs.readSync(fd, buf, 0, 8000, 0);
+			return buf.subarray(0, n).includes(0x00);
+		} finally {
+			fs.closeSync(fd);
+		}
+	} catch {
+		return false; // 读不了就按文本处理，让后续读取自己报错
+	}
+}
+let skippedBinaries = 0;
 const ownText = files.filter((f) => {
 	if (!f.rel.includes('/')) return /\.(sh|prop)$/.test(f.rel);
 	const top = f.rel.split('/')[0];
 	// dex 是编译二进制(魔数 dex\n): 字节流天然含 0x0d, CR 检查是文本世界的
 	// 规则, 对它只会误报。它的门在 stage-tools 拷贝分支: 魔数已验。
-	if (top === 'tools' && f.rel.endsWith('.dex')) return false;
+	if (top !== 'bin' && top !== 'tools') return false; if (looksBinary(f.full)) { skippedBinaries++; return false; }
 	return top === 'bin' || top === 'tools';
 });
 const withCR = [];
@@ -265,7 +286,7 @@ if (withCR.length > 0) {
 			'\n  修: node -e 里的 replace(/\\r\\n/g,"\\n")，或配 .gitattributes 的 eol=lf'
 	);
 }
-log(`行尾检查:     ${ownText.length} 个模块脚本全 LF`);
+log(`行尾检查:     ${ownText.length} 个模块脚本全 LF（另有 ${skippedBinaries} 个二进制按内容跳过）`);
 
 if (NO_ZIP) {
 	log('');
