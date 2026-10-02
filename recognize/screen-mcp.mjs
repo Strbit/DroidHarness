@@ -464,9 +464,14 @@ const TOOLS = [
       '截取指定屏幕并**直接返回图片**，由你的视觉能力去读。\n\n' +
       '适用：自绘界面、游戏、图标上的文字、需要理解布局与语义的场合；' +
       '也是无障碍树"没用的树"时的兜底。\n\n' +
-      '**这个工具支持任意屏**（包括虚拟副屏），因为 screencap 走的是 SurfaceFlinger id。' +
-      '省略 displayId 时截默认屏。虚拟副屏用 list_displays 查到它的 surfaceFlingerId ' +
-      '或逻辑 displayId 后传进来即可。\n\n' +
+      '**两条内部路线，按 displayId 自动选：**\n' +
+      '  · 默认屏 / 物理屏 → 系统 `screencap`（走 SurfaceFlinger id），返回 **PNG**\n' +
+      '  · 虚拟副屏（displayId 非 0）→ 进程内 ImageReader，返回 **JPEG**\n\n' +
+      '⚠ 为什么虚拟副屏不能走 screencap：实测 `screencap -d <副屏逻辑id>` 会报\n' +
+      '`Failed to take screenshot. Display Id \'N\' is not valid.` —— 系统截图抓不到\n' +
+      '虚拟屏。副屏的帧只能由 screen_vd_start 起的那个守护进程在进程内取。\n\n' +
+      '⚠ 传非 0 的 displayId 时，它必须是**本实例启动的那块副屏**；否则明确报错\n' +
+      '（不静默改成截主屏 —— 那会让模型拿着主屏的图去点副屏的坐标）。\n\n' +
       '注意返回里的 deviceState 字段：若 displayState 不是 ON，这张图是**最后一帧旧画面**，' +
       '不能反映当前真实界面（熄屏时 screencap 不报错，这是已知的静默失败）。',
     inputSchema: {
@@ -612,12 +617,29 @@ const TOOLS = [
   {
     name: 'screen_vd_stop',
     description:
-      '**丢弃**虚拟副屏：把它上面的 App 连同当前状态一起清掉，再释放显存。不在跑时幂等返回。\n\n' +
-      '⚠ 只在"这副屏上的东西不要了"时用（比如流程走错、需要重来）。\n' +
-      '**如果想让用户接着操作**（例如留在支付界面让用户付款），千万别用这个 —— 用 screen_vd_handoff，它会把 App 连状态一起交给用户。\n\n' +
-      '实现细节(决定了它为什么"不打扰用户"): 先移除副屏上的所有 RootTask, 再释放副屏。\n' +
-      '直接释放会让 WM 把 task reparent 回主屏并置顶, 抢走用户正在用的 App —— 真机实测过。',
-    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+      '**丢弃**虚拟副屏：把它上面的 App 连同当前状态一起清掉，再释放显存。\n\n' +
+      '⚠ **副屏上有 App 时本工具默认拒绝执行**（报错说明原因），因为实测：\n' +
+      '销毁承载着 App 的副屏，用户**会看到那个 App 在主屏上闪一下**（WM 的跨屏\n' +
+      'CLOSE 过渡会把被删 task 的 surface 从副屏尺寸动到主屏尺寸上渲染）。\n' +
+      '试过"删栈期间关掉过渡动画"，用户复看**仍然闪**，所以没采用。\n\n' +
+      '于是默认行为是：\n' +
+      '  · 副屏上有 App → 拒绝，并给出两个正确选择\n' +
+      '      要留住状态 → `screen_vd_handoff`（搬回主屏，用户接手）\n' +
+      '      确实要丢   → 传 `force: true`（明确接受"会闪一下 + 状态丢失"）\n' +
+      '  · 副屏上没有 App（空屏）→ 正常销毁，全程不打扰用户\n\n' +
+      '不在跑时幂等返回。\n\n' +
+      '**agent 干完活的默认收尾是"什么都不做"**：副屏和 App 都留着，用户前台\n' +
+      '一动不动；等用户自己接手（handoff）或明确要求丢弃。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        force: {
+          type: 'boolean',
+          description: '副屏上有 App 时强制丢弃（调用方明确接受"用户屏幕上会闪一下 + App 状态丢失"）。默认 false',
+        },
+      },
+      additionalProperties: false,
+    },
   },
   {
     name: 'screen_vd_handoff',
@@ -641,7 +663,8 @@ const TOOLS = [
     name: 'screen_vd_shot',
     description:
       '截取**虚拟副屏**当前画面（JPEG），由你的视觉能力去读。\n\n' +
-      '前提：副屏已用 screen_vd_start 启动。主屏截图请用 screen_image（那条走系统 screencap）。\n' +
+      '等价于 `screen_image { displayId: <副屏的 displayId> }` —— 保留它是为了让调用方' +
+      '不必记住/回填那个 id（副屏 id 是每次 screen_vd_start 现分配的）。\n' +
       '返回图片 + 副屏几何元数据。这是"虚拟副屏上发生了什么"的直接证据 —— 读树拿不到的' +
       '自绘界面（游戏/WebView 首帧）用这条看。\n\n' +
       '也适合在交接前**确认状态**（比如确认支付界面已就绪再 handoff）。',
@@ -956,6 +979,29 @@ async function toolsCall(name, args) {
     }
 
     case 'screen_image': {
+      const requested0 = args?.displayId;
+      // 副屏分支: 系统 screencap **抓不到虚拟屏** —— 实测
+      //   screencap -d <副屏逻辑id>  → "Failed to take screenshot. Display Id 'N' is not valid."
+      // 副屏画面只能来自 VdMain 进程内的 ImageReader。契约: displayId 非 0 时必须是
+      // 本实例启动的那块副屏, 否则明确报错(不静默截主屏 —— 那是"静默错坐标")。
+      // 注意输出格式: 这条路是 JPEG(ImageReader → Bitmap.compress),
+      // 系统 screencap 那条是 PNG。
+      if (requested0 !== undefined && requested0 !== null && Number(requested0) !== 0) {
+        const bad = requireOwnVdDisplay(requested0, 'screen_image');
+        if (bad) return bad;
+        try {
+          const { jpeg, displayId, costMs, width, height } = await vdShot();
+          return {
+            text: `屏幕: displayId=${displayId}（虚拟副屏）\n` +
+              `分辨率: ${width}x${height}   大小: ${(jpeg.length / 1024).toFixed(0)} KB\n` +
+              `采集: 刚采集(进程内 ImageReader), 耗时 ${costMs} ms\n` +
+              `格式: JPEG —— 副屏走进程内 ImageReader, 系统 screencap 抓不到虚拟屏。`,
+            image: { data: jpeg.toString('base64'), mimeType: 'image/jpeg' },
+          };
+        } catch (e) {
+          return { isError: true, text: `副屏截图失败: ${e.message}` };
+        }
+      }
       // 支持逻辑 displayId 或 SurfaceFlinger id: 先按逻辑 id 查表, 查不到就当 sfId 直接用
       let sfId = null;
       let logical = null;
@@ -1099,11 +1145,13 @@ async function toolsCall(name, args) {
           : `副屏已启动: displayId=${r.displayId}, ${r.width}x${r.height}@${r.dpi}`;
         return {
           text: `${lines}\n\n接下来:\n` +
-            `  · 把 App 搬到副屏: screen_app { package, displayId: ${r.displayId} }\n` +
-            `    （已在运行的 App 会被 move-stack 整体搬运, 保留状态; 未运行的冷启动到副屏）\n` +
-            `  · 读/点/输入副屏: screen_tree、screen_tap、screen_text 传 displayId=${r.displayId}\n` +
-            `  · 看副屏画面: screen_vd_shot\n` +
-            `  · 用完释放: screen_vd_stop\n\n` +
+            `  · 把 App 放到副屏: screen_app { package, displayId: ${r.displayId} }\n` +
+            `    （即使该 App 已在主屏运行, 也会在副屏新建一个独立 task, 主屏那份不动）\n` +
+            `  · 读/点/输入副屏: screen_tree、screen_targets、screen_tap、screen_text 传 displayId=${r.displayId}\n` +
+            `  · 看副屏画面: screen_image { displayId: ${r.displayId} } 或 screen_vd_shot\n` +
+            `  · 让用户接手: screen_vd_handoff（搬回主屏, 状态不丢）\n\n` +
+            `**干完活的默认收尾是"什么都不做"** —— 副屏和 App 都留着, 用户前台一动不动。\n` +
+            `只有内容确实不要了才 screen_vd_stop（副屏上有 App 时它默认拒绝, 因为实测会闪）。\n\n` +
             `⚠ 跨屏承载依赖 LSPosed hook 生效; 没有 hook 时 screen_app 会明确报错(不会假装成功)。`,
         };
       } catch (e) {
@@ -1114,12 +1162,21 @@ async function toolsCall(name, args) {
     case 'screen_vd_stop': {
       try {
         const before = vdGet();
-        const r = await vdStop();
-        if (!r.stopped) return { text: '没有运行中的副屏（幂等）' };
+        const r = await vdStop({ force: !!args?.force });
+        if (!r.stopped) {
+          if (r.reason === 'occupied') {
+            // 默认拒绝销毁有 App 的副屏 —— 这是实测结论(会闪一下), 不是保守。
+            return { isError: true, text: r.detail };
+          }
+          return { text: '没有运行中的副屏（幂等）' };
+        }
         const cleared = (r.clearedStacks || []).filter((s) => s.ok).length;
         return {
           text: `副屏已丢弃并释放 (displayId=${r.displayId ?? '?'})\n` +
-            `已清掉副屏上的 ${cleared} 个栈 —— 副屏内容不再存在；用户主屏前台未受影响。\n` +
+            `已清掉副屏上的 ${cleared} 个栈 —— 副屏内容不再存在。\n` +
+            (r.forced
+              ? `⚠ 本次是 force 丢弃：副屏上原有的 App 连状态一起没了，且**用户屏幕上可能闪过一下那个 App**（实测存在）。\n`
+              : `用户主屏前台未受影响。\n`) +
             (cleared === 0 && before
               ? '（副屏上本来就没有 App；若有 App 请检查 am stack remove 是否生效）'
               : ''),

@@ -348,22 +348,49 @@ mCurrentFocus=... com.example.piliplus/.MainActivity     ← 主屏的焦点，�
 | 意图 | 工具 | 主屏前台 |
 |---|---|---|
 | 让用户**接手**（AI 停在支付界面，用户来付款） | `screen_vd_handoff` | 搬到主屏并置顶 —— 此时接管前台是**期望行为** |
-| 内容**不要了**（流程走错，重来） | `screen_vd_stop` | 全程不变 |
 | 还要**接着用**（AI 还没干完） | 什么都不做，副屏常驻 | 全程不变 |
+| 内容**不要了** | `screen_vd_stop` | 有 App 时**默认拒绝**（见下） |
+
+**`screen_vd_stop` 为什么会拒绝：** 实测销毁一个**承载着 App** 的副屏时，用户
+**会看到那个 App 在主屏上闪一下** —— 删栈会让 WM 跑一条跨屏 CLOSE 过渡，把被删
+task 的 surface 从副屏尺寸动到**主屏**尺寸上渲染：
+
+```
+onTransitionReady t=CLOSE r=[0@Point(0,0)]
+  ...Task #199 com.tencent.mm  sb=Rect(0,0-800,1200) eb=Rect(0,0-2608,1200) d=22->0
+```
+
+`sb`=副屏尺寸、`eb`=**主屏**尺寸、`d`=显示从 22 变到 0。用户原话："闪过去一个
+悬浮窗一样的东西，能看到是微信，闪一下就没了"。
+
+试过但**无效**的做法（已撤）：删栈期间临时把过渡动画 scale 设 0。用户复看**仍然
+闪**，那条跨屏过渡记录也仍在；而且它改的是全局设置，有副作用，所以没采用。
+
+于是契约改成：
+
+- 副屏上**有 App** → 默认**拒绝**，并给出两个正确选择：
+  要留住状态用 `screen_vd_handoff`，确实要丢传 `force: true`（明确接受"会闪一下 + 状态丢失"）
+- 副屏是**空屏** → 正常销毁，全程不打扰用户
+
+**agent 干完活的默认收尾是"什么都不做"** —— 副屏和 App 都留着，用户前台一动不动。
+这也正是参考实现（agent-mobile-use）的做法：它的模式机从不销毁副屏，`stop` 路径
+从不被正常流程调用，且 `vd.release()` 之前也不清栈。
 
 `screen_vd_handoff` 是 `move-stack <taskId> 0`：reparent **不重建 Activity**，
 所以界面停在原处（支付页还是支付页）。实测交接前后是同一个 `taskId`、同一个
 `topActivity`。
 
-### 销毁副屏为什么必须先清栈
+### 销毁副屏时"先清栈"解决了什么、没解决什么
 
 `screen_vd_stop`（以及 `VdMain.cleanup()`）的顺序是
 **先 `am stack remove` 清掉副屏上的 RootTask，再 release 副屏**。
 
-直接 release 时 WM 会把 task reparent 回 display 0 **且置顶**
-（AOSP 的 `moveRootTaskToDisplay` 固定 `onTop=true`），用户正在用的 App 被顶掉。
-实测：用户在看 piliplus、副屏跑着设置，直接释放 → 前台立刻变成设置。
-清栈后再释放 → 前台逐字未变。
+- **解决的**：直接 release 时 WM 会把 task reparent 回 display 0 **且置顶**
+  （AOSP 的 `moveRootTaskToDisplay` 固定 `onTop=true`），用户正在用的 App 被顶掉。
+  实测：用户在看 piliplus、副屏跑着设置，直接释放 → 前台立刻变成设置。
+- **没解决的**：删栈本身仍会触发一条跨屏 CLOSE 过渡，用户**仍会看到那个 App
+  闪一下**（见上一节的 logcat 证据）。所以最终结论不是"清栈就干净了"，而是
+  **有 App 就不销毁**。
 
 ### 跨屏承载的前置条件：LSPosed hook
 
