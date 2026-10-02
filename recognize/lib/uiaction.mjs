@@ -698,7 +698,21 @@ export async function topPackageOnDisplay(displayId) {
   return null;
 }
 
-/** 副屏截图: JPEG Buffer + 元信息。 */export async function vdShot({ maxAgeMs = 0 } = {}) {
+/**
+ * 副屏截图: JPEG Buffer + 元信息。
+ *
+ * 历史(排查报告 workspace/123 钉死的一条缺陷, 已修):
+ *   VdMain 曾把 PixelFormat.RGBA_8888 的缓冲区按 A,R,G,B 读, 于是 alpha 槽
+ *   装进真值 R, 再被 premultiply 一次, 产出确定性色彩变换
+ *   (红变蓝、绿变黑、暗部发紫; 白色是不动点所以"白字看着正常")。
+ *   修好后本函数不再需要额外色彩校正 —— 若将来又出现通道错位, 用
+ *   (255,0,0) 投到副屏采一次: 采到 (255,0,0) 才对, 采到 (0,0,254) 即复发。
+ *
+ * 注: 这里**不再**声明 maxAgeMs。原先声明了却从未使用, 是个骗人的死参数
+ * (调用方传了以为有用)。副屏帧是请求时才取的, 没有缓存可复用, 所以本函数
+ * 天然只返回"刚取的那一帧"。
+ */
+export async function vdShot() {
   return vdChainRun(async () => {
     if (!vdChild || !vdInfo) throw new Error('副屏未运行。先 screen_vd_start。');
     const outPath = `/data/local/tmp/dsh-vd-shot-${Date.now().toString(36)}.jpg`;
@@ -711,7 +725,12 @@ export async function topPackageOnDisplay(displayId) {
     if (jpeg.length < 3 || jpeg[0] !== 0xFF || jpeg[1] !== 0xD8) {
       throw new Error(`截图不是合法 JPEG (${jpeg.length} B)`);
     }
-    return { jpeg, displayId: vdInfo.displayId, costMs: json.cost_ms, width: vdInfo.width, height: vdInfo.height };
+    // 无缓存可复用: 每一帧都是本次现取的, 如实报为不一致于主屏的语义
+    return {
+      jpeg, displayId: vdInfo.displayId, costMs: json.cost_ms,
+      width: vdInfo.width, height: vdInfo.height,
+      fromCache: false, frameTimestamp: Date.now(),
+    };
   });
 }
 
@@ -862,14 +881,24 @@ export async function launchOnDisplay(displayId, pkg, activity = null, { timeout
   }
 
   // 复核: 目标屏上真的出现了该包的 task 吗(不靠命令退出码 —— 它可能为 0 而实际没动)
-  await new Promise((res) => setTimeout(res, 1200));
-  const after = await findTasks(pkg);
-  const onTarget = after.find((t) => t.displayId === target);
+  //
+  // ⚠ 这里原本只 sleep 1200ms 就查一次, 会**假阴性**: task 注册晚于 am 返回时,
+  //   明明已经上屏了却报 `launch-not-on-target`(排查报告 §4.1 实测: 同一时刻
+  //   screen_targets 读到 93 个节点、com.android.browser 确在副屏)。
+  //   改成轮询等待: 最多 ~9s, 每 600ms 一次, 命中即返回。
+  let onTarget = null;
+  for (let i = 0; i < 15; i++) {
+    await new Promise((res) => setTimeout(res, 600));
+    const after = await findTasks(pkg);
+    onTarget = after.find((t) => t.displayId === target);
+    if (onTarget) break;
+  }
   if (!onTarget) {
+    const after = await findTasks(pkg);
     return {
       ok: false, method: 'am-start-multiple', displayId: target,
       output: out.slice(0, 300), error: 'launch-not-on-target',
-      detail: `命令已发但 display ${target} 上没有 ${pkg} 的 task。` +
+      detail: `命令已发但等了 ~9s, display ${target} 上仍没有 ${pkg} 的 task。` +
         `当前该包 task: ${after.map((t) => `#${t.taskId}@d${t.displayId}`).join(', ') || '(无)'}`,
     };
   }
