@@ -6,7 +6,7 @@
 //
 // 用法: node test-uiaction.mjs   (在 recognize/ 下)
 import assert from 'node:assert/strict';
-import { physicalInput, _a11yList, DEX_PATH } from './lib/uiaction.mjs';
+import { physicalInput, _a11yList, _vdGeom, DEX_PATH } from './lib/uiaction.mjs';
 import fs from 'node:fs';
 
 let passed = 0;
@@ -135,6 +135,66 @@ const spawnEnv = await import('./lib/spawn-env.mjs');
   }
   t('不传 spawnImpl 时 runCommand 仍能执行(默认 execFile)', () => {
     assert.ok(ok, errMsg + ' ← 默认实现坏了, 真机上所有子进程调用都会挂');
+  });
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 副屏宽度夹取 (真机 regression)
+//
+// 症状: 副屏宽度 ≠ 主屏宽度时, **主屏桌面**的大时钟按 (副屏宽/主屏宽) 缩放,
+// 且不自愈 —— 用户看到"时钟被切掉一位"(如 18:17 的 7 只剩右半)。
+// 实测数据(小米 25102RKBEC / Android 16, 主屏 1200x2608@480):
+//     1200x2608@480 → 时钟高 326(正常)   1200x2608@320 → 326(正常, 密度无关)
+//     1200x1200@480 → 326(正常, 高度无关)  800x1200@480 → 217(异常)
+//     217/326 = 0.666 ≈ 800/1200 ← 只有宽度参与
+// 所以 vdStart 必须把 width 夹到主屏宽度, 高度同比缩放。
+console.log('');
+console.log('副屏几何: 宽度夹取 (真机 regression 回归)');
+{
+  const g = _vdGeom;
+
+  t('宽度与主屏一致 → 原样不动', () => {
+    const r = g.snapWidthToMain(1200, 2608, 1200);
+    assert.equal(r.snapped, false);
+    assert.equal(r.width, 1200);
+    assert.equal(r.height, 2608);
+  });
+
+  t('宽度 800 / 主屏 1200 → 夹到 1200, 高度同比放大', () => {
+    // 800x1200 → 1200x1800 (ratio 1.5), 保住调用方的宽高比
+    const r = g.snapWidthToMain(800, 1200, 1200);
+    assert.equal(r.snapped, true);
+    assert.equal(r.width, 1200);
+    assert.equal(r.height, 1800);
+    assert.equal(r.ratio, 1.5);
+  });
+
+  t('宽度大于主屏 → 同样夹回来(等比缩小高度)', () => {
+    const r = g.snapWidthToMain(2400, 5200, 1200);
+    assert.equal(r.snapped, true);
+    assert.equal(r.width, 1200);
+    assert.equal(r.height, 2600);
+    assert.equal(r.ratio, 0.5);
+  });
+
+  t('高度取整后不会变成 0(极小值兜底)', () => {
+    const r = g.snapWidthToMain(1200_0000, 1, 1200);
+    assert.equal(r.width, 1200);
+    assert.ok(r.height >= 1, `height=${r.height} 应 >= 1`);
+  });
+
+  t('拿不到主屏宽度 → 原样返回, 不瞎猜', () => {
+    for (const bad of [null, undefined, NaN, 0, -1]) {
+      const r = g.snapWidthToMain(800, 1200, bad);
+      assert.equal(r.snapped, false, `mainWidth=${bad} 不该夹取`);
+      assert.equal(r.width, 800);
+      assert.equal(r.height, 1200);
+    }
+  });
+
+  t('宽度本身非法 → 不夹(交给调用方的完整性检查报错)', () => {
+    const r = g.snapWidthToMain(NaN, 1200, 1200);
+    assert.equal(r.snapped, false);
   });
 }
 
