@@ -310,6 +310,33 @@ export async function injectText(displayId, text, { timeout = 45000, mode = 'rep
 /** 供测试: 服务列表的纯函数(合并/摘除/判定)。 */
 export const _a11yList = { hasService, mergeService, removeService };
 
+/**
+ * 把副屏宽度夹到主屏宽度, 高度按同比缩放。
+ *
+ * 为什么必须这样: 真机实测, 副屏宽度 ≠ 主屏宽度时**主屏桌面**的大时钟会按
+ * (副屏宽/主屏宽) 缩放且不自愈 —— 用户看到"时钟被切掉一位"。
+ * 尺寸与密度都不参与触发(1200x1200@480 与 1200x2608@320 都正常)。
+ *
+ * 拿不到主屏宽度(或值不合理)时**原样返回**, 不猜。
+ * @returns {{width:number,height:number,snapped:boolean,ratio?:number}}
+ */
+export function snapWidthToMain(width, height, mainWidth) {
+  const w = Number(width), h = Number(height), mw = Number(mainWidth);
+  if (!Number.isFinite(mw) || mw <= 0) return { width: w, height: h, snapped: false };
+  if (!Number.isFinite(w) || w === mw) return { width: w, height: h, snapped: false };
+  const ratio = mw / w;
+  return {
+    width: mw,
+    height: Math.max(1, Math.round(h * ratio)),
+    snapped: true,
+    ratio,
+  };
+}
+
+/** 供测试: 副屏几何的纯函数。 */
+export const _vdGeom = { snapWidthToMain };
+
+
 // ═══════════════════════ 虚拟副屏 (PR B) ═══════════════════════
 //
 // 形状与动作层不同: 副屏守护进程必须**常驻**(它持有 VirtualDisplay),
@@ -380,14 +407,8 @@ function vdStatusJson() {
  */
 export async function vdStart(width, height, dpi) {
   return vdChainRun(async () => {
-    if (vdChild) {
-      const same = vdInfo && vdInfo.width === width && vdInfo.height === height && vdInfo.dpi === dpi;
-      if (same) return { ...vdInfo, already: true };
-      throw new Error(
-        `本实例已有一块副屏 (displayId=${vdInfo?.displayId}, ${vdInfo?.width}x${vdInfo?.height})。` +
-        `不同尺寸请先 screen_vd_stop。`,
-      );
-    }
+    // 宽度被夹到主屏宽度时记下原始请求值(供结果回传)。
+    let widthSnappedFrom = null;
     if (!fs.existsSync(DEX_PATH)) {
       const e = new Error(DEX_MISSING_HINT);
       e.code = 'dex-missing';
@@ -397,21 +418,58 @@ export async function vdStart(width, height, dpi) {
     // 真实几何: 从物理屏推导(与 runner 一样不依赖 root; wm 是系统二进制)。
     // 调用方显式给了三个值就用给定的; 缺哪个补哪个。
     let w = width, h = height, d = dpi;
-    if (w == null || h == null || d == null) {
-      try {
-        const [sz, den] = await Promise.all([
-          run('/system/bin/wm', ['size']),
-          run('/system/bin/wm', ['density']),
-        ]);
-        const pm = sz.stdout.match(/(\d+)x(\d+)/);
-        const pd = den.stdout.match(/(\d+)/);
-        if (w == null && pm) w = Number(pm[1]);
-        if (h == null && pm) h = Number(pm[2]);
-        if (d == null && pd) d = Number(pd[1]);
-      } catch { /* 全部显式给值时不需要 */ }
-    }
+    let mainW = null, mainH = null, mainDpi = null;
+    try {
+      const [sz, den] = await Promise.all([
+        run('/system/bin/wm', ['size']),
+        run('/system/bin/wm', ['density']),
+      ]);
+      const pm = sz.stdout.match(/(\d+)x(\d+)/);
+      const pd = den.stdout.match(/(\d+)/);
+      if (pm) { mainW = Number(pm[1]); mainH = Number(pm[2]); }
+      if (pd) mainDpi = Number(pd[1]);
+    } catch { /* 拿不到就退化: 只信调用方给的值 */ }
+    if (w == null) w = mainW;
+    if (h == null) h = mainH;
+    if (d == null) d = mainDpi;
     if (!Number.isFinite(w) || !Number.isFinite(h) || !Number.isFinite(d)) {
       throw new Error(`副屏几何不完整: ${w}x${h}@${d} —— 传 width/height/dpi 或让设备端推导`);
+    }
+
+    // ⚠ 副屏宽度必须与主屏一致，否则会**改坏主屏桌面**（真机实测，见下）
+    // ─────────────────────────────────────────────────────────────
+    // 现象: 副屏宽度 ≠ 主屏宽度时, 主屏桌面的大时钟/日期组件会按
+    //       (副屏宽 / 主屏宽) 缩放, 且**不会自动恢复**。用户看到的是
+    //       "时钟被切掉一位"(如 18:17 的 7 只剩右半)。
+    // 实测(小米 25102RKBEC / Android 16, 主屏 1200x2608@480):
+    //       副屏 1200x2608@480 → 时钟高 326 (正常)
+    //       副屏 1200x2608@320 → 时钟高 326 (正常) ← 密度无关
+    //       副屏 1200x1200@480 → 时钟高 326 (正常) ← 高度无关
+    //       副屏  800x1200@480 → 时钟高 217 (异常) ← 宽度 800/1200 = 0.667
+    //       217 / 326 = 0.666 ≈ 800 / 1200
+    // 机制: 创建/销毁副屏会让 MIUI 的 AutoDensityController 重算 display 0
+    //       的配置(logcat: "on display changed 0 context dpi:478 origin dpi:480"),
+    //       桌面据此重新布局; 副屏宽度参与了这次重算。
+    // 因此: 把宽度**夹到主屏宽度**, 高度按原比例同比缩放(保住调用方要的宽高比),
+    //       于是"省显存"仍然可用 —— 只能靠压高度/密度, 不能压宽度。
+    const snapped = snapWidthToMain(w, h, mainW);
+    if (snapped.snapped) {
+      widthSnappedFrom = { width: w, height: h };
+      w = snapped.width;
+      h = snapped.height;
+    }
+
+    // 幂等: 已在跑且**解析后**的几何一致 → 直接返回现有信息。
+    // 必须放在几何解析之后 —— 否则 `screen_vd_start` 不带参数调用第二次时,
+    // 会拿 null 去和 vdInfo.width(1200) 比, 误判成"不同尺寸"而报错。
+    if (vdChild) {
+      if (vdInfo && vdInfo.width === w && vdInfo.height === h && vdInfo.dpi === d) {
+        return { ...vdInfo, already: true };
+      }
+      throw new Error(
+        `本实例已有一块副屏 (displayId=${vdInfo?.displayId}, ${vdInfo?.width}x${vdInfo?.height}@${vdInfo?.dpi})。` +
+        `不同尺寸请先 screen_vd_stop。`,
+      );
     }
 
     // 孤儿回收: 状态文件 running 且那个进程还活着 —— 但它不是**本实例**的
@@ -475,6 +533,7 @@ export async function vdStart(width, height, dpi) {
       throw new Error(`副屏 READY 但状态文件异常: ${JSON.stringify(st)}`);
     }
     vdInfo = { displayId: st.display_id, width: st.width, height: st.height, dpi: st.dpi };
+    if (widthSnappedFrom) vdInfo.widthSnappedFrom = widthSnappedFrom;
 
     // 记录用户此刻在主屏上的前台 App —— 给"守护进程猝死"兜底用。
     // 只记第一次(后面几轮 vdStart 若已在跑会 early return, 不会覆盖)。

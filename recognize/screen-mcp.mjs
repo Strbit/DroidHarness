@@ -602,13 +602,17 @@ const TOOLS = [
       '用途：自动化操作在副屏上进行，**不干扰用户正在用的主屏**。副屏上可以启动任意 App、' +
       '读树（screen_tree/displayId）、点击（screen_tap/displayId）、注入文字（screen_text/displayId）、' +
       '截图（screen_vd_shot）。\n\n' +
-      '几何参数省略时自动取物理屏的宽高与密度（推荐）；也可以显式指定更小的尺寸（省显存）。\n' +
+      '几何参数省略时自动取物理屏的宽高与密度（推荐）。\n\n' +
+      '⚠ **width 必须等于主屏宽度**：真机实测，副屏宽度 ≠ 主屏宽度时，**主屏桌面**的大时钟会按\n' +
+      '(副屏宽/主屏宽) 缩放且不自愈（用户看到"时钟被切掉一位"）。所以传了不同的 width 会被\n' +
+      '自动夹到主屏宽度，height 同比缩放，并如实告知。**要省显存请压 height/dpi，不要压 width。**\n' +
+      '（实测：1200x2608@320 与 1200x1200@480 都无副作用，800x1200@480 会触发。）\n\n' +
       '本 MCP 实例同一时间只支持一块副屏；换尺寸先 stop。MCP 服务退出时副屏随之销毁。',
     inputSchema: {
       type: 'object',
       properties: {
-        width: { type: 'number', description: '副屏宽（像素）。省略=物理屏宽' },
-        height: { type: 'number', description: '副屏高（像素）。省略=物理屏高' },
+        width: { type: 'number', description: '副屏宽（像素）。省略=物理屏宽。**与主屏不同会被自动夹到主屏宽度**（见工具说明）' },
+        height: { type: 'number', description: '副屏高（像素）。省略=物理屏高。省显存请压这里' },
         dpi: { type: 'number', description: '副屏密度。省略=物理屏密度' },
       },
       additionalProperties: false,
@@ -1155,8 +1159,13 @@ async function toolsCall(name, args) {
         const lines = r.already
           ? `副屏已在运行 (幂等返回): displayId=${r.displayId}, ${r.width}x${r.height}@${r.dpi}`
           : `副屏已启动: displayId=${r.displayId}, ${r.width}x${r.height}@${r.dpi}`;
+        const snapped = r.widthSnappedFrom
+          ? `\n⚠ 你请求的宽度 ${r.widthSnappedFrom.width} 与主屏宽度不同, 已改为 ${r.width}` +
+            `（高度同比缩放为 ${r.height}）。原因: 真机实测副屏宽度 ≠ 主屏宽度会让**主屏桌面**` +
+            `的大时钟按 (副屏宽/主屏宽) 缩放且不自愈。省显存请改压 height/dpi, 不要压 width。`
+          : '';
         return {
-          text: `${lines}\n\n接下来:\n` +
+          text: `${lines}${snapped}\n\n接下来:\n` +
             `  · 把 App 放到副屏: screen_app { package, displayId: ${r.displayId} }\n` +
             `    （即使该 App 已在主屏运行, 也会在副屏新建一个独立 task, 主屏那份不动）\n` +
             `  · 读/点/输入副屏: screen_tree、screen_targets、screen_tap、screen_text 传 displayId=${r.displayId}\n` +
