@@ -76,6 +76,12 @@ public final class VdMain {
         // serveLoop 末尾的 cleanup() 覆盖 EOF/quit, 钩子覆盖信号 —— 两条路都要
         // "先清栈再 release", 否则用户前台会被抢。SIGKILL 捕获不到, 由 JS 侧
         // 的前台守卫兜底(见 recognize/lib/uiaction.mjs 的 vdStart 退出监听)。
+        //
+        // ⚠ 钩子里同样要过"有 App 就拒绝清理"这道闸: SIGTERM 是 JS 侧
+        //   `child.kill()` 走的路径, 绕开它就会重演"删用户 task / 抢用户前台"。
+        //   钩子**不能阻止退出**(SIGTERM 已经在退了), 但可以做到**不动 App 栈** ——
+        //   只清 home 栈, App 栈留给 WM reparent(抢一次前台), 至少数据不丢。
+        //   "完全不抢前台"那条路由 serveLoop 的拒绝退出覆盖(它不走到钩子)。
         try {
             Runtime.getRuntime().addShutdownHook(new Thread(new Runnable() {
                 @Override public void run() { cleanup(); }
@@ -199,7 +205,11 @@ public final class VdMain {
         while ((line = in.readLine()) != null) {
             line = line.trim();
             if (line.isEmpty()) continue;
-            if ("quit".equals(line) || "exit".equals(line)) break;
+            if ("quit".equals(line) || "exit".equals(line)) {
+                // ⚠ 有真实 App 时**拒绝退出**（详见 refuseExitIfOccupied 的说明）。
+                if (refuseExitIfOccupied()) continue;
+                break;
+            }
             if ("ping".equals(line)) { System.out.println("pong\n<<<VD_END>>>"); System.out.flush(); continue; }
             if (line.startsWith("shot ")) {
                 String[] p = line.split(" ");
@@ -220,6 +230,16 @@ public final class VdMain {
             }
             System.out.println("{\"ok\":false,\"error\":\"unknown command: " + esc(line) + "\"}\n<<<VD_END>>>");
             System.out.flush();
+        }
+        // stdin EOF(父进程死了/管道断了)是**意外**退出, 同样要过这道闸 ——
+        // 否则测试脚本一 process.exit, 用户前台就被 reparent 抢掉(实测事故)。
+        if (refuseExitIfOccupied()) {
+            // 拒绝退出: 不能再读 stdin(已 EOF), 但**保持进程存活**,
+            // 让副屏与上面的 App 都留在原地。外部要收掉它就显式 handoff。
+            System.err.println("[VdMain] stdin EOF 但副屏上有 App —— 拒绝退出, 进程保持存活");
+            while (true) {
+                try { Thread.sleep(3600_000L); } catch (InterruptedException ignored) { }
+            }
         }
         cleanup();
         status("stopped", -1);
@@ -311,21 +331,87 @@ public final class VdMain {
         }
     }
 
+    /** 列出某块屏上**非 home** 类型的 RootTask id（真实 App 的栈）。 */
+    private static java.util.List<String> appStacksOnDisplay(int displayId) {
+        java.util.List<String> ids = new java.util.ArrayList<String>();
+        if (displayId < 0) return ids;
+        try {
+            java.util.regex.Pattern patRoot =
+                    java.util.regex.Pattern.compile("^RootTask id=(\\d+).*displayId=(\\d+)");
+            java.util.regex.Pattern patHome =
+                    java.util.regex.Pattern.compile("mActivityType=home\\b");
+            Process p = new ProcessBuilder("/system/bin/cmd", "activity", "stack", "list")
+                    .redirectErrorStream(true).start();
+            java.io.BufferedReader r = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8));
+            String line;
+            String curId = null;
+            boolean curHome = false;
+            while ((line = r.readLine()) != null) {
+                java.util.regex.Matcher m = patRoot.matcher(line);
+                if (m.find()) {
+                    if (curId != null && !curHome) ids.add(curId);
+                    curHome = false;
+                    curId = (Integer.parseInt(m.group(2)) == displayId) ? m.group(1) : null;
+                    continue;
+                }
+                if (curId != null && !curHome && patHome.matcher(line).find()) curHome = true;
+            }
+            if (curId != null && !curHome) ids.add(curId);
+            r.close();
+            p.waitFor();
+        } catch (Throwable t) {
+            System.err.println("[VdMain] appStacksOnDisplay failed: " + t);
+        }
+        return ids;
+    }
+
+    /**
+     * 副屏上还有真实 App 时**拒绝退出**。返回 true 表示"已拒绝"。
+     *
+     * 为什么必须拒绝（真机实测，两种收尾都不可接受）:
+     *   · 退出前**清掉** App 栈 → `am stack remove` 会真的删掉那些 task。
+     *     而 `screen_app` 现在会把**用户主屏的 task 迁移**到副屏，所以删的是
+     *     **用户自己的任务**。实测事故: `Destroy ... Task #27 com.tencent.mm`
+     *     → 用户微信界面消失。
+     *   · 退出前**保留** App 栈 → `vd.release()` 时 WM 把它们 reparent 回 display 0
+     *     且 onTop=true(AOSP 的 moveRootTaskToDisplay 固定置顶) → **抢用户前台**。
+     *     实测: 连跑三轮测试, 用户前台被连抢三次。
+     *
+     * 两者都不行, 所以答案是**不退**: 既不删栈也不 release, 副屏与 App 原地留存。
+     * 要收掉它就显式 `screen_vd_handoff`(搬回主屏交给用户), 或用户自己关掉那个 App。
+     *
+     * 只有"副屏上只剩它自己的 home 栈"时才允许退出 —— 那种情况清栈无害,
+     * 且必须清(否则 release 时 home 栈被 reparent 回 display 0 同样抢前台)。
+     */
+    private static boolean refuseExitIfOccupied() {
+        java.util.List<String> apps = appStacksOnDisplay(sDisplayId);
+        if (apps.isEmpty()) return false;
+        System.err.println("[VdMain] 拒绝退出: 副屏(display " + sDisplayId + ") 上还有 "
+                + apps.size() + " 个真实 App 栈 " + apps
+                + " —— 删它会毁用户数据, 保留它 release 会抢用户前台。"
+                + " 请显式 handoff 或先关掉那些 App。");
+        return true;
+    }
+
     private static void cleanup() {
         if (sCleaned) return;
         sCleaned = true;
 
-        // ⚠⚠ **必须先删掉副屏上的栈, 再 release** ⚠⚠
+        // ⚠⚠ **必须先处理副屏上的栈, 再 release** ⚠⚠
         // ────────────────────────────────────────────────
         // 直接 release 时, WindowManager 会把它承载的 RootTask reparent 回
         // display 0 **且置顶**(AOSP 的 moveRootTaskToDisplay 固定 onTop=true),
         // 于是用户正在用的 App 被顶掉。真机实测: 用户在看 piliplus, 副屏上跑
         // 着设置, 守护进程一退出, 前台立刻变成"设置" —— 这正是用户报的
         // "为什么 App 会跳回主屏"。
-        // 先把副屏上的栈 remove 掉(task 随栈销毁, 没有东西需要 reparent),
-        // 再释放副屏, 用户前台就一点都不动。实测三阶段前台逐字未变。
-        // JS 侧 vdStop() 里的顺序与这里一致, 两处都改才能覆盖所有退出路径。
-        removeStacksOnDisplay(sDisplayId);
+        //
+        // 但**只能删我们自己建的 home 栈**, 真实 App 的栈一律不碰 ——
+        // 因为 screen_app 现在会把你主屏的 task 迁移到副屏, 那些栈里装的是
+        // **用户自己的任务**。删了它就是删用户的数据(实测事故, 见下)。
+        // 保留 App 栈的代价是 release 时它们会被 reparent 回主屏、抢一次前台,
+        // 但任务和状态都在 —— 比数据被删轻得多。
+        removeStacksOnDisplay(sDisplayId, /* onlyHome= */ true);
 
         try { if (sHeldImage != null) sHeldImage.close(); } catch (Throwable ignored) {}
         sHeldImage = null;
@@ -336,37 +422,68 @@ public final class VdMain {
     }
 
     /**
-     * 清掉指定屏上的所有 RootTask(用 `am stack remove`)。
+     * 清掉指定屏上的 RootTask。
      *
-     * 为什么不直接调 ActivityTaskManager: 本进程是 app_process(shell/root 身份),
-     * 没有 system_server 内的 Binder 句柄; 而 `am stack remove` 走的就是
-     * ActivityManagerShellCommand, 是这类操作的正规入口(实测有效, 见真机日志
-     * "cleared 2 stack(s) on display N")。
+     * `onlyHome=true` 时**只删 home 类型栈** —— 也就是 MIUI 给每块新屏自动建的那个
+     * `SecondaryDisplayLauncher`，属于我们这块屏自己的东西。**真实 App 的栈一律不碰。**
+     *
+     * ⚠ 为什么必须区分（实测事故，2026-10-05）:
+     *   `screen_app` 改成"已有 task 就迁移"之后，副屏上承载的可能是**用户自己主屏的
+     *   task**（同一个 task 被 move-stack 搬过来）。此时若还按老逻辑"删掉副屏上所有栈"，
+     *   守护进程一退出就会**把用户的 task 删掉**。实测日志:
+     *     Destroy timeout of remove-task, attempt to kill Task #27 com.tencent.mm
+     *     onTransitionReady t=CLOSE ... Task{m=CLOSE ... d=2->0}
+     *   用户看到的是"微信画面闪一下"，而且那个 task 真的没了。
+     *   改造前这行是安全的（副屏上的栈都是我们自己用 MULTIPLE_TASK 建的），
+     *   引入迁移之后就不再安全 —— 这是随迁移一起引入的回归。
+     *
+     * 保留 home 栈的删除仍然必要: 不删它，release 时它会被 reparent 回 display 0
+     * （WM 的 moveRootTaskToDisplay 固定 onTop=true），把用户前台顶掉。
+     *
+     * 不删真实 App 栈的代价: release 时它们同样会被 reparent 回主屏（会抢一次前台），
+     * 但**任务与状态都还在**。相比之下"数据被删掉"严重得多，所以选这个。
      */
-    private static void removeStacksOnDisplay(int displayId) {
+    private static void removeStacksOnDisplay(int displayId, boolean onlyHome) {
         if (displayId < 0) return;
         try {
             java.util.List<String> ids = new java.util.ArrayList<String>();
-            java.util.regex.Pattern pat =
+            java.util.regex.Pattern patRoot =
                     java.util.regex.Pattern.compile("^RootTask id=(\\d+).*displayId=(\\d+)");
+            java.util.regex.Pattern patHome =
+                    java.util.regex.Pattern.compile("mActivityType=home\\b");
             Process p = new ProcessBuilder("/system/bin/cmd", "activity", "stack", "list")
                     .redirectErrorStream(true).start();
             java.io.BufferedReader r = new java.io.BufferedReader(
                     new java.io.InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8));
             String line;
+            // 每个 RootTask 的 `mActivityType=` 出现在紧跟其后的 configuration 行里，
+            // 所以要等看到下一段才敢判定上一段是不是 home。
+            String curId = null;
+            boolean curHome = false;
             while ((line = r.readLine()) != null) {
-                java.util.regex.Matcher m = pat.matcher(line);
-                if (m.find() && Integer.parseInt(m.group(2)) == displayId) {
-                    ids.add(m.group(1));
+                java.util.regex.Matcher m = patRoot.matcher(line);
+                if (m.find()) {
+                    // 结算上一段
+                    if (curId != null && (!onlyHome || curHome)) ids.add(curId);
+                    curHome = false;
+                    if (Integer.parseInt(m.group(2)) == displayId) {
+                        curId = m.group(1);
+                    } else {
+                        curId = null;   // 不在目标屏, 这一段不用管
+                    }
+                    continue;
                 }
+                if (curId != null && !curHome && patHome.matcher(line).find()) curHome = true;
             }
+            if (curId != null && (!onlyHome || curHome)) ids.add(curId);
             r.close();
             p.waitFor();
             for (String id : ids) {
                 new ProcessBuilder("/system/bin/am", "stack", "remove", id)
                         .redirectErrorStream(true).start().waitFor();
             }
-            System.err.println("[VdMain] cleared " + ids.size() + " stack(s) on display " + displayId);
+            System.err.println("[VdMain] cleared " + ids.size() + " stack(s) on display " + displayId
+                    + (onlyHome ? " (仅 home 栈; 真实 App 栈保留)" : ""));
         } catch (Throwable t) {
             System.err.println("[VdMain] clear stacks failed: " + t);
         }

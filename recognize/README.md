@@ -403,17 +403,67 @@ onTransitionReady t=CLOSE r=[0@Point(0,0)]
 
 于是契约改成：
 
-- 副屏上**有 App** → 默认**拒绝**，并给出两个正确选择：
-  要留住状态用 `screen_vd_handoff`，确实要丢传 `force: true`（明确接受"会闪一下 + 状态丢失"）
-- 副屏是**空屏** → 正常销毁，全程不打扰用户
+- 副屏上**有 App** → **拒绝**销毁，**`force` 也不放行**（理由见下）
+- 副屏是**空屏**（只剩它自己的 home 栈）→ 正常销毁，不打扰用户
 
 **agent 干完活的默认收尾是"什么都不做"** —— 副屏和 App 都留着，用户前台一动不动。
 这也正是参考实现（agent-mobile-use）的做法：它的模式机从不销毁副屏，`stop` 路径
 从不被正常流程调用，且 `vd.release()` 之前也不清栈。
 
-`screen_vd_handoff` 是 `move-stack <taskId> 0`：reparent **不重建 Activity**，
+#### ⚠⚠ 为什么 `force` 也被取消了（2026-10-05 实测事故）
+
+`screen_app` 改成"已有 task 就迁移"之后，**副屏上承载的很可能是用户自己主屏的 task**
+（同一个 task 被 `move-stack` 搬过来）。此时"销毁副屏" = **删掉用户的 task**：
+
+```
+Destroy timeout of remove-task, attempt to kill Task #27 com.tencent.mm
+onTransitionReady t=CLOSE ... Task #27 m=CLOSE ... d=2->0
+```
+
+用户看到"微信闪一下"，而且那个 task **真的没了**（进程还在，界面消失）。
+
+**改造前这条路径是安全的** —— 副屏上的栈都是我们自己用 `MULTIPLE_TASK` 建的，删了
+无所谓；引入迁移之后它变成了"删用户数据"。
+
+#### 最终方案：有 App 时**守护进程拒绝退出**
+
+两种收尾代价都不可接受，所以答案是**不退**：
+
+| 收尾方式 | 代价 |
+|---|---|
+| 退出前**清掉** App 栈 | ❌ `am stack remove` 真删 task → **毁用户数据** |
+| 退出前**保留** App 栈 | ❌ `vd.release()` 把它们 reparent 回 display 0 且 `onTop=true` → **抢用户前台**（实测连跑三轮测试，用户前台被连抢三次） |
+| **不退出**（采用） | ✅ 数据不丢、前台不动；代价是副屏常驻，直到用户接手或自己关掉那个 App |
+
+实现（`VdMain.serveLoop`）：
+
+- 收到 `quit`/`exit` 或 **stdin EOF** 时调 `refuseExitIfOccupied()`：副屏上还有
+  非 home 栈就**拒绝退出**，进程 sleep 保持存活（副屏与 App 原地留存）
+- 只有"副屏上只剩它自己的 home 栈"才允许退出 —— 那时清栈无害，且**必须**清
+  （否则 release 时 home 栈被 reparent 回 display 0 同样抢前台）
+- `cleanup()` 只删 **home 栈**（`removeStacksOnDisplay(id, onlyHome=true)`），
+  真实 App 栈一律保留；`Runtime.halt()` 跳过 shutdown hook，所以 SIGTERM 那条路
+  也要过同一道闸（它不能阻止退出，但做到**不动 App 栈**）
+
+`vdStop`：副屏上有真实 App 就拒绝，**不看 `force`**（丢的不是"我们造的副本"，
+这个责任不能由调用方一句 `force` 承担）。要腾出副屏：让用户接手
+（`screen_vd_handoff`）或让用户自己关掉那个 App。
+
+真机验证（修复后）：
+
+```
+[0] 迁移前  微信 display=0    主屏前台=piliplus/.MainActivity t41
+[2] move-stack taskId=45      微信 display=6（副屏）
+[4] node 退出 → 守护进程 stdin EOF
+    → VdMain 仍存活 (PID 15226)   副屏仍在   微信 task 45 仍在
+    → 前台 = piliplus/.MainActivity t41  **逐字未变**
+    → 无 reparent / 无 Destroy 痕迹
+```
+
+`screen_vd_handoff` 是 `move-stack <rootTaskId> 0`：reparent **不重建 Activity**，
 所以界面停在原处（支付页还是支付页）。实测交接前后是同一个 `taskId`、同一个
-`topActivity`。
+`topActivity`。（注意它搬的是 **rootTaskId**，多数情况与 taskId 同号但不保证 ——
+实测副屏桌面是 RootTask 100 / taskId 101。）
 
 ### 销毁副屏时"先清栈"解决了什么、没解决什么
 
@@ -426,6 +476,11 @@ onTransitionReady t=CLOSE r=[0@Point(0,0)]
 - **没解决的**：删栈本身仍会触发一条跨屏 CLOSE 过渡，用户**仍会看到那个 App
   闪一下**（见上一节的 logcat 证据）。所以最终结论不是"清栈就干净了"，而是
   **有 App 就不销毁**。
+- **⚠ 而且"清栈"现在只清 home 栈**：`screen_app` 会迁移用户主屏的 task 到副屏，
+  无条件清栈等于删用户的 task（实测事故，见上一节）。所以
+  `removeStacksOnDisplay(id, onlyHome=true)` / `vdStop` 都**只碰副屏自己的 home 栈**。
+  迁移来的 App 栈保留 → release 时它们被 reparent 回主屏并抢一次前台，
+  但**任务与状态还在**。这个取舍是刻意的：抢前台可恢复，数据删了不可恢复。
 
 ### 跨屏承载的前置条件：LSPosed hook
 

@@ -633,34 +633,53 @@ export async function appsOnDisplay(displayId) {
 //   而 agent 干完活的**默认收尾是什么都不做**: 副屏和 App 都留着, 用户前台
 //   一动不动。这也正是参考实现(agent-mobile-use)的做法 —— 它的 stop 路径
 //   从不被正常流程调用, `vd.release()` 之前也不清栈。
+//
+// ⚠⚠ 2026-10-05 事故补充: `force: true` 这条路**对迁移来的 task 也不安全**
+// ─────────────────────────────────────────────────────────────────
+// `screen_app` 改成"已有 task 就迁移"之后, 副屏上承载的很可能是**用户自己主屏的
+// task**(同一个 task 被 move-stack 搬过来)。此时"销毁副屏" = **删掉用户的 task**。
+// 实测事故(logcat):
+//     Destroy timeout of remove-task, attempt to kill Task #27 com.tencent.mm
+//     onTransitionReady t=CLOSE ... Task{m=CLOSE ... d=2->0}
+// 用户看到"微信闪一下", 而且那个 task 真的没了(进程还在, 界面没了)。
+// 改造前这条路径是安全的 —— 副屏上的栈都是我们自己用 MULTIPLE_TASK 建的, 删了无害。
+//
+// 所以: **副屏上有真实 App 时, 即便 force 也拒绝销毁**。丢掉的不是"我们造的副本",
+// 而是用户自己的任务。要腾出副屏, 正确做法是让用户接手(handoff)或自己关掉那个 App。
 export async function vdStop({ force = false } = {}) {
   return vdChainRun(async () => {
     if (!vdChild) return { stopped: false, reason: 'no-display' };
     const child = vdChild;
     const info = vdInfo;
 
-    // 0. 副屏上还有**真实 App** → 默认**不销毁**(理由见上面的实测结论)。
+    // 0. 副屏上还有**真实 App** → 拒绝销毁(理由见上面的实测结论)。
     //    注意用 appsOnDisplay 而不是 stacksOnDisplay: 副屏永远有一个 home 栈,
     //    那不算"有 App"(否则空副屏也会被拒)。
     let occupied = [];
     if (info && Number.isFinite(info.displayId)) {
       try { occupied = await appsOnDisplay(info.displayId); } catch { occupied = []; }
     }
-    if (occupied.length > 0 && !force) {
+    if (occupied.length > 0) {
       const list = occupied.map((o) => `${o.package}(stack ${o.stackId})`).join(', ');
+      // force 也不放行 —— 那些栈里装的可能是**用户自己的 task**(screen_app 会迁移它们)。
+      // 销毁它 = 删用户数据, 这个代价不能由调用方一句 force 承担。
       return {
         stopped: false, reason: 'occupied',
         displayId: info?.displayId ?? null, apps: occupied,
         detail:
-          `副屏(displayId=${info?.displayId}) 上还有 App：${list}。默认不销毁 —— ` +
-          `销毁会把它们连状态一起丢掉，而且实测**用户会看到那个 App 在主屏上闪一下**。\n` +
-          `要留住状态 → 用 screen_vd_handoff（搬回主屏，用户接手）；\n` +
-          `确实要丢   → 传 force: true（调用方明确接受"会闪一下 + 状态丢失"）。\n` +
-          `agent 干完活的默认收尾是**什么都不做**：副屏留着，用户前台不受影响。`,
+          `副屏(displayId=${info?.displayId}) 上还有 App：${list}。**不销毁** ——\n` +
+          `  1) 销毁会让用户看到那个 App 在主屏上闪一下（跨屏 CLOSE 过渡）；\n` +
+          `  2) 更严重: screen_app 现在会把**用户主屏的 task 迁移**到副屏，\n` +
+          `     所以这些栈里装的可能是用户自己的任务，销毁它就是**删用户数据**\n` +
+          `     （实测事故: Task #27 com.tencent.mm 被 Destroy，界面没了）。\n` +
+          `⚠ force 在这条路上也不放行 —— 丢的不是"我们造的副本"。\n` +
+          `正确做法：让用户接手（screen_vd_handoff），或让用户自己关掉那个 App；\n` +
+          `agent 干完活的默认收尾是**什么都不做**，副屏留着即可。`,
       };
     }
 
-    // 1. 副屏还活着 → 清掉它上面的所有 RootTask
+    // 1. 走到这里说明副屏上**只剩它自己的 home 栈**(真实的 App 栈已在上面被拒) →
+    //    清掉它。不删的话 release 时它会被 reparent 回 display 0 并置顶, 顶掉用户前台。
     const removed = [];
     if (info && Number.isFinite(info.displayId)) {
       try {
@@ -673,7 +692,9 @@ export async function vdStop({ force = false } = {}) {
       } catch { /* 尽力而为: 清不掉也不影响后续释放 */ }
     }
 
-    // 2. 再让守护进程释放副屏
+    // 2. 再让守护进程释放副屏。
+    //    走到这里副屏上**只剩它自己的 home 栈**(有真实 App 的话上面 already 拒了)，
+    //    所以守护进程会正常退出；即便它因为竞态拒绝退出，超时后 kill 也只影响 home 栈。
     vdChild = null;
     vdInfo = null;
     // 正常停止: 告知前台守卫"这条路是预期的", 别多此一举去拉 App
@@ -686,7 +707,7 @@ export async function vdStop({ force = false } = {}) {
       child.on('exit', () => { clearTimeout(t); resolve(); });
     });
     try { fs.unlinkSync(VD_STOP_FILE); } catch { /* 已不在 */ }
-    return { stopped: true, displayId: info?.displayId ?? null, clearedStacks: removed, forced: !!force };
+    return { stopped: true, displayId: info?.displayId ?? null, clearedStacks: removed };
   });
 }
 
