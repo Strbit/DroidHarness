@@ -6,7 +6,7 @@
 //
 // 用法: node test-uiaction.mjs   (在 recognize/ 下)
 import assert from 'node:assert/strict';
-import { physicalInput, _a11yList, _vdGeom, _taskParse, DEX_PATH } from './lib/uiaction.mjs';
+import { physicalInput, _a11yList, _vdGeom, _taskParse, _vdLifecycle, DEX_PATH } from './lib/uiaction.mjs';
 import fs from 'node:fs';
 
 let passed = 0;
@@ -288,6 +288,63 @@ console.log('task 归属解析 (幻影 display 回归)');
     ].join('\n');
     assert.deepEqual(p.parseStackList(dump, 'com.a'), []);
     assert.equal(p.parseStackList(dump, 'com.ab').length, 1);
+  });
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 孤儿副屏回收判定 (真机 regression：无脑 kill -9 会顶掉用户前台)
+//
+// 症状：MCP 重启后"上一任留下的副屏"没人能控制，旧实现直接 kill -9。
+//   但守护进程被 SIGKILL 时来不及清理，WM 随即释放那块屏并把它承载的 task
+//   reparent 回 display 0 且置顶（`clearAllTasksOnDisplay` →
+//   `resumeNextFocusAfterReparent`）→ **用户正在用的 App 被顶掉**。
+//   实测 logcat：
+//     VirtualDisplayAdapter: Virtual display device released because application token died
+//     DisplayManagerService: Logical display removed: 7
+//     moveTaskToFront: Task{... com.tencent.mm}
+//       caller trace: ... Task.resumeNextFocusAfterReparent:6245
+//                     DisplayContent.clearAllTasksOnDisplay:7243
+//   用户原话: "微信突然弹出来顶掉了我原来的软件"。
+// 修法：副屏上有真实 App 就**拒绝回收**，如实报错；只剩 home 栈才安全回收。
+console.log('');
+console.log('孤儿副屏回收判定 (顶前台回归)');
+{
+  const g = _vdLifecycle;
+  const prev = { status: 'running', pid: 12345, display_id: 7 };
+
+  t('副屏上有 App → refuse（不能 kill）', () => {
+    const d = g.decideOrphanReclaim(prev, [{ stackId: 45, package: 'com.tencent.mm' }]);
+    assert.equal(d.action, 'refuse');
+    assert.equal(d.result.ok, false);
+    assert.equal(d.result.error, 'orphan-occupied');
+    assert.equal(d.result.apps.length, 1);
+  });
+
+  t('拒绝时的说明里带出具体 App（调用方能据此决策）', () => {
+    const d = g.decideOrphanReclaim(prev, [{ stackId: 45, package: 'com.tencent.mm' }]);
+    assert.match(d.result.detail, /com\.tencent\.mm/);
+    assert.match(d.result.detail, /顶掉用户正在用的 App/);
+  });
+
+  t('副屏上只有 home 栈(空数组) → reclaim（安全）', () => {
+    assert.equal(g.decideOrphanReclaim(prev, []).action, 'reclaim');
+  });
+
+  t('多个 App 全部报出', () => {
+    const d = g.decideOrphanReclaim(prev, [
+      { stackId: 45, package: 'com.tencent.mm' },
+      { stackId: 46, package: 'com.android.settings' },
+    ]);
+    assert.equal(d.action, 'refuse');
+    assert.equal(d.result.apps.length, 2);
+    assert.match(d.result.detail, /com\.tencent\.mm/);
+    assert.match(d.result.detail, /com\.android\.settings/);
+  });
+
+  t('appsOnIt 非数组/缺失 → 当作空(保守回收, 不崩)', () => {
+    for (const bad of [null, undefined, 'x', 42]) {
+      assert.equal(g.decideOrphanReclaim(prev, bad).action, 'reclaim');
+    }
   });
 }
 

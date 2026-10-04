@@ -1169,6 +1169,10 @@ async function toolsCall(name, args) {
       }
       try {
         const r = await vdStart(width, height, dpi);
+        // 孤儿副屏上有 App → 拒绝回收（杀掉会让 task 掉回主屏顶掉用户前台）。如实报错。
+        if (r && r.ok === false && r.error === 'orphan-occupied') {
+          return { isError: true, text: r.detail };
+        }
         const lines = r.already
           ? `副屏已在运行 (幂等返回): displayId=${r.displayId}, ${r.width}x${r.height}@${r.dpi}`
           : `副屏已启动: displayId=${r.displayId}, ${r.width}x${r.height}@${r.dpi}`;
@@ -1180,12 +1184,12 @@ async function toolsCall(name, args) {
         return {
           text: `${lines}${snapped}\n\n接下来:\n` +
             `  · 把 App 放到副屏: screen_app { package, displayId: ${r.displayId} }\n` +
-            `    （即使该 App 已在主屏运行, 也会在副屏新建一个独立 task, 主屏那份不动）\n` +
+            `    （已有 task → **迁移**保留状态；无 task → 冷启动。都不会新建第二个 task）\n` +
             `  · 读/点/输入副屏: screen_tree、screen_targets、screen_tap、screen_text 传 displayId=${r.displayId}\n` +
             `  · 看副屏画面: screen_image { displayId: ${r.displayId} } 或 screen_vd_shot\n` +
             `  · 让用户接手: screen_vd_handoff（搬回主屏, 状态不丢）\n\n` +
             `**干完活的默认收尾是"什么都不做"** —— 副屏和 App 都留着, 用户前台一动不动。\n` +
-            `只有内容确实不要了才 screen_vd_stop（副屏上有 App 时它默认拒绝, 因为实测会闪）。\n\n` +
+            `screen_vd_stop 在副屏上有 App 时**一律拒绝**（销毁会删用户自己的 task —— see its docs）。\n\n` +
             `⚠ 跨屏承载依赖 LSPosed hook 生效; 没有 hook 时 screen_app 会明确报错(不会假装成功)。`,
         };
       } catch (e) {

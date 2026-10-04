@@ -473,14 +473,35 @@ export async function vdStart(width, height, dpi) {
     }
 
     // 孤儿回收: 状态文件 running 且那个进程还活着 —— 但它不是**本实例**的
-    // 子进程(MCP 重启后 vdChild 丢失)。没人能再对它 shot/stop, 留着只是
-    // 白占一块 display 与一个常驻进程 → 杀掉, 走全新启动。
-    // (同一实例内的重复 start 已在上面用 vdChild 拦住, 不会走到这里。)
+    // 子进程(MCP 重启后 vdChild 丢失)。没人能再对它 shot/stop。
+    //
+    // ⚠⚠ 不能无脑 kill -9（2026-10-05 实测事故，两次踩到）
+    // ──────────────────────────────────────────────────────
+    // 守护进程被 SIGKILL 时**来不及清理**（`app_process` 的 ART 没装信号处理器，
+    // 连 SIGTERM 都跑不到 JVM 关闭钩子）。WM 随即释放那块虚拟屏，走
+    // `DisplayContent.clearAllTasksOnDisplay` → `resumeNextFocusAfterReparent`，
+    // 把它承载的 task **reparent 回 display 0 且置顶** —— 用户正在用的 App 被顶掉。
+    // 实测 logcat:
+    //   VirtualDisplayAdapter: Virtual display device released because application token died
+    //   DisplayManagerService: Logical display removed: 7
+    //   moveTaskToFront: Task{... com.tencent.mm}
+    //     caller trace: ... Task.resumeNextFocusAfterReparent:6245
+    //                   DisplayContent.clearAllTasksOnDisplay:7243
+    // 用户原话: "微信突然弹出来顶掉了我原来的软件"。
+    //
+    // 所以：**副屏上有真实 App 就不回收**（不杀）。宁可让调用方看到一条明确的错误，
+    // 也不要把用户的 task 掉回主屏。只有"只剩它自己的 home 栈"时才安全回收。
     const prev = vdStatusJson();
     if (prev && prev.status === 'running') {
       const alive = await run('/system/bin/sh', ['-c', `kill -0 ${Number(prev.pid)} 2>/dev/null && echo alive || echo dead`])
         .then((r) => r.stdout.trim() === 'alive').catch(() => false);
       if (alive) {
+        let orphanApps = [];
+        if (Number.isFinite(prev.display_id) && prev.display_id >= 0) {
+          try { orphanApps = await appsOnDisplay(prev.display_id); } catch { orphanApps = []; }
+        }
+        const decision = decideOrphanReclaim(prev, orphanApps);
+        if (decision.action === 'refuse') return decision.result;
         await run('/system/bin/sh', ['-c', `kill ${Number(prev.pid)}; sleep 1; kill -9 ${Number(prev.pid)} 2>/dev/null; rm -f ${VD_STATUS_FILE} ${VD_STOP_FILE}`]);
       } else {
         await run('/system/bin/sh', ['-c', `rm -f ${VD_STATUS_FILE} ${VD_STOP_FILE}`]);
@@ -899,6 +920,44 @@ export function parseStackList(dump, pkg) {
 
 /** 供测试: task 归属解析的纯函数。 */
 export const _taskParse = { parseStackList };
+
+/**
+ * 决定"上一任 MCP 留下的副屏"(孤儿)能不能回收。
+ *
+ * 纯函数, 便于单测 —— 这个判定的错误会造成**用户前台被顶掉**(实测事故)。
+ *
+ * - 副屏上有真实 App(非 home 栈) → `refuse`: 不能 kill。
+ *   守护进程被 SIGKILL 时来不及清理, WM 会释放那块屏并把它承载的 task
+ *   reparent 回 display 0 且置顶(`clearAllTasksOnDisplay` →
+ *   `resumeNextFocusAfterReparent`)→ 用户正在用的 App 被顶掉。
+ * - 只剩它自己的 home 栈 → `reclaim`: 清掉无害, 可以安全回收。
+ *
+ * @returns {{action:'reclaim'|'refuse', result?:object}}
+ */
+export function decideOrphanReclaim(prev, appsOnIt) {
+  const apps = Array.isArray(appsOnIt) ? appsOnIt : [];
+  if (apps.length === 0) return { action: 'reclaim' };
+  const list = apps.map((o) => `${o.package}(stack ${o.stackId})`).join(', ');
+  return {
+    action: 'refuse',
+    result: {
+      ok: false, error: 'orphan-occupied',
+      displayId: prev?.display_id, pid: prev?.pid, apps,
+      detail:
+        `发现一块**上一任 MCP 留下的**副屏 (displayId=${prev?.display_id}, pid=${prev?.pid})，` +
+        `目前没人能控制它，上面还有 App：${list}。\n` +
+        `**不回收** —— 杀掉守护进程会让 WM 释放那块屏，把它们 reparent 回主屏并置顶，` +
+        `**顶掉用户正在用的 App**（实测事故："微信突然弹出来顶掉了我原来的软件"）。\n` +
+        `要腾出副屏，任选其一：\n` +
+        `  · 让用户自己关掉那些 App，然后重试 screen_vd_start（空屏会被安全回收）\n` +
+        `  · 或重启 MCP 服务，让新实例**接管**这块副屏（而不是杀掉它）`,
+    },
+  };
+}
+
+/** 供测试: 副屏生命周期判定的纯函数。 */
+export const _vdLifecycle = { decideOrphanReclaim };
+
 
 
 

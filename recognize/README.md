@@ -569,6 +569,27 @@ system_server 里放开几处判定。它是**本仓库最危险的一段代码*
   `vdStart` 记录用户当时的前台 App，子进程**意外**退出时核对并把它拉回来
   （`vdStop` 的正常路径会标记 `expected`，不触发兜底）。JS 侧兜底需要 MCP
   进程活着 —— 这是当前设计的边界。
+
+  ⚠ **2026-10-05 又踩到两次，已加两道闸**：
+  1. `VdMain` 的 `quit`/EOF 路径现在调 `refuseExitIfOccupied()` —— 副屏上有真实
+     App 就**拒绝退出**（进程 sleep 保持存活），既不删栈也不 release。见上文
+     "有 App 时守护进程拒绝退出"。
+  2. **孤儿回收不再无脑 `kill -9`**：MCP 重启后发现有前任留下的副屏时，先查那块屏
+     上有没有真实 App；有就**拒绝回收并如实报错**（`orphan-occupied`），只剩它自己的
+     home 栈才安全回收。判定抽成纯函数 `decideOrphanReclaim`，单测守着。
+
+  实测事故原文（用户原话："微信突然弹出来顶掉了我原来的软件"）：
+
+  ```
+  VirtualDisplayAdapter: Virtual display device released because application token died
+  DisplayManagerService: Logical display removed: 7
+  moveTaskToFront: Task{... com.tencent.mm}
+    caller trace: ... Task.resumeNextFocusAfterReparent:6245
+                  DisplayContent.clearAllTasksOnDisplay:7243
+  ```
+
+  ⚠ **SIGKILL 是捕不到的**（上面第 1 道闸只能盖住 `quit`/EOF）。所以任何
+  "杀掉守护进程"的代码路径都必须先确认那块屏上没有真实 App —— 这就是第 2 道闸。
 - 3 个 hook 目标类在 MIUI/HyperOS 上被精简（`DisplayManager#canHostTasks`、
   `DisplayContent#canHostTasksLocked`、`LogicalDisplay`），打 MISS 继续；
   实测 11 个重载命中即够用。
