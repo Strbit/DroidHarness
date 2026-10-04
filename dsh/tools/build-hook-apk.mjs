@@ -37,9 +37,14 @@ const die = (m) => { console.error(m); process.exit(1); };
 const log = (m) => console.log(m);
 
 const manifestSrc = path.join(HERE, 'hook-manifest.xml');
-const resDir = path.join(ROOT, '.build', 'hook-res');
+// ⚠ res 目录必须在仓库里（tools/hook-res），**不能放 .build/**：
+//   它是 APK 的构建输入，放 gitignore 目录里会让新克隆的仓库编不出 APK。
+//   （同类问题踩过一次：Xposed 的编译期 stub 原先也在 .build/ 里，见
+//     recognize/uiaction/hook/stub/ 的注释。）
+//   目前它只声明 xposed_scope（LSPosed 作用域），见 hook-res/values/arrays.xml。
+const resDir = path.join(HERE, 'hook-res');
 const hookDex = path.join(OUT, 'hook.dex');
-for (const f of [manifestSrc, hookDex]) if (!fs.existsSync(f)) die(`! 缺 ${f}`);
+for (const f of [manifestSrc, hookDex, resDir]) if (!fs.existsSync(f)) die(`! 缺 ${f}`);
 for (const tool of ['aapt2.exe', 'aapt2', 'apksigner.bat', 'apksigner']) {
   if (fs.existsSync(path.join(BT, tool))) continue;
 }
@@ -100,6 +105,43 @@ execSync(`"${zipalign}" -p -f 4 "${packedApk}" "${alignedApk}"`, { stdio: 'inher
     die(`! resources.arsc 压缩方式=${arsc.method}, 必须为 0(stored) —— Android 11+ 会拒装`);
   }
   log(`  resources.arsc: stored ✓  ${arsc.data.length} B`);
+}
+
+// 2d. 自检: LSPosed 作用域必须**真的编进 APK**, 且与 customize.sh 注册的一致
+//
+// ⚠ 这道自检要防的是"改了声明但 APK 没重建"这个**构建编排**问题, 不是
+//   arrays.xml 本身写错(那是 Edit 时就该看出来的)。实测踩到: `build-uiaction.mjs`
+//   原先只把 OUT 里**已有的** APK 复制进模块, 不重新构建 —— 改了 hook-res 之后
+//   跑它, 会拿旧 APK 打一个 ✓。真相是 `aapt2 dump resources` 里 scope 仍是
+//   `size=1 ["android"]`(期望 3 项)。
+//
+//   所以这里: ① dump 出 APK 里真实的数组; ② 与**期望集合**比对(不是与刚读的
+//   arrays.xml 比 —— 那样在同一个构建里必然相等, 是个假自检)。
+//   期望集合同时要和 customize.sh 里写进 LSPosed 数据库的那三个 scope 一致。
+{
+  const EXPECTED_SCOPES = ['android', 'system', 'com.android.systemui'];
+  let dump = '';
+  try {
+    dump = execSync(`"${aapt2}" dump resources "${alignedApk}"`, { encoding: 'utf8' });
+  } catch (e) {
+    die(`! aapt2 dump resources 失败, 无法校验作用域: ${e.message}`);
+  }
+  const got = [...dump.matchAll(/"([^"]+)"/g)].map((m) => m[1])
+    .filter((s) => !s.includes('/') && s !== 'array' && s !== 'xposed_scope');
+  const missing = EXPECTED_SCOPES.filter((w) => !got.includes(w));
+  const extra = got.filter((s) => !EXPECTED_SCOPES.includes(s) && /^[a-z][a-z0-9._]*$/i.test(s));
+  if (missing.length) {
+    die(`! APK 里的 xposed_scope 缺项: ${missing.join(', ')}\n` +
+        `    期望: ${JSON.stringify(EXPECTED_SCOPES)}\n    实际: ${JSON.stringify(got)}\n` +
+        `    (记得同步 dsh/tools/hook-res/values/arrays.xml 与 customize.sh 的 scope 注册)`);
+  }
+  if (extra.length) {
+    die(`! APK 里的 xposed_scope 有多余项: ${extra.join(', ')}\n    实际: ${JSON.stringify(got)}`);
+  }
+  if (got.length !== EXPECTED_SCOPES.length) {
+    die(`! APK 里的 xposed_scope 项数不对: 期望 ${EXPECTED_SCOPES.length}, 实得 ${got.length} (${JSON.stringify(got)})`);
+  }
+  log(`  xposed_scope: ${JSON.stringify(got)} ✓ (已编进 APK, 与 customize.sh 注册的 3 个一致)`);
 }
 
 // 3. 签名 (debug keystore 自动生成)
