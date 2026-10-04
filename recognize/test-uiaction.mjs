@@ -6,7 +6,7 @@
 //
 // 用法: node test-uiaction.mjs   (在 recognize/ 下)
 import assert from 'node:assert/strict';
-import { physicalInput, _a11yList, _vdGeom, DEX_PATH } from './lib/uiaction.mjs';
+import { physicalInput, _a11yList, _vdGeom, _taskParse, DEX_PATH } from './lib/uiaction.mjs';
 import fs from 'node:fs';
 
 let passed = 0;
@@ -195,6 +195,99 @@ console.log('副屏几何: 宽度夹取 (真机 regression 回归)');
   t('宽度本身非法 → 不夹(交给调用方的完整性检查报错)', () => {
     const r = g.snapWidthToMain(NaN, 1200, 1200);
     assert.equal(r.snapped, false);
+  });
+}
+
+// ══════════════════════════════════════════════════════════════════
+// task 归属解析 (真机 regression：幻影 display 会造成"假成功")
+//
+// 症状：旧实现用 `dumpsys activity activities` + awk 追 `^Display #` 表头。
+//   但在所有 Display 段之后还有一个全局段 `ActivityTaskSupervisor state:`，
+//   它把每个 display 的 task 再列一遍；awk 只更新 d、从不清零，于是**所有 task
+//   都被额外归到最后一个 display 号**上。实测（taskId=255 真在 display 0）：
+//       display=0  task=255   ← 正确
+//       display=4  task=255   ← 幻影
+//   危害：launchOnDisplay 的落点复核是 `t.displayId === target`，当 target 恰好
+//   等于最后一个 display 号（本机常见就是副屏 —— 最在意的场景）时，任何正在运行的
+//   task 都会幻影命中 → **永远报成功**，包括实际启动失败的情况。
+// 修法：改用权威的 `cmd activity stack list`（RootTask id=/displayId=）。
+console.log('');
+console.log('task 归属解析 (幻影 display 回归)');
+{
+  const p = _taskParse;
+
+  // 取自真机 `cmd activity stack list` 的真实输出片段（含缩进）
+  const REAL = [
+    'RootTask id=305 bounds=[0,0][1200,2608] displayId=0 userId=0',
+    '  configuration={1.0 460mcc11mnc [zh_CN] ldltr ... display=0 ...}',
+    '  taskId=305: com.example.piliplus/com.example.piliplus.MainActivity bounds=[0,0][1200,2608] userId=0 visible=true topActivity=ComponentInfo{com.example.piliplus/com.example.piliplus.MainActivity}',
+    '',
+    'RootTask id=302 bounds=[0,0][1200,2608] displayId=0 userId=0',
+    '  configuration={1.0 460mcc11mnc [zh_CN] ldltr ... display=0 ...}',
+    '  taskId=302: com.tencent.mobileqq/com.tencent.mobileqq.activity.SplashActivity bounds=[0,0][1200,2608] userId=0 visible=false topActivity=ComponentInfo{com.tencent.mobileqq/com.tencent.mobileqq.activity.SplashActivity}',
+    '',
+    // 副屏（display 2）上的设置
+    'RootTask id=58 bounds=[0,0][1200,2608] displayId=2 userId=0',
+    '  configuration={1.0 460mcc11mnc [zh_CN] ldltr ... display=2 ...}',
+    '  taskId=58: com.android.settings/com.android.settings.MainSettings bounds=[0,0][1200,2608] userId=0 visible=true topActivity=ComponentInfo{com.android.settings/com.android.settings.MainSettings}',
+    '',
+    // 副屏桌面：RootTask id 与 taskId **不同号**（真机实测 100 / 101）
+    'RootTask id=100 bounds=[0,0][1200,2608] displayId=2 userId=0',
+    '  taskId=101: com.miui.home/com.miui.home.launcher.SecondaryDisplayLauncher bounds=[0,0][1200,2608] userId=0 visible=true topActivity=ComponentInfo{com.miui.home/com.miui.home.launcher.SecondaryDisplayLauncher}',
+  ].join('\n');
+
+  t('归属正确：主屏的 task 归 display 0，副屏的归 display 2', () => {
+    assert.deepEqual(p.parseStackList(REAL, 'com.tencent.mobileqq')[0].displayId, 0);
+    assert.deepEqual(p.parseStackList(REAL, 'com.android.settings')[0].displayId, 2);
+  });
+
+  t('不会把 task 额外归到"最后一个 display"(幻影 display 回归)', () => {
+    // 旧实现在这里会为同一个 task 产出两条记录（正确的 0 和污染的 4）
+    for (const pkg of ['com.example.piliplus', 'com.tencent.mobileqq', 'com.android.settings']) {
+      const got = p.parseStackList(REAL, pkg);
+      assert.equal(got.length, 1, `${pkg} 应只有 1 条记录, 实得 ${got.length}`);
+    }
+    // 关键判据：不能出现 display=4（本机最后一个 display 号）的幻影
+    const all = p.parseStackList(REAL, 'com.example.piliplus')
+      .concat(p.parseStackList(REAL, 'com.android.settings'));
+    assert.ok(all.every((t) => t.displayId !== 4), '出现了幻影 display=4');
+  });
+
+  t('只挑目标包，不混入别的包', () => {
+    const got = p.parseStackList(REAL, 'com.android.settings');
+    assert.equal(got.length, 1);
+    assert.equal(got[0].taskId, 58);
+  });
+
+  t('rootTaskId 与 taskId 不同号时分别记录(迁移要搬 rootTaskId)', () => {
+    const got = p.parseStackList(REAL, 'com.miui.home')[0];
+    assert.equal(got.taskId, 101);
+    assert.equal(got.rootTaskId, 100, 'rootTaskId 必须是 RootTask 行里的 id, 不是 taskId');
+    assert.equal(got.isRoot, false, 'taskId≠rootTaskId 时 isRoot 应为 false');
+  });
+
+  t('taskId === rootTaskId 时标记 isRoot(迁移优先搬它)', () => {
+    const got = p.parseStackList(REAL, 'com.android.settings')[0];
+    assert.equal(got.isRoot, true);
+  });
+
+  t('visible 如实解析', () => {
+    assert.equal(p.parseStackList(REAL, 'com.android.settings')[0].visible, true);
+    assert.equal(p.parseStackList(REAL, 'com.tencent.mobileqq')[0].visible, false);
+  });
+
+  t('空输入/无匹配包 → 空数组(不抛异常)', () => {
+    assert.deepEqual(p.parseStackList('', 'com.tencent.mm'), []);
+    assert.deepEqual(p.parseStackList(REAL, 'com.not.installed'), []);
+  });
+
+  t('包名有歧义前缀时不误匹配(com.a 不该命中 com.ab)', () => {
+    const dump = [
+      'RootTask id=7 bounds=[0,0][1200,2608] displayId=0 userId=0',
+      '  taskId=7: com.ab/com.ab.Main bounds=[0,0][1200,2608] userId=0 visible=true',
+    ].join('\n');
+    assert.deepEqual(p.parseStackList(dump, 'com.a'), []);
+    assert.equal(p.parseStackList(dump, 'com.ab').length, 1);
   });
 }
 

@@ -719,8 +719,11 @@ export async function vdHandoff(pkg, { timeout = 30000 } = {}) {
           `当前: ${tasks.map((t) => `#${t.taskId}@d${t.displayId}`).join(', ') || '(无)'}`,
       };
     }
+    // move-stack 搬的是 **RootTask**，不是 taskId（多数情况两者同号，但不保证 ——
+    // 实测副屏桌面是 RootTask 100 / taskId 101）。
+    const moveId = onVd.rootTaskId ?? onVd.taskId;
     const r = await run('/system/bin/cmd', ['activity', 'display', 'move-stack',
-      String(onVd.taskId), '0'], { timeout });
+      String(moveId), '0'], { timeout });
     const out = `${r.stdout || ''}${r.stderr || ''}`.trim();
     if (/Error|Exception/i.test(out)) {
       return { ok: false, error: 'move-failed', output: out.slice(0, 300) };
@@ -817,36 +820,67 @@ export function vdGet() { return vdInfo ? { ...vdInfo } : null; }
 
 /**
  * 找出某个包当前所有 task 及其所在 display。
- * 解析 dumpsys activity activities 的 "Display #N" 分段 + "Task{... #id ...}" 行。
- * 返回 [{ taskId, displayId, isRoot, visible }]，按 taskId 升序。
+ *
+ * 归属来源: `cmd activity stack list`（**权威**），不是 `dumpsys activity activities`。
+ *
+ * 为什么换掉 dumpsys —— 它会产出"幻影 display"（真机实测）:
+ *   `dumpsys activity activities` 在所有 `Display #N` 段之后还有一个全局段
+ *   `ActivityTaskSupervisor state:`，里面把每个 display 的 task **再列一遍**。
+ *   靠 awk 追 `^Display #` 表头时，那个全局段不会重置 display 号，于是**所有
+ *   task 都会被额外归到最后一个 display 号**上。实测（taskId=255 真在 display 0）:
+ *
+ *     display=0  task=255      ← 正确
+ *     display=4  task=255      ← 幻影(被全局段污染)
+ *
+ *   危害是**假成功**: launchOnDisplay 的落点复核用 `t.displayId === target`,
+ *   当 target 恰好等于最后一个 display 号（本机常见就是副屏 —— 我们最在意的场景）时,
+ *   **任何正在运行的 task 都会幻影命中**, 于是永远报成功, 包括实际失败的情况。
+ *   `am stack list` 的 `RootTask id=... displayId=...` 是权威且无歧义。
+ *
+ * 返回 [{ taskId, displayId, isRoot, visible, raw }]，按 taskId 升序。
  */
 export async function findTasks(pkg) {
-  const out = await run('/system/bin/sh', [
-    '-c',
-    // awk 追踪最近的 Display # 表头, 把 Task 行归到它名下。
-    // 不用 grep -B: 表头与 Task 之间还有别的行, -B 的窗口大小不可靠。
-    `dumpsys activity activities 2>/dev/null | awk -v pkg="${pkg.replace(/"/g, '')}" '
-       /^Display #/ { d=$2; sub("#","",d) }
-       /Task\\{/ && $0 ~ ("A=[0-9]*:" pkg) {
-         line=$0
-         if (match(line, /#[0-9]+/)) { t=substr(line, RSTART+1, RLENGTH-1); print d" "t" "line }
-       }'`,
-  ], { timeout: 20000 });
+  const safePkg = String(pkg).replace(/[^A-Za-z0-9._]/g, '');
+  const out = await run('/system/bin/cmd', ['activity', 'stack', 'list'], { timeout: 20000 });
+  return parseStackList(String(out.stdout || ''), safePkg);
+}
+
+/**
+ * 纯函数: 解析 `cmd activity stack list` 的输出，挑出某个包的 task。
+ * 抽出来是为了能在 PC 上单测 —— 这段解析的归属错误会造成"假成功"，
+ * 必须有断言守着（见上面注释里"幻影 display"的说明）。
+ */
+export function parseStackList(dump, pkg) {
   const tasks = [];
-  for (const line of String(out.stdout || '').split('\n')) {
-    const m = line.match(/^(\d+)\s+(\d+)\s+(.*)$/);
-    if (!m) continue;
-    const rest = m[3];
+  let curRootId = null, curDisplay = null;
+  for (const line of String(dump || '').split('\n')) {
+    // 形如: RootTask id=113 bounds=[0,0][1200,2608] displayId=11 userId=0
+    const root = line.match(/^RootTask id=(\d+).*displayId=(\d+)/);
+    if (root) { curRootId = Number(root[1]); curDisplay = Number(root[2]); continue; }
+    // 形如:   taskId=255: com.tencent.mm/com.tencent.mm.ui.LauncherUI bounds=[...] visible=true topActivity=...
+    const t = line.match(/^\s+taskId=(\d+):\s+([A-Za-z0-9._]+)\/(\S+)(.*)$/);
+    if (!t || curDisplay == null) continue;
+    if (t[2] !== pkg) continue;
+    const rest = t[4] || '';
     tasks.push({
-      displayId: Number(m[1]),
-      taskId: Number(m[2]),
-      isRoot: /rootOfTask=true/.test(rest),
+      taskId: Number(t[1]),
+      // 迁移要搬的是 RootTask（`cmd activity display move-stack <rootTaskId> <displayId>`）。
+      // 多数情况 rootTaskId === taskId，但不保证（实测副屏桌面是 RootTask 100 / taskId 101）。
+      rootTaskId: curRootId,
+      displayId: curDisplay,
+      isRoot: Number(t[1]) === curRootId,
       visible: /visible=true/.test(rest),
-      raw: rest.slice(0, 200),
+      raw: line.trim().slice(0, 200),
     });
   }
-  return tasks;
+  return tasks.sort((a, b) => a.taskId - b.taskId);
 }
+
+/** 供测试: task 归属解析的纯函数。 */
+export const _taskParse = { parseStackList };
+
+
+
 
 /**
  * 列出某块屏上的 RootTask id。
@@ -870,20 +904,34 @@ export async function stacksOnDisplay(displayId) {
 }
 
 /**
- * 把 App 放到目标屏。
+ * 把 App 放到目标屏。三路分支（与参考实现 agent-mobile-use 行为一致）。
  *
- * ⚠ 设计红线: **只在副屏原生启动, 绝不搬运主屏的 task**
- * ────────────────────────────────────────────────────
- * 真机实测教训:
- *   · `am start --display N`(不带 MULTIPLE_TASK)对已运行的 singleTask App
- *     (微信)会把 intent 交给主屏那个既有实例 → **把用户正在看的 App 拉到前台**
- *   · `cmd activity display move-stack <taskId> <displayId>` 是"迁移"语义,
- *     实测立刻抢走前台; 副屏销毁时 task 又被 reparent 回来再抢一次
- *   · `am start -f 0x18000000 --display N`(NEW_TASK|MULTIPLE_TASK)会在副屏
- *     **新建一个独立 task**, 主屏那边完全不碰 —— 实测期间主屏前台逐字未变
+ *   1. 已有 task 且已在目标屏  → `already-there`（幂等，不重复启动）
+ *   2. 已有 task 但不在目标屏  → `move-stack`（**迁移**，保留 App 状态，不新建 task）
+ *   3. 无 task                → `am-start`，flag = `NEW_TASK`（**不含 MULTIPLE_TASK**）
  *
- * 所以这里固定用第三种。副屏上跑的是同一 App 的**另一个 task**(同一账号/进程),
- * 不是分身用户, 也不动用户手上那个实例。
+ * 为什么从"永远新建(MULTIPLE_TASK)"改成"先迁移"（改造规格 §1，均有实测）:
+ *   · `MULTIPLE_TASK` 强行造出同一 App 的第二个 task，而微信 `LauncherUI` 有全局
+ *     单实例约束 —— **微信会主动 finish 掉用户那个旧 task**。三次干净复现的死亡
+ *     延迟 93 / 146 / 126 ms，`nonFinishingActivityCount:0`；微信进程 pid 全程未变，
+ *     证明是 App 主动清理，不是系统回收。
+ *   · 旧 task 被清空后 recents 里仍留一张指向它的卡片 → **僵尸卡片**
+ *     （拿不到快照 → 渲染成空白，日夜模式决定它是白还是黑；点它没反应）。
+ *     用户原话："你每次创建副屏，我的主屏都会多出来一个无法点击的白色的卡片"。
+ *   · 迁移不新建、不丢状态：同一个 `ActivityRecord`，只是 display 变了，全程只有
+ *     一个 task、recents 只有一张卡片。
+ *
+ * 迁移会抢走源屏前台（`reparent` 会重算焦点）—— 这是**有意的**，与参考实现的模式
+ * 切换语义一致；调用方若要保住源屏前台需自行记录并在迁移后恢复（`vdStop` 的
+ * "先删栈再释放"就是为了避开这一点）。
+ *
+ * ⚠ 为什么不能对已运行的 singleTask App 直接用 `am start --display N`:
+ *   系统会把 intent 交给主屏那个既有实例（`Warning: Activity not started, intent
+ *   has been delivered to currently running top-most instance`），既没上副屏、
+ *   又把用户正在看的 App 拉到前台。
+ *
+ * 前置条件: LSPosed hook 必须已生效，否则 move-stack 报
+ * `moveRootTaskToDisplay: Unknown displayId=N`（实测）。
  *
  * @returns { ok, method, displayId, taskId?, output, error?, detail? }
  */
@@ -905,20 +953,77 @@ export async function resolveLaunchActivity(pkg, { timeout = 15000 } = {}) {
   return m ? `${m[1]}/${m[2]}` : null;
 }
 
+/**
+ * 轮询等某个包的 task 落到目标屏。返回命中的 task 或 null。
+ * 不靠命令退出码 —— 它可能为 0 而实际没动。
+ */
+async function waitTaskOnDisplay(pkg, target, { attempts = 15, intervalMs = 600 } = {}) {
+  for (let i = 0; i < attempts; i++) {
+    await new Promise((res) => setTimeout(res, intervalMs));
+    const after = await findTasks(pkg);
+    const hit = after.find((t) => t.displayId === target);
+    if (hit) return { hit, after };
+  }
+  return { hit: null, after: await findTasks(pkg) };
+}
+
 export async function launchOnDisplay(displayId, pkg, activity = null, { timeout = 30000 } = {}) {
   const target = Number(displayId);
-  const FLAG_NEW_TASK_MULTIPLE = '0x18000000'; // NEW_TASK | MULTIPLE_TASK
+  // FLAG_ACTIVITY_NEW_TASK。**不含 MULTIPLE_TASK** —— 参考实现的冷启动用的就是它,
+  // 而 MULTIPLE_TASK 正是"摧毁用户旧 task + 造出僵尸卡片"的根因(见函数头注释)。
+  const FLAG_NEW_TASK = '0x10000000';
 
+  // ── 分支 1/2: 已有 task → 复用或迁移 ──────────────────────────
+  // 有 task 就**绝不新建** —— 新建会触发上面那串连锁反应。
+  const before = await findTasks(pkg);
+  if (before.length > 0) {
+    const onTarget = before.find((t) => t.displayId === target);
+    if (onTarget) {
+      return {
+        ok: true, method: 'already-there', displayId: target,
+        taskId: onTarget.taskId,
+        detail: `${pkg} 已经在 display ${target}（task #${onTarget.taskId}），无需启动。`,
+      };
+    }
+    // 不在目标屏 → 迁移。搬 RootTask（而非 taskId）是 move-stack 的要求。
+    const src = before.find((t) => t.isRoot) || before[0];
+    const moveId = src.rootTaskId ?? src.taskId;
+    const r = await run('/system/bin/cmd', ['activity', 'display', 'move-stack',
+      String(moveId), String(target)], { timeout });
+    const out = `${r.stdout || ''}${r.stderr || ''}`.trim();
+    if (/Error|Exception|Unknown displayId/i.test(out)) {
+      return {
+        ok: false, method: 'move-stack', displayId: target,
+        output: out.slice(0, 400), error: 'move-stack-failed',
+        detail: `把 ${pkg} 的 task #${moveId} 从 display ${src.displayId} 迁移到 ` +
+          `display ${target} 失败。跨屏承载需要 LSPosed hook 生效；缺 hook 时 WM 会报 ` +
+          `"Unknown displayId=${target}"。`,
+      };
+    }
+    const { hit, after } = await waitTaskOnDisplay(pkg, target);
+    if (!hit) {
+      return {
+        ok: false, method: 'move-stack', displayId: target,
+        output: out.slice(0, 300), error: 'move-noop',
+        detail: `move-stack 已发但等了约 9s，display ${target} 上仍没有 ${pkg} 的 task。` +
+          `当前该包 task: ${after.map((t) => `#${t.taskId}@d${t.displayId}`).join(', ') || '(无)'}`,
+      };
+    }
+    return {
+      ok: true, method: 'move-stack', displayId: target,
+      taskId: hit.taskId, fromDisplayId: src.displayId, output: out.slice(0, 200),
+    };
+  }
+
+  // ── 分支 3: 无 task → 冷启动 ────────────────────────────────
   // `am start -n` 要的是 "包/Activity" 全称 —— 只给包名会被直接拒:
   //   java.lang.IllegalArgumentException: Bad component name: com.tencent.mm
-  // (真机踩到: 此前所有手测都显式带了 activity, 所以这个分支一直没被走到。)
-  // 没给 activity 时先解析该包的启动 Activity。
   let component = activity ? `${pkg}/${activity}` : null;
   if (!component) {
     component = await resolveLaunchActivity(pkg);
     if (!component) {
       return {
-        ok: false, method: 'am-start-multiple', displayId: target,
+        ok: false, method: 'am-start', displayId: target,
         error: 'resolve-activity-failed',
         detail: `解析不出 ${pkg} 的启动 Activity(cmd package resolve-activity 无结果)。` +
           `请显式传 activity 参数, 或用 screen_app 的 dryRun 先确认包名。`,
@@ -926,43 +1031,30 @@ export async function launchOnDisplay(displayId, pkg, activity = null, { timeout
     }
   }
 
-  const args = ['start', '-f', FLAG_NEW_TASK_MULTIPLE, '--display', String(target), '-n', component];
+  const args = ['start', '-f', FLAG_NEW_TASK, '--display', String(target), '-n', component];
   const r = await run('/system/bin/am', args, { timeout });
   const out = `${r.stdout || ''}${r.stderr || ''}`.trim();
 
   if (/Error|Exception|not found|does not exist/i.test(out)) {
     return {
-      ok: false, method: 'am-start-multiple', displayId: target,
+      ok: false, method: 'am-start', displayId: target,
       output: out.slice(0, 400), error: 'am-start-failed',
       detail: `在 display ${target} 上启动 ${pkg} 失败。跨屏承载需要 LSPosed hook 生效; ` +
         `缺 hook 时 WM 会拒绝把 task 放到虚拟屏。`,
     };
   }
 
-  // 复核: 目标屏上真的出现了该包的 task 吗(不靠命令退出码 —— 它可能为 0 而实际没动)
-  //
-  // ⚠ 这里原本只 sleep 1200ms 就查一次, 会**假阴性**: task 注册晚于 am 返回时,
-  //   明明已经上屏了却报 `launch-not-on-target`(排查报告 §4.1 实测: 同一时刻
-  //   screen_targets 读到 93 个节点、com.android.browser 确在副屏)。
-  //   改成轮询等待: 最多 ~9s, 每 600ms 一次, 命中即返回。
-  let onTarget = null;
-  for (let i = 0; i < 15; i++) {
-    await new Promise((res) => setTimeout(res, 600));
-    const after = await findTasks(pkg);
-    onTarget = after.find((t) => t.displayId === target);
-    if (onTarget) break;
-  }
+  const { hit: onTarget, after } = await waitTaskOnDisplay(pkg, target);
   if (!onTarget) {
-    const after = await findTasks(pkg);
     return {
-      ok: false, method: 'am-start-multiple', displayId: target,
+      ok: false, method: 'am-start', displayId: target,
       output: out.slice(0, 300), error: 'launch-not-on-target',
       detail: `命令已发但等了 ~9s, display ${target} 上仍没有 ${pkg} 的 task。` +
         `当前该包 task: ${after.map((t) => `#${t.taskId}@d${t.displayId}`).join(', ') || '(无)'}`,
     };
   }
   return {
-    ok: true, method: 'am-start-multiple', displayId: target,
+    ok: true, method: 'am-start', displayId: target,
     taskId: onTarget.taskId, output: out.slice(0, 200),
   };
 }

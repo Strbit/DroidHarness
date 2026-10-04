@@ -681,15 +681,23 @@ const TOOLS = [
   {
     name: 'screen_app',
     description:
-      '把某个 App 启动到指定的屏上。**它不会碰主屏上已有的实例** —— 这是"自动化不打扰用户"的关键。\n\n' +
-      '机制：`am start -f 0x18000000 --display N`（NEW_TASK|MULTIPLE_TASK）。\n' +
-      '即使该 App 已在主屏运行（微信这类 singleTask 应用），也会在副屏**新建一个独立 task**，\n' +
-      '主屏那份原样不动（实测：全程主屏前台逐字未变）。副屏上跑的是同一账号/同一进程的另一个\n' +
-      '任务窗口，不是分身用户。\n\n' +
-      '⚠ 反例（都已实测踩过，不要用）：\n' +
-      '  · `am start --display N`（不带 MULTIPLE_TASK）→ singleTask 应用会把 intent 交给主屏\n' +
-      '    已有实例，**把用户正在看的 App 拉到前台**\n' +
-      '  · `cmd activity display move-stack` → "迁移"语义，立刻抢走前台；副屏销毁时还会再抢一次\n\n' +
+      '把某个 App 放到指定的屏上。**已有 task 就迁移，绝不再建第二个 task。**\n\n' +
+      '三路分支（与参考实现 agent-mobile-use 行为一致）：\n' +
+      '  · 该 App 已在目标屏      → 直接返回 `already-there`，不重复启动\n' +
+      '  · 该 App 在别的屏        → `cmd activity display move-stack` **迁移**，同一个\n' +
+      '    ActivityRecord 换屏，**App 状态（如已填好的支付页）完整保留**\n' +
+      '  · 该 App 完全没有 task    → `am start -f 0x10000000 --display N`（NEW_TASK，\n' +
+      '    **不含 MULTIPLE_TASK**）冷启动\n\n' +
+      '⚠ 为什么不再用 `MULTIPLE_TASK` 新建第二个 task（实测代价，见改造规格 §1）：\n' +
+      '  · 微信这类有全局单实例约束的 App 会**主动 finish 掉用户那个旧 task**\n' +
+      '    （三次复现，死亡延迟 93/146/126 ms，进程 pid 未变 = App 主动清理）\n' +
+      '  · 被清空的 task 在最近任务里留下一张**僵尸卡片**：拿不到快照 → 渲染成空白\n' +
+      '    （日夜模式决定是白还是黑），**点它没有反应**\n\n' +
+      '⚠ 迁移会抢走源屏前台（`reparent` 重算焦点）—— 这是**有意**的，与参考实现的模式\n' +
+      '切换语义一致。若在意用户当前前台，请在调用前记录、调用后恢复。\n\n' +
+      '⚠ 已知边界：**虚拟屏上的 task 无法通过最近任务卡片拉回主屏**（AOSP 未实现跨屏\n' +
+      'recents，源码自标 `TODO (b/115289124)`）。要把副屏界面交给用户请用\n' +
+      '`screen_vd_handoff`，或让用户点桌面图标。\n\n' +
       '命令后会**复核** task 真的落在目标屏（命令返回 0 但实际没动的情况实测存在）。',
     inputSchema: {
       type: 'object',
@@ -1307,9 +1315,11 @@ async function toolsCall(name, args) {
                 : ''),
           };
         }
-        const how = r.method === 'move-stack' ? `已用 move-stack 搬运 task #${r.taskId}（保留 App 状态）`
-          : r.method === 'already-there' ? `已经在 display ${displayId}（task #${r.taskId}）`
-          : '已冷启动到目标屏';
+        const how = r.method === 'move-stack'
+          ? `已用 move-stack 把 task #${r.taskId} 从 display ${r.fromDisplayId} 迁移到 ${displayId}` +
+            `（**保留 App 状态**，没有新建第二个 task）`
+          : r.method === 'already-there' ? `已经在 display ${displayId}（task #${r.taskId}），未重复启动`
+          : `已冷启动到 display ${displayId}（flag = NEW_TASK，不含 MULTIPLE_TASK）`;
         return { text: `${pkg} → display ${displayId}\n${how}\n${r.output || ''}`.trim() };
       } catch (e) {
         return { isError: true, text: `screen_app 失败: ${e.message}` };

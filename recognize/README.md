@@ -333,21 +333,50 @@ mCurrentFocus=... com.example.piliplus/.MainActivity     ← 主屏的焦点，�
 
 ### App 怎么上副屏：`screen_app`
 
-`am start -f 0x18000000 --display N`（`NEW_TASK | MULTIPLE_TASK`）。
-即使该 App 已在主屏运行（微信这类 singleTask），也会在副屏**新建一个独立 task**，
-主屏那份原样不动 —— 副屏上是同一账号/同一进程的另一个任务窗口，**不是分身用户**。
+三路分支（与参考实现 agent-mobile-use 行为一致）：
 
-**两条实测踩过的反例，别用：**
-
-| 写法 | 后果 |
+| 场景 | 做法 |
 |---|---|
-| `am start --display N`（不带 MULTIPLE_TASK） | singleTask 应用会把 intent 交给主屏既有实例，**把用户正在看的 App 拉到前台**，而且没上副屏 |
-| `cmd activity display move-stack` | "迁移"语义，立刻抢走前台；副屏销毁时 task reparent 回来会**再抢一次** |
+| 该 App 已在目标屏 | 直接返回 `already-there`，不重复启动 |
+| 该 App 在别的屏 | `cmd activity display move-stack <rootTaskId> <displayId>` **迁移** |
+| 该 App 完全没有 task | `am start -f 0x10000000 --display N`（`NEW_TASK`，**不含 MULTIPLE_TASK**）冷启动 |
+
+**迁移不新建、不丢状态**：同一个 `ActivityRecord` 只是换了 display，全程只有一个
+task、最近任务只有一张卡片。所以停在支付页这类状态原样保留。
+
+**为什么不再用 `MULTIPLE_TASK` 新建第二个 task**（实测代价，改造规格 §1）：
+
+- 微信这类有全局单实例约束的 App 会**主动 finish 掉用户那个旧 task** —— 三次干净
+  复现的死亡延迟 93 / 146 / 126 ms、`nonFinishingActivityCount:0`，而**微信进程 pid
+  全程未变**，证明是 App 主动清理而非系统回收
+- 被清空的 task 在最近任务里留下一张**僵尸卡片**：拿不到快照 → 渲染成空白（日夜模式
+  决定它是白还是黑），**点它没有反应**。用户原话："你每次创建副屏，我的主屏都会多出来
+  一个无法点击的白色的卡片"
+
+**迁移会抢走源屏前台**（`reparent` 重算焦点）—— 这是**有意**的：与参考实现的模式切换
+语义一致。若在意用户当前前台，调用前记录、调用后恢复（`vdStop` 的"先删栈再释放"就是
+为了避开这一点）。
 
 `screen_app` 省略 `activity` 时会先 `cmd package resolve-activity --brief <pkg>`
 解析启动 Activity —— `am start -n` 只接受 `包/Activity` 全称，给裸包名会报
 `Bad component name`（实测）。命令发出后还会**复核** task 真的落在目标屏
 （命令返回 0 而实际没动的情况实测存在）。
+
+> ⚠ **已知边界：虚拟屏上的 task 无法用最近任务卡片拉回主屏。** 这是 AOSP 未实现的
+> 功能，源码自标 `TODO (b/115289124)`。实测（本机 HyperOS）`startActivityFromRecents`
+> 被正常调用、AMS 也发起了 `TO_FRONT` 过渡，但 task 只在**它自己那块屏**上置前：
+>
+> ```
+> ActivityManagerWrapper: startActivityFromRecents,taskId=58
+> SoScStageCoordinator: TO_FRONT ... triggerTask displayId=2
+> DisplayModeDirectorImpl: Invalid displayId: 2, only 0 and 1 are supported
+> 结果: taskId=58 仍在 display=2
+> ```
+>
+> 参考实现（agent-mobile-use）在同一台机器上**表现完全相同**，且它的 hook 清单里
+> **没有任何** recents / 跨屏拉起相关目标（只有 `canHostTasks` 系列 + IME 隔离）。
+> 要把副屏界面交给用户，请用 `screen_vd_handoff`，或让用户点**桌面图标**
+> （走 `ActivityStarter.recycleTask` → `reparent`，跨屏有效）。
 
 ### 三种收尾，由调用方按意图选
 
