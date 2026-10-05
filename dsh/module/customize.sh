@@ -577,10 +577,21 @@ else
 		sql_run() { LD_LIBRARY_PATH="$MODPATH/usr/lib" "$SQLITE_BIN" "$@"; }
 		sql_run "$LSP_DB" "INSERT OR REPLACE INTO modules (module_pkg_name, apk_path) VALUES ('$HOOK_PKG', '$APK_PATH');" 2>/dev/null
 		sql_run "$LSP_DB" "INSERT OR REPLACE INTO modules_state (module_pkg_name, user_id, enabled) VALUES ('$HOOK_PKG', 0, 1);" 2>/dev/null
-		# 两个作用域都要: android(system_server 进程) 与 system(系统框架)。
-		# 缺 system 的表现是"模块装了、启用了、但一行日志都没有" —— 极难归因。
+		# 三个作用域都要（必须与 tools/hook-res/values/arrays.xml 里声明的
+		# xposed_scope 一致 —— 数据库决定"这次开机加载什么"，APK 声明决定
+		# "用户在 LSPosed 管理器里能看到/勾选什么"；只改一边会出现
+		# "手动重勾作用域后少一个 scope"的诡异现象）:
+		#   android             → system_server。**副屏承载的全部 hook 都在这里**
+		#   system              → 系统框架的另一个 scope 记录。缺它的表现是
+		#                         "模块装了、启用了、但一行日志都没有" —— 极难归因。
+		#   com.android.systemui→ SystemUI 进程。给通知胶囊/灵动岛这类 UI 层
+		#                         改造用（参考实现 agent-mobile-use 用它把通知接进
+		#                         ColorOS 流体云）。我们目前还没有 SystemUI 侧的
+		#                         hook，先注册着 —— 将来接 HyperOS 灵动岛时不用
+		#                         再动这段，也不会被"用户手动重勾"弄丢。
 		sql_run "$LSP_DB" "INSERT OR REPLACE INTO scope (module_pkg_name, app_pkg_name, user_id) VALUES ('$HOOK_PKG', 'android', 0);" 2>/dev/null
 		sql_run "$LSP_DB" "INSERT OR REPLACE INTO scope (module_pkg_name, app_pkg_name, user_id) VALUES ('$HOOK_PKG', 'system', 0);" 2>/dev/null
+		sql_run "$LSP_DB" "INSERT OR REPLACE INTO scope (module_pkg_name, app_pkg_name, user_id) VALUES ('$HOOK_PKG', 'com.android.systemui', 0);" 2>/dev/null
 
 		# 8.4 回读校验(真 sqlite3 能回显, shim 不能):
 		# 只报 OK 而不核对, 就分不清"写进去了"和"静默失败" —— 而作用域没写进去
@@ -590,9 +601,9 @@ else
 			      || '/' || (SELECT count(*) FROM modules_state WHERE module_pkg_name='$HOOK_PKG' AND enabled=1) \
 			      || '/' || (SELECT count(*) FROM scope WHERE module_pkg_name='$HOOK_PKG');" 2>/dev/null | tr -d '\r')
 		case "$CHECK" in
-		1/1/2) ui_print "  [ OK ] LSPosed 作用域已注册 (android + system, 回读校验 1/1/2)" ;;
+		1/1/3) ui_print "  [ OK ] LSPosed 作用域已注册 (android + system + systemui, 回读校验 1/1/3)" ;;
 		"")    ui_print "  [WARN] 作用域写库后回读为空 —— sqlite3 可能跑不起来(LD_LIBRARY_PATH 不对?)" ;;
-		*)     ui_print "  [WARN] 作用域回读异常($CHECK, 期望 1/1/2) —— 可能只写进去一部分" ;;
+		*)     ui_print "  [WARN] 作用域回读异常($CHECK, 期望 1/1/3) —— 可能只写进去一部分" ;;
 		esac
 
 		# 8.3 安全启用标记 —— hook 只在存在这个文件时才生效。

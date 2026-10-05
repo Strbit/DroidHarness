@@ -22,7 +22,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -206,19 +206,30 @@ if (hookFiles.length) {
 
   // hook APK: LSPosed 模块的载体 (Xposed 模块必须是已安装的 APK)。
   // 装进模块的 apk/ 目录, customize.sh 装机时 pm install + 注册作用域。
+  //
+  // ⚠⚠ 必须**真的调 build-hook-apk.mjs 重新构建**, 不能只"复制 OUT 里已有的"。
+  //   原先那段是 `if (existsSync(OUT/dsh-hook.apk)) copyFileSync(...)` —— 于是
+  //   改了 `tools/hook-res/values/arrays.xml`(LSPosed 作用域声明)之后跑本脚本,
+  //   它会把**上一轮的旧 APK** 复制进模块并打一个 ✓, 让人以为改动生效了。
+  //   实测踩到: 把 scope 从 [android] 改成 [android,system,systemui] 后跑本脚本,
+  //   `aapt2 dump resources` 显示模块里的 APK 仍是 `size=1 ["android"]`。
+  //   所以这里改成调用构建脚本(它自己会读 hook-res 并做 arsc stored 自检)。
   const apkOut = path.join(ROOT, 'dsh', 'module', 'apk');
   fs.mkdirSync(apkOut, { recursive: true });
   const apkDst = path.join(apkOut, 'dsh-hook.apk');
   try {
+    const builder = path.join(HERE, 'build-hook-apk.mjs');
+    execFileSync(process.execPath, [builder], { stdio: 'inherit' });
     const apkSrc = path.join(OUT, 'dsh-hook.apk');
-    if (fs.existsSync(apkSrc)) {
-      fs.copyFileSync(apkSrc, apkDst);
-      log(`  ✓ apk/dsh-hook.apk: ${(fs.statSync(apkDst).size / 1024).toFixed(1)} KiB (装机时 pm install + 注册 LSPosed)`);
-    } else {
-      log(`  ! 没找到 ${path.relative(ROOT, apkSrc)} —— 先跑 build-hook-apk.mjs 才会打进模块`);
+    if (!fs.existsSync(apkSrc)) {
+      die(`! build-hook-apk.mjs 跑完了但没有产出 ${path.relative(ROOT, apkSrc)}`);
     }
+    fs.copyFileSync(apkSrc, apkDst);
+    log(`  ✓ apk/dsh-hook.apk: ${(fs.statSync(apkDst).size / 1024).toFixed(1)} KiB (装机时 pm install + 注册 LSPosed)`);
   } catch (e) {
-    log(`  ! 复制 hook APK 失败: ${e.message}`);
+    // 构建失败要**响亮地失败**, 不能只 log 一行 ! 然后当作成功继续 ——
+    // 装机包里的 APK 是旧的, 而现象是"scope 没生效"这类极难归因的问题。
+    die(`! hook APK 构建/复制失败: ${e.message}`);
   }
 }
 log(`产出: ${path.relative(ROOT, dexPath)}`);

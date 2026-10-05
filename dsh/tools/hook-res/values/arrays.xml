@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  LSPosed 模块作用域声明。
+
+  这个文件**必须在仓库里**（不能放在 gitignore 的 .build/ 里）——它是 APK 构建的
+  输入之一，缺了它新克隆的仓库根本编不出 hook APK（同类问题踩过一次：Xposed 的
+  编译期 stub 原先也在 .build/ 里）。build-hook-apk.mjs 会把它读成 res 目录。
+
+  ⚠ 两个 scope 的区别（LSPosed 把它们当**两个不同作用域**，实测踩过）：
+    · android        → system_server 进程（packageName=android）。**副屏承载的
+                        全部 hook 都在这里**：canHostTasks / canBeLaunchedOnDisplay /
+                        canLaunchOnDisplay / IME 隔离。
+    · system         → 也是 system_server，但 LSPosed 走另一条 scope 记录。
+                        只勾 android 时部分 ROM 上模块加载不到。
+    · com.android.systemui → SystemUI 进程。给**通知胶囊/灵动岛**这类 UI 层改造用
+                        （参考实现 agent-mobile-use 用它把通知接进 ColorOS 流体云）。
+                        目前我们还没有 SystemUI 侧的 hook，但先声明 —— 将来接
+                        HyperOS 灵动岛时不用再动这个文件，也不会因为"用户手动在
+                        管理器里重勾作用域"而丢 scope。
+
+  ⚠ 光声明不够：装机时 customize.sh 会把这些写进 LSPosed 数据库
+    （/data/adb/lspd/config/modules_config.db 的 scope 表）。两边必须一致 ——
+    数据库决定"这次开机加载什么"，APK 声明决定"用户在管理器里能看到/勾选什么"。
+    只改一边就会出现"手动重勾后少一个 scope"的诡异现象。
+-->
+<resources>
+    <string-array name="xposed_scope">
+        <item>android</item>
+        <item>system</item>
+        <item>com.android.systemui</item>
+    </string-array>
+</resources>

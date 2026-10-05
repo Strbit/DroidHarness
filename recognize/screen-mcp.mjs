@@ -621,16 +621,21 @@ const TOOLS = [
   {
     name: 'screen_vd_stop',
     description:
-      '**丢弃**虚拟副屏：把它上面的 App 连同当前状态一起清掉，再释放显存。\n\n' +
-      '⚠ **副屏上有 App 时本工具默认拒绝执行**（报错说明原因），因为实测：\n' +
-      '销毁承载着 App 的副屏，用户**会看到那个 App 在主屏上闪一下**（WM 的跨屏\n' +
-      'CLOSE 过渡会把被删 task 的 surface 从副屏尺寸动到主屏尺寸上渲染）。\n' +
-      '试过"删栈期间关掉过渡动画"，用户复看**仍然闪**，所以没采用。\n\n' +
-      '于是默认行为是：\n' +
-      '  · 副屏上有 App → 拒绝，并给出两个正确选择\n' +
-      '      要留住状态 → `screen_vd_handoff`（搬回主屏，用户接手）\n' +
-      '      确实要丢   → 传 `force: true`（明确接受"会闪一下 + 状态丢失"）\n' +
-      '  · 副屏上没有 App（空屏）→ 正常销毁，全程不打扰用户\n\n' +
+      '**丢弃**虚拟副屏并释放显存。\n\n' +
+      '⚠ **副屏上有真实 App 时本工具一律拒绝执行 —— 传 `force` 也不放行。**\n' +
+      '两个理由，第二个是实测事故：\n' +
+      '  1) 销毁承载着 App 的副屏，用户**会看到那个 App 在主屏上闪一下**（WM 的跨屏\n' +
+      '     CLOSE 过渡把被删 task 的 surface 从副屏尺寸动到主屏尺寸上渲染）。\n' +
+      '     试过"删栈期间关掉过渡动画"，用户复看**仍然闪**，所以没采用。\n' +
+      '  2) **更严重**：`screen_app` 现在会把**用户主屏的 task 迁移**到副屏，\n' +
+      '     所以副屏上的栈里装的可能是**用户自己的任务** —— 销毁它就是**删用户数据**。\n' +
+      '     实测事故：`Destroy timeout of remove-task, attempt to kill Task #27\n' +
+      '     com.tencent.mm` → 微信界面消失（进程还在）。\n' +
+      '     丢的不是"我们造的副本"，所以 `force` 这个由调用方承担的责任也不成立。\n\n' +
+      '于是：\n' +
+      '  · 副屏上有 App → **拒绝**。要腾出副屏请让用户接手（`screen_vd_handoff`），\n' +
+      '    或让用户自己关掉那个 App\n' +
+      '  · 副屏上没有 App（只剩它自己的 home 栈）→ 正常销毁，不打扰用户\n\n' +
       '不在跑时幂等返回。\n\n' +
       '**agent 干完活的默认收尾是"什么都不做"**：副屏和 App 都留着，用户前台\n' +
       '一动不动；等用户自己接手（handoff）或明确要求丢弃。',
@@ -639,7 +644,7 @@ const TOOLS = [
       properties: {
         force: {
           type: 'boolean',
-          description: '副屏上有 App 时强制丢弃（调用方明确接受"用户屏幕上会闪一下 + App 状态丢失"）。默认 false',
+          description: '已作废：副屏上有 App 时无论传什么都会拒绝（销毁会删用户自己的 task）。保留仅为兼容旧调用。',
         },
       },
       additionalProperties: false,
@@ -681,15 +686,23 @@ const TOOLS = [
   {
     name: 'screen_app',
     description:
-      '把某个 App 启动到指定的屏上。**它不会碰主屏上已有的实例** —— 这是"自动化不打扰用户"的关键。\n\n' +
-      '机制：`am start -f 0x18000000 --display N`（NEW_TASK|MULTIPLE_TASK）。\n' +
-      '即使该 App 已在主屏运行（微信这类 singleTask 应用），也会在副屏**新建一个独立 task**，\n' +
-      '主屏那份原样不动（实测：全程主屏前台逐字未变）。副屏上跑的是同一账号/同一进程的另一个\n' +
-      '任务窗口，不是分身用户。\n\n' +
-      '⚠ 反例（都已实测踩过，不要用）：\n' +
-      '  · `am start --display N`（不带 MULTIPLE_TASK）→ singleTask 应用会把 intent 交给主屏\n' +
-      '    已有实例，**把用户正在看的 App 拉到前台**\n' +
-      '  · `cmd activity display move-stack` → "迁移"语义，立刻抢走前台；副屏销毁时还会再抢一次\n\n' +
+      '把某个 App 放到指定的屏上。**已有 task 就迁移，绝不再建第二个 task。**\n\n' +
+      '三路分支（与参考实现 agent-mobile-use 行为一致）：\n' +
+      '  · 该 App 已在目标屏      → 直接返回 `already-there`，不重复启动\n' +
+      '  · 该 App 在别的屏        → `cmd activity display move-stack` **迁移**，同一个\n' +
+      '    ActivityRecord 换屏，**App 状态（如已填好的支付页）完整保留**\n' +
+      '  · 该 App 完全没有 task    → `am start -f 0x10000000 --display N`（NEW_TASK，\n' +
+      '    **不含 MULTIPLE_TASK**）冷启动\n\n' +
+      '⚠ 为什么不再用 `MULTIPLE_TASK` 新建第二个 task（实测代价，见改造规格 §1）：\n' +
+      '  · 微信这类有全局单实例约束的 App 会**主动 finish 掉用户那个旧 task**\n' +
+      '    （三次复现，死亡延迟 93/146/126 ms，进程 pid 未变 = App 主动清理）\n' +
+      '  · 被清空的 task 在最近任务里留下一张**僵尸卡片**：拿不到快照 → 渲染成空白\n' +
+      '    （日夜模式决定是白还是黑），**点它没有反应**\n\n' +
+      '⚠ 迁移会抢走源屏前台（`reparent` 重算焦点）—— 这是**有意**的，与参考实现的模式\n' +
+      '切换语义一致。若在意用户当前前台，请在调用前记录、调用后恢复。\n\n' +
+      '⚠ 已知边界：**虚拟屏上的 task 无法通过最近任务卡片拉回主屏**（AOSP 未实现跨屏\n' +
+      'recents，源码自标 `TODO (b/115289124)`）。要把副屏界面交给用户请用\n' +
+      '`screen_vd_handoff`，或让用户点桌面图标。\n\n' +
       '命令后会**复核** task 真的落在目标屏（命令返回 0 但实际没动的情况实测存在）。',
     inputSchema: {
       type: 'object',
@@ -1156,6 +1169,10 @@ async function toolsCall(name, args) {
       }
       try {
         const r = await vdStart(width, height, dpi);
+        // 孤儿副屏上有 App → 拒绝回收（杀掉会让 task 掉回主屏顶掉用户前台）。如实报错。
+        if (r && r.ok === false && r.error === 'orphan-occupied') {
+          return { isError: true, text: r.detail };
+        }
         const lines = r.already
           ? `副屏已在运行 (幂等返回): displayId=${r.displayId}, ${r.width}x${r.height}@${r.dpi}`
           : `副屏已启动: displayId=${r.displayId}, ${r.width}x${r.height}@${r.dpi}`;
@@ -1167,12 +1184,12 @@ async function toolsCall(name, args) {
         return {
           text: `${lines}${snapped}\n\n接下来:\n` +
             `  · 把 App 放到副屏: screen_app { package, displayId: ${r.displayId} }\n` +
-            `    （即使该 App 已在主屏运行, 也会在副屏新建一个独立 task, 主屏那份不动）\n` +
+            `    （已有 task → **迁移**保留状态；无 task → 冷启动。都不会新建第二个 task）\n` +
             `  · 读/点/输入副屏: screen_tree、screen_targets、screen_tap、screen_text 传 displayId=${r.displayId}\n` +
             `  · 看副屏画面: screen_image { displayId: ${r.displayId} } 或 screen_vd_shot\n` +
             `  · 让用户接手: screen_vd_handoff（搬回主屏, 状态不丢）\n\n` +
             `**干完活的默认收尾是"什么都不做"** —— 副屏和 App 都留着, 用户前台一动不动。\n` +
-            `只有内容确实不要了才 screen_vd_stop（副屏上有 App 时它默认拒绝, 因为实测会闪）。\n\n` +
+            `screen_vd_stop 在副屏上有 App 时**一律拒绝**（销毁会删用户自己的 task —— see its docs）。\n\n` +
             `⚠ 跨屏承载依赖 LSPosed hook 生效; 没有 hook 时 screen_app 会明确报错(不会假装成功)。`,
         };
       } catch (e) {
@@ -1182,25 +1199,21 @@ async function toolsCall(name, args) {
 
     case 'screen_vd_stop': {
       try {
-        const before = vdGet();
         const r = await vdStop({ force: !!args?.force });
         if (!r.stopped) {
           if (r.reason === 'occupied') {
-            // 默认拒绝销毁有 App 的副屏 —— 这是实测结论(会闪一下), 不是保守。
+            // 拒绝销毁有 App 的副屏 —— 这是实测结论(会闪一下 + 会删用户自己的 task),
+            // 不是保守。force 也不放行。
             return { isError: true, text: r.detail };
           }
           return { text: '没有运行中的副屏（幂等）' };
         }
         const cleared = (r.clearedStacks || []).filter((s) => s.ok).length;
         return {
-          text: `副屏已丢弃并释放 (displayId=${r.displayId ?? '?'})\n` +
-            `已清掉副屏上的 ${cleared} 个栈 —— 副屏内容不再存在。\n` +
-            (r.forced
-              ? `⚠ 本次是 force 丢弃：副屏上原有的 App 连状态一起没了，且**用户屏幕上可能闪过一下那个 App**（实测存在）。\n`
-              : `用户主屏前台未受影响。\n`) +
-            (cleared === 0 && before
-              ? '（副屏上本来就没有 App；若有 App 请检查 am stack remove 是否生效）'
-              : ''),
+          text: `副屏已释放 (displayId=${r.displayId ?? '?'})\n` +
+            `清掉了 ${cleared} 个栈（只有副屏自己的 home 栈 —— 真实 App 的栈不会被删）。\n` +
+            `用户主屏前台未受影响。\n` +
+            (cleared === 0 ? '（副屏上本来就没有 home 栈）' : ''),
         };
       } catch (e) {
         return { isError: true, text: `副屏停止失败: ${e.message}` };
@@ -1307,9 +1320,11 @@ async function toolsCall(name, args) {
                 : ''),
           };
         }
-        const how = r.method === 'move-stack' ? `已用 move-stack 搬运 task #${r.taskId}（保留 App 状态）`
-          : r.method === 'already-there' ? `已经在 display ${displayId}（task #${r.taskId}）`
-          : '已冷启动到目标屏';
+        const how = r.method === 'move-stack'
+          ? `已用 move-stack 把 task #${r.taskId} 从 display ${r.fromDisplayId} 迁移到 ${displayId}` +
+            `（**保留 App 状态**，没有新建第二个 task）`
+          : r.method === 'already-there' ? `已经在 display ${displayId}（task #${r.taskId}），未重复启动`
+          : `已冷启动到 display ${displayId}（flag = NEW_TASK，不含 MULTIPLE_TASK）`;
         return { text: `${pkg} → display ${displayId}\n${how}\n${r.output || ''}`.trim() };
       } catch (e) {
         return { isError: true, text: `screen_app 失败: ${e.message}` };
