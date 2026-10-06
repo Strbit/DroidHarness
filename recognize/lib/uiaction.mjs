@@ -1034,6 +1034,37 @@ export async function resolveLaunchActivity(pkg, { timeout = 15000 } = {}) {
 }
 
 /**
+ * 判断跨屏承载 hook 当前处于什么状态（给失败信息用，让调用方能区分
+ * "刚开机还没装好" 与 "根本没装 / LSPosed 没生效"）。
+ *
+ * hook 现在**推迟到 sys.boot_completed=1 之后**才装载（见 DshHookEntry 的闸⑤），
+ * 所以"刚开机不久 → move-stack 报 Unknown displayId"是正常且**短暂的**。
+ *
+ * 这是只读探测，任何异常都返回空串（不影响主流程）。
+ * @returns {string} 形如 "已装载(hook日志可见)" / "未就绪(有标记, 未见装载日志)" / ...
+ */
+export async function judgeHookState() {
+  try {
+    const marker = await run('/system/bin/sh',
+      ['-c', 'test -f /data/system/dsh-vd-hook.on && echo yes || echo no']).then((r) => r.stdout.trim()).catch(() => '');
+    const prop = await run('/system/bin/getprop', ['persist.dsh.vd.hook'])
+      .then((r) => r.stdout.trim()).catch(() => '');
+    const log = await run('/system/bin/sh',
+      ['-c', 'logcat -d -t 400 2>/dev/null | grep -c DshHook || echo 0'])
+      .then((r) => String(r.stdout).trim()).catch(() => '0');
+    const fails = await run('/system/bin/sh',
+      ['-c', 'cat /data/system/dsh-vd-hook-fails 2>/dev/null || echo 0'])
+      .then((r) => r.stdout.trim()).catch(() => '0');
+    if (marker !== 'yes') return '标记 /data/system/dsh-vd-hook.on 不存在 → hook 惰性（未启用）';
+    if (prop === '0') return 'persist.dsh.vd.hook=0 → hook 被属性禁用';
+    if (Number(log) > 0) return `hook 有装载日志（尝试次数计数=${fails}）—— 若仍报 Unknown displayId，可能是 LSPosed 未生效`;
+    return '有标记但未见装载日志 → 可能刚开机尚未装载完成（hook 在 boot_completed 之后装载），稍等重试';
+  } catch {
+    return '';
+  }
+}
+
+/**
  * 轮询等某个包的 task 落到目标屏。返回命中的 task 或 null。
  * 不靠命令退出码 —— 它可能为 0 而实际没动。
  */
@@ -1072,12 +1103,23 @@ export async function launchOnDisplay(displayId, pkg, activity = null, { timeout
       String(moveId), String(target)], { timeout });
     const out = `${r.stdout || ''}${r.stderr || ''}`.trim();
     if (/Error|Exception|Unknown displayId/i.test(out)) {
+      // hook 未生效时 WM 的典型报错。因为 hook 现在**推迟到 boot_completed 之后**
+      // 才装载，刚开机那一小段窗口里可能还没装好 —— 所以这里区分"还没装好"与
+      // "根本没装/LSPosed 没生效"，让调用方知道该等一下还是该去查配置。
+      let hookState = '';
+      try {
+        hookState = await judgeHookState();
+      } catch { /* 查不到就按通用提示 */ }
       return {
         ok: false, method: 'move-stack', displayId: target,
         output: out.slice(0, 400), error: 'move-stack-failed',
+        hookState,
         detail: `把 ${pkg} 的 task #${moveId} 从 display ${src.displayId} 迁移到 ` +
           `display ${target} 失败。跨屏承载需要 LSPosed hook 生效；缺 hook 时 WM 会报 ` +
-          `"Unknown displayId=${target}"。`,
+          `"Unknown displayId=${target}"。\n` +
+          (hookState ? `当前 hook 状态：${hookState}\n` : '') +
+          `（hook 已改为**开机完成之后**才装载 —— 若刚开机不久，稍等几秒重试即可；` +
+          `若一直如此，检查 /data/system/dsh-vd-hook.on 与 persist.dsh.vd.hook）`,
       };
     }
     const { hit, after } = await waitTaskOnDisplay(pkg, target);
