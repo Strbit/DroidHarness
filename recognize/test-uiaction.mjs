@@ -6,7 +6,7 @@
 //
 // 用法: node test-uiaction.mjs   (在 recognize/ 下)
 import assert from 'node:assert/strict';
-import { physicalInput, _a11yList, _vdGeom, _taskParse, _vdLifecycle, DEX_PATH } from './lib/uiaction.mjs';
+import { physicalInput, _a11yList, _vdGeom, _taskParse, _vdLifecycle, _vdReap, DEX_PATH } from './lib/uiaction.mjs';
 import fs from 'node:fs';
 
 let passed = 0;
@@ -345,6 +345,67 @@ console.log('孤儿副屏回收判定 (顶前台回归)');
     for (const bad of [null, undefined, 'x', 42]) {
       assert.equal(g.decideOrphanReclaim(prev, bad).action, 'reclaim');
     }
+  });
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 空副屏自动回收判定 (真机 regression：判错会顶掉用户前台 / 删用户 task)
+//
+// 背景: 副屏是常驻的(参考实现 agent-mobile-use 也一样 —— 它的"自动待机"只切模式,
+//   `-1 (idle) never migrates`, VD 进程继续存在)。常驻的代价是空副屏一直占显存,
+//   所以要有"空着够久就收掉"。但**判错代价极大**: 副屏上有 App 时释放它, 会
+//   ① 删掉那些 task(screen_app 迁移过来的是用户自己的 task)
+//   ② 把 task reparent 回主屏顶掉用户前台 —— 两条都是实测事故。
+// 所以判定必须**保守**: 任何不确定都返回 false。
+console.log('');
+console.log('空副屏自动回收判定 (顶前台/删任务 回归)');
+{
+  const g = _vdReap;
+  const REAP = 5 * 60 * 1000;
+  const st = (over) => ({ running: true, displayId: 7, idleMs: 10 * 60 * 1000, ...over });
+
+  t('空屏 + 闲置够久 → 回收', () => {
+    assert.equal(g.shouldReapIdleVd(st(), REAP, []), true);
+  });
+
+  t('⚠ 有 App → 绝不回收(哪怕闲置很久)', () => {
+    assert.equal(g.shouldReapIdleVd(st(), REAP, [{ stackId: 45, package: 'com.tencent.mm' }]), false);
+  });
+
+  t('闲置不够 → 不回收', () => {
+    assert.equal(g.shouldReapIdleVd(st({ idleMs: 60 * 1000 }), REAP, []), false);
+  });
+
+  t('阈值 <=0 表示功能关闭 → 永不回收', () => {
+    assert.equal(g.shouldReapIdleVd(st(), 0, []), false);
+    assert.equal(g.shouldReapIdleVd(st(), -1, []), false);
+  });
+
+  t('副屏没在跑 → 不回收', () => {
+    assert.equal(g.shouldReapIdleVd(st({ running: false }), REAP, []), false);
+  });
+
+  t('从没记录过使用时间(idleMs=null) → 不回收(宁可留着)', () => {
+    assert.equal(g.shouldReapIdleVd(st({ idleMs: null }), REAP, []), false);
+    assert.equal(g.shouldReapIdleVd(st({ idleMs: NaN }), REAP, []), false);
+  });
+
+  t('displayId 非法 → 不回收', () => {
+    assert.equal(g.shouldReapIdleVd(st({ displayId: null }), REAP, []), false);
+    assert.equal(g.shouldReapIdleVd(st({ displayId: -1 }), REAP, []), false);
+  });
+
+  t('appsOnIt 查不到(非数组) → 不回收(当作有东西, 保守)', () => {
+    // 注意: 这与 decideOrphanReclaim 的保守方向相反 —— 那边"查不到"是回收,
+    // 这边是**不回收**。因为这里的代价是删用户 task / 顶前台, 必须更保守。
+    for (const bad of [null, undefined, 'x', 42]) {
+      assert.equal(g.shouldReapIdleVd(st(), REAP, bad), false);
+    }
+  });
+
+  t('state 为 null/异常输入 → 不回收(不抛)', () => {
+    assert.equal(g.shouldReapIdleVd(null, REAP, []), false);
+    assert.equal(g.shouldReapIdleVd(undefined, REAP, []), false);
   });
 }
 
