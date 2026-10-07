@@ -610,6 +610,9 @@
 - `ACTION_SET_TEXT` + 60ms + `refresh()` 读回校验、`isMasked`（密码框圆点判成功）
 - 无 fallback 的单通道注入纪律
 
+本仓库的实现是重写（argv 一次一进程、无 stdin daemon、聚焦模式单一通道），
+未逐行复制；在此按 MIT 归因。
+
 `recognize/uiaction/VdMain.java`（虚拟副屏守护进程）与
 `recognize/uiaction/hook/DshHookEntry.java`（跨屏承载 hook）同样参考了该项目的
 `vd-server-go/main.go`、`vd-tool-java/src/com/agent/DaemonMain.java` 与
@@ -623,20 +626,30 @@
 - 需要放开的 system_server 判定点清单（`canHostTasks` /
   `isCallerAllowedToLaunchOnDisplay` / `canPlaceEntityOnDisplay` /
   `canBeLaunchedOnDisplay` / `canLaunchOnDisplay` / `validatePackageName`）
+- IME 隔离（`InputMethodManagerService#computeImeDisplayIdForTarget`）：
+  目标屏非 0 时把 IME 留在该屏，避免副屏上的输入框把软键盘弹到主屏
 - `am start --display` 在非默认屏承载 Activity 的前置条件
 
-**本仓库的改写在以下几处与参考实现不同（都是真机实测后的取舍，非逐行复制）：**
+**本仓库的改写在以下几处与参考实现不同（都是取舍，非逐行复制）：**
 
 - hook 改为**精确到重载**：只用反射枚举同名方法、且仅对返回类型严格为 `boolean`
-  的重载调 `XposedBridge.hookMethod`。参考实现用的无差别 `hookAllMethods` 会把
-  所有重载（含非 boolean 的）一并强制返回 `Boolean.TRUE` —— 实测会让
-  system_server 在调用点崩溃、反复重启、只能进 recovery。（这是本仓库踩过的
-  真实事故，整改见 `DshHookEntry.java` 顶部注释与 `dsh/module/customize.sh` §8。）
+  的重载调 `XposedBridge.hookMethod`。参考实现用的无差别 `hookAllMethods` 不看
+  返回类型 —— 把非 boolean 重载替换成 `return TRUE` 会在调用点崩溃。
+  【这是**防御性设计，不是已发生事故的整改**：参考实现一直用 `hookAllMethods`
+  且长期没出过这类事故，我们只是选了更稳的写法。本仓库曾把此事写成"踩过的真实
+  事故/根因是 hookAllMethods"，那是**未经证实的归因**，2026-10-07 已更正 ——
+  详见 `recognize/README.md`「更正」一节。】
+- hook 装载**推迟到 `sys.boot_completed=1` 之后**：开机阶段完全不碰系统，
+  即使 hook 有问题系统也已起来，用户能进系统关掉它（开机早期装载会形成
+  "起不来 → 关不掉"的死循环）。参考实现是加载即 hook。
 - 副屏销毁前**先清掉副屏上的 RootTask 再 release**（`am stack remove`）。参考实现
   只 `vd.release()`；实测那样会把 task reparent 回 display 0 且置顶，把用户正在
   用的 App 顶掉。
 - 不做 H.264 实时流与"前台/后台/待机"三态模式机 —— DSH 的形状是"按需看一眼"
   （读树 → 动作 → 截图确认），帧率需求为零，只保留 ImageReader 单帧通道。
+- 不做 SystemUI 侧改造：参考实现 hook 了两个 OPPO 专有类
+  （`com.oplus.systemui...OplusLiveAlertFilters` 等）把通知接进 ColorOS 流体云；
+  这是平台专属功能，与本项目的"前台/后台分离"目标无关。
 - 归因方式：本仓库的实现为独立重写，未逐行复制；在此按 MIT 归因。
 
 ---

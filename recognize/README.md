@@ -486,20 +486,62 @@ onTransitionReady t=CLOSE ... Task #27 m=CLOSE ... d=2->0
 
 AOSP 默认拒绝把 App 放到非默认屏（`START_TASK_FROM_DISPLAY` 是 signature 权限，
 root 也拿不到）。所以需要 `recognize/uiaction/hook/DshHookEntry.java` 在
-system_server 里放开几处判定。它是**本仓库最危险的一段代码**，因此有四道闸：
+system_server 里放开几处判定。它是**本仓库最危险的一段代码**，因此有五道闸：
 
 1. **只改返回类型严格为 `boolean` 的重载** —— 用反射枚举同名方法逐个判定，
-   非 boolean 的一律跳过并记日志。无差别 `hookAllMethods` 会把所有重载一并
-   强制返回 `Boolean.TRUE`，只要有一个签名不匹配就会在**调用点**崩溃 →
-   system_server 崩溃循环 → 只能进 recovery。**这是真踩过的事故。**
+   非 boolean 的一律跳过并记日志。
+   `XposedBridge.hookAllMethods` 不看返回类型，把非 boolean 重载替换成
+   `return TRUE` 会在**调用点**崩溃 → system_server 崩溃循环 → 只能进 recovery。
+   【**这是防御性设计，不是已发生事故的整改** —— 参考实现一直用 `hookAllMethods`
+   且长期没出过这类事故，所以我们只是选了更稳的写法。详见下面的"更正"。】
 2. **全程 try/catch，任何异常只记日志**：最坏结果是"这个钩子没装上"，不是开机崩。
 3. **启用标记 `/data/system/dsh-vd-hook.on`**：安装器创建；数据被清 → 标记消失
    → 模块**彻底惰性**。（路径必须在 system_server 读得到的地方 —— 放
    `/data/adb/dsh/` 会因 `/data/adb` 是 0700 而永远读不到，实测踩过。）
-4. **启动失败自愈**：连续多次启动都活不过 120s 就自动停用自己，并留下
-   `/data/system/dsh-vd-hook-fails` 计数。活过 120s 则计数清零。
+4. **启动失败自愈**：连续多次装载后系统没撑过 120s 就自动停用自己，并留下
+   `/data/system/dsh-vd-hook-fails` 计数。撑过 120s 则计数清零。
+5. **⬅ 不在开机阶段装载（2026-10-07 新增）**：`handleLoadPackage` 只安排一个
+   线程等 `sys.boot_completed=1` 再真正 hook。**开机阶段完全不碰系统** ——
+   即使 hook 有问题，系统也已经起来了，用户能进系统去关它。
+   （旧写法是开机早期就装载，一旦 system_server 起不来，"删标记文件"这条救急
+   路径本身要求你能进系统 ← 死循环。这是**结构性风险**，与历史事故无关。）
+   装载前会**重新核对**标记与属性，所以用户在开机过程中关掉它依然有效。
+   "安装即用"不受影响：装机仍自动注册作用域 + 建标记，用户不用做任何事。
 
-临时关掉：`setprop persist.dsh.vd.hook 0`（下次注入生效），或删掉启用标记。
+临时关掉：`setprop persist.dsh.vd.hook 0`（下次开机生效），或删掉启用标记。
+
+**hook 覆盖的两件事**（除跨屏承载判定外）：
+
+| 目标 | 作用 | 类型 |
+|---|---|---|
+| `canHostTasks` / `isCallerAllowedToLaunchOnDisplay` / `canPlaceEntityOnDisplay` / `canBeLaunchedOnDisplay` / `canLaunchOnDisplay` / `validatePackageName` | 让 App 能落到虚拟屏（否则 `move-stack` 报 `Unknown displayId=N`） | 【实测】缺它直接失败 |
+| `InputMethodManagerService#computeImeDisplayIdForTarget` | **IME 隔离**：副屏上的输入框把软键盘弹在**副屏**，而不是弹到主屏 | 【设计目标】不隔离就会在用户主屏上冒出一块键盘，直接破坏"不打扰前台" |
+
+IME 隔离这条是**从参考实现 agent-mobile-use 学来的缺口修补**（它 hook 了同一个方法）。
+注意它的返回值是 `int` 而非 `boolean`，所以**不能**走 `hookBoolean` 那条"只认 boolean
+重载"的路径 —— 它单独实现（`hookImeIsolation`），且参数签名不符时宁可跳过，绝不硬 hook。
+
+### ⚠ 更正：关于"这个 hook 曾经导致开不了机"的历史记载（2026-10-07）
+
+本仓库此前在多个文件里写过"这个 hook 把手机搞到开不了机（需格式化 /data），
+根因是 `hookAllMethods`"。**那是未经证实的归因，现已更正。**
+
+事实是：当时用户通宵到凌晨 5 点、手上有数据备份，为了尽快恢复数据**直接格式化了
+/data，没有做任何排查** —— 没有 logcat、没有崩溃栈、没有复现步骤。所以：
+
+- 那次开机失败与"当时刚装了带 hook 的模块"**在时间上相关**；
+- **根因至今未知。** "hookAllMethods 导致"是后来写注释时补的推测，不是调查结论。
+
+这个教训值得记下来：**把推测写成"血泪教训/真踩过的事故"，会污染下游的判断**——
+有协作者正是引用这段记载，把它当成了既定历史。
+
+下面各条一律区分两类理由，不再混用：
+
+| 标记 | 含义 |
+|---|---|
+| 【实测】 | 有 logcat / 复现支撑 |
+| 【防御性设计】 | 因为理论上危险所以不这么做，与是否出过事无关 |
+| 【结构性风险】 | 系统结构决定的、独立于历史的真实风险 |
 
 ### 已知边界（诚实记下来）
 
