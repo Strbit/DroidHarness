@@ -360,6 +360,106 @@ let vdInfo = null;           // { displayId, width, height, dpi }
 let vdPending = null;        // shot/ping 的应答解析器挂这里
 let vdChain = Promise.resolve();
 
+// ── 空副屏自动回收(idle reaper) ───────────────────────────────
+//
+// 为什么要有它: 副屏是**常驻**的(参考实现 agent-mobile-use 也一样 —— 它那个
+// "完成后自动待机"只是把模式切成 idle, VD 进程继续存在; 源码注释原话
+// `-1 (idle) never migrates`)。常驻的好处是"随时可用", 代价是空副屏会一直
+// 占着显存与一个常驻进程。所以在**确认没用**时把它收掉。
+//
+// ⚠ 只在"副屏上没有任何真实 App"时才回收 —— 这是硬前提:
+//    副屏上有 App 时释放它, 会 ① 删掉那些 task(screen_app 迁移过来的是
+//    **用户自己的** task), ② 把 task reparent 回主屏顶掉用户前台。
+//    两条都是实测事故, 所以下面每一条路径都再查一次占用(不靠缓存判断)。
+//
+// 默认 5 分钟; 设 0 可关闭。回收失败(比如期间又来了 App)就静默跳过, 下次再试。
+/** 空闲多久后回收空副屏(毫秒)。0 = 关闭自动回收。 */
+const VD_IDLE_REAP_MS = Number(process.env.DSH_VD_IDLE_REAP_MS || 5 * 60 * 1000);
+/** 多久检查一次。 */
+const VD_IDLE_TICK_MS = 60 * 1000;
+/** 最近一次"用到副屏"的时间戳(任何 VD 相关操作都会刷新)。 */
+let vdLastUseMs = 0;
+/** 自动回收的定时器(惰性创建)。 */
+let vdReaperTimer = null;
+/** 最近一次自动回收的记录, 给 vdGet 展示(可观测性)。 */
+let vdLastReap = null;
+
+/** 刷新"最近使用时间"。任何对副屏的读写都该调它。 */
+function touchVd() {
+  vdLastUseMs = Date.now();
+  ensureReaper();
+}
+
+/**
+ * 惰性启动回收定时器。**unref() 是必须的** —— 否则这个定时器会阻止 node 进程
+ * 正常退出(MCP 是常驻服务, 但测试脚本里跑完就该退)。
+ */
+function ensureReaper() {
+  if (vdReaperTimer || !(VD_IDLE_REAP_MS > 0)) return;
+  try {
+    vdReaperTimer = setInterval(() => { void maybeReapIdleVd(); }, VD_IDLE_TICK_MS);
+    if (typeof vdReaperTimer.unref === 'function') vdReaperTimer.unref();
+  } catch { vdReaperTimer = null; }
+}
+
+/**
+ * 纯函数: 该不该回收这块副屏?
+ *
+ * 抽出来是为了能在 PC 上单测 —— 这个判定的错误会让**用户前台被顶掉**
+ * (副屏上有 App 时释放它, task 会 reparent 回主屏并置顶), 必须有断言守着。
+ *
+ * 保守原则: 任何不确定都返回 false(不回收)。
+ *
+ * @param {{running:boolean, displayId:number|null, idleMs:number|null}} state
+ * @param {number} reapMs  阈值; <=0 表示功能关闭
+ * @param {Array|null} appsOnIt  该屏上的真实 App(不含 home 栈)
+ * @returns {boolean}
+ */
+export function shouldReapIdleVd(state, reapMs, appsOnIt) {
+  try {
+    if (!state || !state.running) return false;              // 没在跑
+    if (!(Number(reapMs) > 0)) return false;                 // 功能关闭
+    if (!Number.isFinite(state.displayId) || state.displayId < 0) return false;
+    // 从没记录过使用时间 → 当作刚用过, 不回收(宁可留着)
+    if (!Number.isFinite(state.idleMs) || state.idleMs < 0) return false;
+    if (state.idleMs < Number(reapMs)) return false;         // 还没闲置够
+    if (!Array.isArray(appsOnIt) || appsOnIt.length > 0) return false;  // 有 App 或查不到
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 检查一次: 副屏空着且闲置够久 → 回收。
+ * 真正回收走 vdStop(它内部**再查一次**占用, 并且会拒绝有 App 的情况 —— 双保险)。
+ */
+async function maybeReapIdleVd() {
+  try {
+    if (!vdChild || !vdInfo) return;
+    const idleMs = vdLastUseMs > 0 ? Date.now() - vdLastUseMs : null;
+    const st = { running: true, displayId: vdInfo.displayId, idleMs };
+    // 先只判"在跑 + 闲置够久"; appsOnIt 传 [] 表示"还没查",
+    // 所以这一步只做与 App 无关的判断。
+    if (!shouldReapIdleVd(st, VD_IDLE_REAP_MS, [])) return;
+
+    // 再查实际占用。**查询失败就放弃**(当作有东西) —— 宁可留着, 不能误删用户 task。
+    let apps;
+    try { apps = await appsOnDisplay(vdInfo.displayId); } catch { return; }
+    if (!shouldReapIdleVd(st, VD_IDLE_REAP_MS, apps)) return;
+
+    const before = vdInfo.displayId;
+    const r = await vdStop({});       // vdStop 内部还会再查一次占用并可能拒绝
+    if (r && r.stopped) {
+      vdLastReap = { displayId: before, idleMs, at: Date.now() };
+      console.error(`[vd-reaper] 空副屏闲置 ${Math.round(idleMs / 1000)}s, 已自动释放 (displayId=${before})`);
+    }
+  } catch { /* 回收失败不能影响主流程; 下次 tick 再试 */ }
+}
+
+/** 供测试: 空副屏回收判定的纯函数。 */
+export const _vdReap = { shouldReapIdleVd };
+
 /**
  * 前台守卫: 副屏运行期间, 记录用户在主屏上的前台 App。
  *
@@ -464,7 +564,8 @@ export async function vdStart(width, height, dpi) {
     // 会拿 null 去和 vdInfo.width(1200) 比, 误判成"不同尺寸"而报错。
     if (vdChild) {
       if (vdInfo && vdInfo.width === w && vdInfo.height === h && vdInfo.dpi === d) {
-        return { ...vdInfo, already: true };
+        touchVd();
+        return { ...vdInfo, idleReapMs: VD_IDLE_REAP_MS > 0 ? VD_IDLE_REAP_MS : null, already: true };
       }
       throw new Error(
         `本实例已有一块副屏 (displayId=${vdInfo?.displayId}, ${vdInfo?.width}x${vdInfo?.height}@${vdInfo?.dpi})。` +
@@ -554,6 +655,7 @@ export async function vdStart(width, height, dpi) {
       throw new Error(`副屏 READY 但状态文件异常: ${JSON.stringify(st)}`);
     }
     vdInfo = { displayId: st.display_id, width: st.width, height: st.height, dpi: st.dpi };
+    touchVd();   // 刚建好 —— 刷新空闲计时, 别让它立刻被回收
     if (widthSnappedFrom) vdInfo.widthSnappedFrom = widthSnappedFrom;
 
     // 记录用户此刻在主屏上的前台 App —— 给"守护进程猝死"兜底用。
@@ -584,7 +686,7 @@ export async function vdStart(width, height, dpi) {
         } catch { /* 兜底失败也不能抛(在 exit 回调里) */ }
       })();
     });
-    return { ...vdInfo, already: false };
+    return { ...vdInfo, idleReapMs: VD_IDLE_REAP_MS > 0 ? VD_IDLE_REAP_MS : null, already: false };
   });
 }
 
@@ -750,6 +852,7 @@ export async function vdStop({ force = false } = {}) {
 export async function vdHandoff(pkg, { timeout = 30000 } = {}) {
   return vdChainRun(async () => {
     if (!vdChild || !vdInfo) throw new Error('副屏未运行。先 screen_vd_start。');
+    touchVd();   // 交接也是在用副屏 —— 别让回收器在交接途中把屏收掉
     const vdDid = vdInfo.displayId;
     const tasks = await findTasks(pkg);
     const onVd = tasks.find((t) => t.displayId === vdDid && t.isRoot)
@@ -819,6 +922,7 @@ export async function topPackageOnDisplay(displayId) {
 export async function vdShot() {
   return vdChainRun(async () => {
     if (!vdChild || !vdInfo) throw new Error('副屏未运行。先 screen_vd_start。');
+    touchVd();   // 截图 = 在用副屏
     const outPath = `/data/local/tmp/dsh-vd-shot-${Date.now().toString(36)}.jpg`;
     const resp = await vdCommand(`shot ${vdInfo.displayId} ${Buffer.from(outPath, 'utf8').toString('base64')}`);
     let json;
@@ -839,7 +943,15 @@ export async function vdShot() {
 }
 
 /** 副屏信息(树/动作工具要用 displayId)。 */
-export function vdGet() { return vdInfo ? { ...vdInfo } : null; }
+export function vdGet() {
+  if (!vdInfo) return null;
+  return {
+    ...vdInfo,
+    idleMs: vdLastUseMs > 0 ? Date.now() - vdLastUseMs : null,
+    idleReapMs: VD_IDLE_REAP_MS > 0 ? VD_IDLE_REAP_MS : null,
+    lastReap: vdLastReap,
+  };
+}
 
 // ── 把 App 放到指定屏（副屏承载的关键路径）────────────────────
 //
@@ -1080,6 +1192,9 @@ async function waitTaskOnDisplay(pkg, target, { attempts = 15, intervalMs = 600 
 
 export async function launchOnDisplay(displayId, pkg, activity = null, { timeout = 30000 } = {}) {
   const target = Number(displayId);
+  // 在非默认屏上放 App = "正在用副屏" → 刷新空闲计时。
+  // 这很关键: 否则刚把 App 放上去, 5 分钟后就被回收器收掉了。
+  if (target !== 0) touchVd();
   // FLAG_ACTIVITY_NEW_TASK。**不含 MULTIPLE_TASK** —— 参考实现的冷启动用的就是它,
   // 而 MULTIPLE_TASK 正是"摧毁用户旧 task + 造出僵尸卡片"的根因(见函数头注释)。
   const FLAG_NEW_TASK = '0x10000000';
@@ -1196,6 +1311,8 @@ export async function fetchTree(displayId, { timeout = 45000 } = {}) {
       e.code = 'dex-missing';
       throw e;
     }
+    // 读非默认屏的树 = 在用副屏(读主屏不算)
+    if (Number(displayId) !== 0) touchVd();
     ensureRunner();
     await reconcileA11y();
     const { detach } = await attachA11yService();

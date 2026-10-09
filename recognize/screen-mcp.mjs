@@ -607,7 +607,10 @@ const TOOLS = [
       '(副屏宽/主屏宽) 缩放且不自愈（用户看到"时钟被切掉一位"）。所以传了不同的 width 会被\n' +
       '自动夹到主屏宽度，height 同比缩放，并如实告知。**要省显存请压 height/dpi，不要压 width。**\n' +
       '（实测：1200x2608@320 与 1200x1200@480 都无副作用，800x1200@480 会触发。）\n\n' +
-      '本 MCP 实例同一时间只支持一块副屏；换尺寸先 stop。MCP 服务退出时副屏随之销毁。',
+      '本 MCP 实例同一时间只支持一块副屏；换尺寸先 stop。MCP 服务退出时副屏随之销毁。\n\n' +
+      '🕒 **空副屏会自动回收**：副屏上没有任何 App 且闲置超过 N 分钟（默认 5）会被自动释放，\n' +
+      '只清它自己的 home 栈。**有 App 时永不自动回收** —— 那会删用户 task / 顶用户前台\n' +
+      '（两者都是实测事故）。阈值可用环境变量 `DSH_VD_IDLE_REAP_MS` 调整，设 0 关闭。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1189,8 +1192,13 @@ async function toolsCall(name, args) {
             `  · 看副屏画面: screen_image { displayId: ${r.displayId} } 或 screen_vd_shot\n` +
             `  · 让用户接手: screen_vd_handoff（搬回主屏, 状态不丢）\n\n` +
             `**干完活的默认收尾是"什么都不做"** —— 副屏和 App 都留着, 用户前台一动不动。\n` +
-            `screen_vd_stop 在副屏上有 App 时**一律拒绝**（销毁会删用户自己的 task —— see its docs）。\n\n` +
-            `⚠ 跨屏承载依赖 LSPosed hook 生效; 没有 hook 时 screen_app 会明确报错(不会假装成功)。`,
+            `screen_vd_stop 在副屏上有 App 时**一律拒绝**（销毁会删用户自己的 task —— see its docs）。\n` +
+            (r.idleReapMs
+              ? `\n🕒 **空副屏会自动回收**：副屏上没有任何 App 且闲置超过 ${Math.round(r.idleReapMs / 60000)} 分钟，` +
+                `会被自动释放（只清它自己的 home 栈，不碰任何 App、不影响用户前台）。\n` +
+                `   有 App 时**永不自动回收**（那会删用户 task / 顶用户前台）。\n`
+              : '') +
+            `\n⚠ 跨屏承载依赖 LSPosed hook 生效; 没有 hook 时 screen_app 会明确报错(不会假装成功)。`,
         };
       } catch (e) {
         return { isError: true, text: `副屏启动失败: ${e.message}` };
@@ -1249,8 +1257,7 @@ async function toolsCall(name, args) {
           text: `已交接: ${pkg} 从副屏(displayId=${r.from}) 搬到主屏 display 0（task #${r.taskId}）\n` +
             `App 状态原样保留（reparent 不重建 Activity）—— 用户现在可以在自己屏幕上直接继续操作。\n` +
             `副屏仍在运行；如果不再需要，用 screen_vd_stop 丢弃。`,
-        };
-      } catch (e) {
+        };      } catch (e) {
         return { isError: true, text: `交接失败: ${e.message}` };
       }
     }
