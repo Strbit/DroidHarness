@@ -18,7 +18,7 @@
  * 用法:
  *   node dsh/tools/build-dsh-tree.mjs                  # 装 + 打补丁 + 校验
  *   node dsh/tools/build-dsh-tree.mjs --skip-install   # 只打补丁 + 校验 (树已存在)
- *   node dsh/tools/build-dsh-tree.mjs --version 0.1.7-rc.2
+ *   node dsh/tools/build-dsh-tree.mjs --version 0.2.1-rc.2
  *
  *   node dsh/tools/build-dsh-tree.mjs --skip-install --prune --dry-run
  *       只分析能裁掉什么, 打印清单, 不删任何东西
@@ -47,7 +47,11 @@ function argValue(name, fallback) {
 	return v === undefined || v.startsWith('--') ? true : v;
 }
 // 与用户当前 PC 上跑的一致. 注意 npm 的 latest 反而更旧, 这个是 next 标签.
-const DSH_VERSION = argValue('--version', '0.1.7-rc.2');
+// 2026-10 升级: 0.1.7-rc.2 → 0.2.1-rc.2 (后者是当前 latest 与 next 双标签)。
+// 升级前已逐个核对 build-dsh-tree.mjs 里**所有**文本补丁锚点在该版本仍存在
+// (dsh-fs-local 3 处 + dsh-attachment-local 1 处 + shim 的 main 落点),
+// 否则脚本会 die —— 见 .build/probe-anchors.mjs。
+const DSH_VERSION = argValue('--version', '0.2.1-rc.2');
 const DSH_PKG = `@deepseek-ai/dsh@${DSH_VERSION}`;
 
 const log = (...a) => console.log(...a);
@@ -97,7 +101,41 @@ if (!SKIP_INSTALL) {
 	fs.mkdirSync(APP, { recursive: true });
 	fs.writeFileSync(
 		path.join(APP, 'package.json'),
-		JSON.stringify({ name: 'dsh-android-app', version: '1.0.0', private: true }, null, 2) + '\n'
+		JSON.stringify(
+			{
+				name: 'dsh-android-app',
+				version: '1.0.0',
+				private: true,
+				dependencies: { '@deepseek-ai/dsh': DSH_VERSION },
+				// ⚠ overrides 是**必须的**（2026-10 升级 0.2.1-rc.2 时发现两处）
+				//
+				// (1) koffi —— 0.2.1-rc.2 把对 koffi 的依赖从 `^3.1.0` **收紧成精确
+				//     `3.1.1`**，而 koffi 的 Android 预编译包
+				//     （@koromix/koffi-android-arm64）**是 3.2.x 才加进来的** ——
+				//     3.1.1 的 optionalDependencies 里根本没有 android 条目。
+				//     结果 npm 装出 koffi@3.1.1，
+				//     `@koromix/koffi-android-arm64/android_arm64/koffi.node` 不存在，
+				//     校验直接失败；就算硬打包，真机上 require('koffi') 也会炸。
+				//     旧树（0.1.7-rc.2）是 `^3.1.0`，npm 自然解析到 3.3.1，所以没问题。
+				//     这是**上游的版本收紧**导致的平台回归，不是我们的代码问题。
+				//
+				// (2) zod —— 0.2.1-rc.2 里 **56 个** @deepseek-ai 包都**精确**依赖
+				//     zod@4.4.3，而顶层被 `@modelcontextprotocol/*`（^4.2.0）等
+				//     推到 4.6.7。npm 于是给每个包各塞一份嵌套的 zod@4.4.3：
+				//     实测 **51 份 zod、223.2 MiB / 36740 文件（全树的 47%）**。
+				//     旧树没这个现象（那时依赖范围更宽，能共用顶层那份）。
+				//     用 overrides 把 zod 钉到 4.4.3 —— 已用 semver 逐个核对：
+				//     `4.4.3` / `^4.4.3` / `^4.0.0` / `^4.2.0` / `^3.25 || ^4.0` 全部满足。
+				//     （唯一例外是 @google/genai 要 `^3.25.0`，那是 zod v3，
+				//      属于另一个大版本，overrides 不影响它 —— npm 会单独保留。）
+				overrides: {
+					koffi: '3.3.1',
+					zod: '4.4.3',
+				},
+			},
+			null,
+			2,
+		) + '\n'
 	);
 
 	const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
@@ -674,6 +712,18 @@ const PRUNE_BY_EXT = [
 	['.pdb', 'Windows 调试符号, 只有 Windows 链接器用'],
 	['.d.ts', '类型声明, Node 运行期从不加载'],
 	['.md', '文档'],
+	// ── 下面三类是 0.2.1-rc.2 起才出现的大头 ──────────────────────
+	// 上游从这一版开始把 **TypeScript 源码**一起发进 npm 包（旧版只发编译后的 .js）。
+	// 实测: .ts 159.7 MiB / .cts 17.3 MiB / .mts 5.9 MiB = 182.9 MiB, 约占全树 39%。
+	// 安全性已逐条核对（见 .build/analyze-ts.mjs.ps1）:
+	//   · 全树扫过, **没有任何 .js/.cjs/.mjs 去 require/import 一个 .ts**
+	//   · 没有包的 package.json main/exports 指向 .ts
+	//   · Node 本身也**不能**直接执行 .ts（无 loader 时）
+	// 但**仍然过一遍引用扫描**（下面 analyzePrune 对每一档都做），
+	// 万一某个包真把 .ts 当资源读，那一档会被自动跳过并报"被引用!"。
+	['.ts', 'TypeScript 源码, Node 运行期不加载 (上游从 0.2.1 起随包发布)'],
+	['.cts', 'TypeScript 源码 (.cts), 同上'],
+	['.mts', 'TypeScript 源码 (.mts), 同上'],
 ];
 const PRUNE_BY_DIR = ['test', 'tests', '__tests__', 'spec', 'docs', 'doc', 'example', 'examples', 'benchmark', 'benchmarks'];
 const PRUNE_BY_PLATFORM = [
