@@ -602,11 +602,19 @@ const TOOLS = [
       '用途：自动化操作在副屏上进行，**不干扰用户正在用的主屏**。副屏上可以启动任意 App、' +
       '读树（screen_tree/displayId）、点击（screen_tap/displayId）、注入文字（screen_text/displayId）、' +
       '截图（screen_vd_shot）。\n\n' +
-      '几何参数省略时自动取物理屏的宽高与密度（推荐）。\n\n' +
-      '⚠ **width 必须等于主屏宽度**：真机实测，副屏宽度 ≠ 主屏宽度时，**主屏桌面**的大时钟会按\n' +
-      '(副屏宽/主屏宽) 缩放且不自愈（用户看到"时钟被切掉一位"）。所以传了不同的 width 会被\n' +
-      '自动夹到主屏宽度，height 同比缩放，并如实告知。**要省显存请压 height/dpi，不要压 width。**\n' +
-      '（实测：1200x2608@320 与 1200x1200@480 都无副作用，800x1200@480 会触发。）\n\n' +
+      '几何参数省略时自动取物理屏的宽高与密度（**强烈推荐省略**）。\n\n' +
+      '🚨 **副屏宽高都必须等于主屏，否则会改坏主屏**（两条都是真机实测，且用户当场可见）：\n' +
+      '  · **宽度 ≠ 主屏** → 主屏桌面的大时钟按 (副屏宽/主屏宽) 缩放且不自愈（"时钟被切掉一位"）。\n' +
+      '  · **高度 ≠ 主屏** → **主屏手势失效**。实测副屏 1200×1200 时，主屏返回手势 stub 的\n' +
+      '    touchableRegion 被按**副屏高度**重算成 `[1137,288][1200,1113]`（正常应是 `...2521`），\n' +
+      '    于是左右边缘只剩上半段能返回、**底部上滑完全不能用**；且销毁副屏后不会立即恢复\n' +
+      '    （实测约 7 分钟自愈，或 `killall com.android.systemui` 立即恢复）。\n' +
+      '    算术可验证：`2521-1113 = 1408 = 2608-1200`，恰好等于两屏高度差。\n' +
+      '    根因是 MIUI 的手势/insets 几何没有按 display 隔离 —— 我们无法在工具侧修好，\n' +
+      '    只能**不制造不一致的几何**。\n' +
+      '所以传了不同的 width/height 都会被**夹到主屏尺寸**并如实告知。\n' +
+      '**不要再以"省显存"为由压 height / width** —— 本 ROM 上这是拿主屏交互能力换显存。\n' +
+      '真要省资源请压 `dpi`（不影响手势几何）。\n\n' +
       '本 MCP 实例同一时间只支持一块副屏；换尺寸先 stop。MCP 服务退出时副屏随之销毁。\n\n' +
       '🕒 **空副屏会自动回收**：副屏上没有任何 App 且闲置超过 N 分钟（默认 5）会被自动释放，\n' +
       '只清它自己的 home 栈。**有 App 时永不自动回收** —— 那会删用户 task / 顶用户前台\n' +
@@ -614,9 +622,9 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        width: { type: 'number', description: '副屏宽（像素）。省略=物理屏宽。**与主屏不同会被自动夹到主屏宽度**（见工具说明）' },
-        height: { type: 'number', description: '副屏高（像素）。省略=物理屏高。省显存请压这里' },
-        dpi: { type: 'number', description: '副屏密度。省略=物理屏密度' },
+        width: { type: 'number', description: '副屏宽（像素）。省略=物理屏宽。**与主屏不同会被自动夹到主屏宽度**（宽度不一致会改坏主屏时钟）' },
+        height: { type: 'number', description: '副屏高（像素）。省略=物理屏高。**与主屏不同会被自动夹到主屏高度**（高度不一致会导致主屏手势失效，实测）' },
+        dpi: { type: 'number', description: '副屏密度。省略=物理屏密度。**要省资源请压这里**（不影响手势几何）' },
       },
       additionalProperties: false,
     },
@@ -1179,10 +1187,13 @@ async function toolsCall(name, args) {
         const lines = r.already
           ? `副屏已在运行 (幂等返回): displayId=${r.displayId}, ${r.width}x${r.height}@${r.dpi}`
           : `副屏已启动: displayId=${r.displayId}, ${r.width}x${r.height}@${r.dpi}`;
-        const snapped = r.widthSnappedFrom
-          ? `\n⚠ 你请求的宽度 ${r.widthSnappedFrom.width} 与主屏宽度不同, 已改为 ${r.width}` +
-            `（高度同比缩放为 ${r.height}）。原因: 真机实测副屏宽度 ≠ 主屏宽度会让**主屏桌面**` +
-            `的大时钟按 (副屏宽/主屏宽) 缩放且不自愈。省显存请改压 height/dpi, 不要压 width。`
+        // 宽/高被夹回主屏时如实告知 —— 两个方向都会改坏主屏（都是实测）
+        const snapped = r.geomSnappedFrom
+          ? `\n⚠ 你请求的几何 ${r.geomSnappedFrom.width}x${r.geomSnappedFrom.height} 与主屏不同，` +
+            `已改为 ${r.width}x${r.height}。原因（**都会改坏主屏，真机实测**）：\n` +
+            `  · 宽度 ≠ 主屏 → 主屏桌面大时钟按 (副屏宽/主屏宽) 缩放且**不自愈**；\n` +
+            `  · 高度 ≠ 主屏 → **主屏手势失效**（返回只剩上半段、底部上滑不能用，实测约 7 分钟才自愈）。\n` +
+            `要省资源请压 dpi（不参与手势/桌面几何），不要压 width/height。`
           : '';
         return {
           text: `${lines}${snapped}\n\n接下来:\n` +
