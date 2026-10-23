@@ -311,30 +311,68 @@ export async function injectText(displayId, text, { timeout = 45000, mode = 'rep
 export const _a11yList = { hasService, mergeService, removeService };
 
 /**
- * 把副屏宽度夹到主屏宽度, 高度按同比缩放。
+ * 把副屏的 **宽和高分别夹到主屏对应尺寸**。
  *
- * 为什么必须这样: 真机实测, 副屏宽度 ≠ 主屏宽度时**主屏桌面**的大时钟会按
- * (副屏宽/主屏宽) 缩放且不自愈 —— 用户看到"时钟被切掉一位"。
- * 尺寸与密度都不参与触发(1200x1200@480 与 1200x2608@320 都正常)。
+ * 为什么宽高都必须等于主屏 —— 两条都是真机实测，症状都发生在**主屏**上：
  *
- * 拿不到主屏宽度(或值不合理)时**原样返回**, 不猜。
- * @returns {{width:number,height:number,snapped:boolean,ratio?:number}}
+ *   ① 宽度 ≠ 主屏 → 主屏桌面大时钟按 (副屏宽/主屏宽) 缩放且不自愈
+ *      ("时钟被切掉一位")。
+ *   ② 高度 ≠ 主屏 → **主屏手势失效**。实测副屏 1200×1200 时，display 0 的
+ *      GestureStub 的 touchableRegion 被按**副屏高度**算成 [1137,288][1200,1113]
+ *      (正常 ...2521)，于是左右边缘只剩上半段能返回、底部上滑完全不能用。
+ *      算术可验证: 2521-1113 = 1408 = 2608-1200 = 两屏高度差。
+ *      根因是 MIUI 的手势/insets 几何没按 display 隔离 —— 我们修不了 ROM,
+ *      只能不制造不一致的几何。
+ *
+ * 历史教训: 本函数之前叫 `snapWidthToMain`，只夹宽度、高度按比例跟着变，
+ * 并在文档里建议"省显存请压 height" —— 在 MIUI 上那是**拿主屏交互换显存**。
+ * 2026-10-21 现场取证(workspace/123/vd-forensics/gesture-leak-report.md)后改为
+ * 宽高都夹。真要省资源只能压 **dpi**，它不参与手势几何。
+ *
+ * 拿不到主屏尺寸(或值不合理)时那一维**原样返回**, 不猜。
+ * @returns {{width:number,height:number,snapped:boolean,widthSnapped:boolean,heightSnapped:boolean}}
  */
-export function snapWidthToMain(width, height, mainWidth) {
-  const w = Number(width), h = Number(height), mw = Number(mainWidth);
-  if (!Number.isFinite(mw) || mw <= 0) return { width: w, height: h, snapped: false };
-  if (!Number.isFinite(w) || w === mw) return { width: w, height: h, snapped: false };
-  const ratio = mw / w;
+export function snapToMainDisplay(width, height, mainWidth, mainHeight) {
+  const w = Number(width), h = Number(height);
+  const mw = Number(mainWidth), mh = Number(mainHeight);
+  let outW = w, outH = h, widthSnapped = false, heightSnapped = false;
+
+  if (Number.isFinite(mw) && mw > 0 && Number.isFinite(w) && w !== mw) {
+    outW = mw;
+    widthSnapped = true;
+  }
+  if (Number.isFinite(mh) && mh > 0 && Number.isFinite(h) && h !== mh) {
+    outH = mh;
+    heightSnapped = true;
+  }
   return {
-    width: mw,
-    height: Math.max(1, Math.round(h * ratio)),
-    snapped: true,
-    ratio,
+    width: outW,
+    height: outH,
+    snapped: widthSnapped || heightSnapped,
+    widthSnapped,
+    heightSnapped,
   };
 }
 
+/**
+ * 兼容旧名: 只夹宽度(保留给仍按"宽高同比"语义调用的地方/测试)。
+ * 新代码请用 snapToMainDisplay。
+ */
+export function snapWidthToMain(width, height, mainWidth) {
+  const r = snapToMainDisplay(width, height, mainWidth, Number.NaN);
+  return r.widthSnapped
+    ? {
+        width: r.width,
+        // 旧语义: 高度按宽度缩放比例同比缩放
+        height: Math.max(1, Math.round(Number(height) * (r.width / Number(width)))),
+        snapped: true,
+        ratio: r.width / Number(width),
+      }
+    : { width: r.width, height: r.height, snapped: false };
+}
+
 /** 供测试: 副屏几何的纯函数。 */
-export const _vdGeom = { snapWidthToMain };
+export const _vdGeom = { snapToMainDisplay, snapWidthToMain };
 
 
 // ═══════════════════════ 虚拟副屏 (PR B) ═══════════════════════
@@ -507,8 +545,8 @@ function vdStatusJson() {
  */
 export async function vdStart(width, height, dpi) {
   return vdChainRun(async () => {
-    // 宽度被夹到主屏宽度时记下原始请求值(供结果回传)。
-    let widthSnappedFrom = null;
+    // 宽/高被夹到主屏时记下原始请求值(供结果回传)。
+    let geomSnappedFrom = null;
     if (!fs.existsSync(DEX_PATH)) {
       const e = new Error(DEX_MISSING_HINT);
       e.code = 'dex-missing';
@@ -536,25 +574,32 @@ export async function vdStart(width, height, dpi) {
       throw new Error(`副屏几何不完整: ${w}x${h}@${d} —— 传 width/height/dpi 或让设备端推导`);
     }
 
-    // ⚠ 副屏宽度必须与主屏一致，否则会**改坏主屏桌面**（真机实测，见下）
+    // ⚠ 副屏的**宽和高都必须等于主屏**，否则会改坏主屏（两条都真机实测）
     // ─────────────────────────────────────────────────────────────
-    // 现象: 副屏宽度 ≠ 主屏宽度时, 主屏桌面的大时钟/日期组件会按
-    //       (副屏宽 / 主屏宽) 缩放, 且**不会自动恢复**。用户看到的是
-    //       "时钟被切掉一位"(如 18:17 的 7 只剩右半)。
-    // 实测(小米 25102RKBEC / Android 16, 主屏 1200x2608@480):
-    //       副屏 1200x2608@480 → 时钟高 326 (正常)
-    //       副屏 1200x2608@320 → 时钟高 326 (正常) ← 密度无关
-    //       副屏 1200x1200@480 → 时钟高 326 (正常) ← 高度无关
-    //       副屏  800x1200@480 → 时钟高 217 (异常) ← 宽度 800/1200 = 0.667
-    //       217 / 326 = 0.666 ≈ 800 / 1200
-    // 机制: 创建/销毁副屏会让 MIUI 的 AutoDensityController 重算 display 0
-    //       的配置(logcat: "on display changed 0 context dpi:478 origin dpi:480"),
-    //       桌面据此重新布局; 副屏宽度参与了这次重算。
-    // 因此: 把宽度**夹到主屏宽度**, 高度按原比例同比缩放(保住调用方要的宽高比),
-    //       于是"省显存"仍然可用 —— 只能靠压高度/密度, 不能压宽度。
-    const snapped = snapWidthToMain(w, h, mainW);
+    // ① 宽度不一致 → 主屏桌面大时钟按 (副屏宽/主屏宽) 缩放且**不自愈**,
+    //    用户看到"时钟被切掉一位"。实测(小米 25102RKBEC, 主屏 1200x2608@480):
+    //      副屏 1200x2608@480 → 时钟高 326 (正常)
+    //      副屏 1200x2608@320 → 时钟高 326 (正常) ← 密度无关
+    //      副屏 1200x1200@480 → 时钟高 326 (正常) ← 高度对时钟无关
+    //      副屏  800x1200@480 → 时钟高 217 (异常) ← 800/1200=0.667, 217/326≈0.666
+    //    机制: 建/销毁副屏会让 MIUI AutoDensityController 重算 display 0 配置
+    //          (logcat: "on display changed 0 context dpi:478 origin dpi:480")。
+    //
+    // ② 高度不一致 → **主屏手势失效**（2026-10-21 现场取证发现，比①更严重）:
+    //      display 0 的 GestureStub touchableRegion 被按**副屏高度**重算成
+    //      [1137,288][1200,1113]（正常 ...2521），左右边缘只剩上半段能返回、
+    //      底部上滑完全不能用；销毁副屏后不立即恢复（实测约 7 分钟自愈）。
+    //      算术: 2521-1113 = 1408 = 2608-1200 = 两屏高度差。
+    //      证据: workspace/123/vd-forensics/gesture-leak-report.md
+    //      根因是 MIUI 的 insets/手势几何没按 display 隔离 —— ROM 缺陷，工具侧
+    //      修不了，只能**不制造不一致的几何**。
+    //
+    // 所以宽、高都夹到主屏。**要省资源只能压 dpi**（不参与手势/密度几何）。
+    // 历史: 旧版只夹宽度、高度同比缩放，还建议"省显存请压 height" —— 在 MIUI 上
+    // 那是拿主屏交互换显存，已按现场取证更正。
+    const snapped = snapToMainDisplay(w, h, mainW, mainH);
     if (snapped.snapped) {
-      widthSnappedFrom = { width: w, height: h };
+      geomSnappedFrom = { width: w, height: h };
       w = snapped.width;
       h = snapped.height;
     }
@@ -656,7 +701,7 @@ export async function vdStart(width, height, dpi) {
     }
     vdInfo = { displayId: st.display_id, width: st.width, height: st.height, dpi: st.dpi };
     touchVd();   // 刚建好 —— 刷新空闲计时, 别让它立刻被回收
-    if (widthSnappedFrom) vdInfo.widthSnappedFrom = widthSnappedFrom;
+    if (geomSnappedFrom) vdInfo.geomSnappedFrom = geomSnappedFrom;
 
     // 记录用户此刻在主屏上的前台 App —— 给"守护进程猝死"兜底用。
     // 只记第一次(后面几轮 vdStart 若已在跑会 early return, 不会覆盖)。
